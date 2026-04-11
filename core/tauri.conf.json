@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.worxheet",
   "build": {
-    "beforeDevCommand": "pnpm ui:dev",
+    "beforeDevCommand": "pnpm app:dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm ui:build",
+    "beforeBuildCommand": "pnpm app:build",
     "frontendDist": "../dist"
   },
   "app": {

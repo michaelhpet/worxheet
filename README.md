@@ -6,9 +6,9 @@ Worxheet is a desktop application built to transform primary study materials int
 
 The project is structured as a high-performance monolith:
 
-- Frontend (`/ui`): React.js. Handles the UI and artifact visualization.
+- Frontend (`/app`): React 19 + TanStack Router. Handles the UI and artifact visualization.
 
-- Backend (`/core`): Rust Core. Manages SQLite persistence, file system access, and IPC commands.
+- Backend (`/core`): Rust + Tauri. Manages SQLite persistence, file system access, and IPC commands.
 
 - SQLite: Local relational storage for "Subjects" and metadata.
 
@@ -16,9 +16,13 @@ The project is structured as a high-performance monolith:
 
 ## 🛠 Tech Stack
 
-- Framework: Tauri (Rust + React)
+- Framework: Tauri 2.x (Rust + React)
+
+- Frontend: React 19, TanStack Router, Tailwind CSS 4, shadcn/ui, Biome
 
 - Language: Rust, TypeScript, SQL
+
+- Build: Vite, pnpm
 
 - AI/LLM: `LlamaParse` (Ingestion), `nomic-embed-text` (Embeddings), (TBD) (HOTS Generation)
 

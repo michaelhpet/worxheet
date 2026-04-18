@@ -1,15 +1,46 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Button } from "../components/ui/button";
+import { useState } from "react";
+import { FileCard } from "@/components/file-card";
+import { FilesUploader } from "@/components/files-uploader";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
 
 export const Route = createFileRoute("/")({
 	component: Home,
 });
 
 function Home() {
+	const [files, setFiles] = useState<string[]>([]);
+
+	const onFiles = (newFiles: string[]) => {
+		if (!newFiles.length) return;
+		setFiles((prev) => [...prev, ...newFiles.filter((f) => !prev.includes(f))]);
+	};
+
+	const removeFile = (path: string) => {
+		setFiles((prev) => prev.filter((f) => f !== path));
+	};
+
 	return (
-		<main className="flex flex-col items-center gap-3">
-			<p>Home page</p>
-			<Button>Click something!</Button>
+		<main className="w-screen h-screen flex items-stretch">
+			<section className="w-2/3 h-full border-r">
+				<FilesUploader onFiles={onFiles} />
+			</section>
+			<aside className="relative w-1/3 h-full flex flex-col">
+				<ul className="flex flex-col p-3 overflow-auto">
+					{files.map((file) => (
+						<FileCard key={file} path={file} onRemove={removeFile} />
+					))}
+				</ul>
+				{!!files.length && (
+					<footer className="sticky bottom-0 w-full mt-auto bg-background">
+						<Separator />
+						<div className="flex items-center justify-end gap-2 p-3">
+							<Button>Continue</Button>
+						</div>
+					</footer>
+				)}
+			</aside>
 		</main>
 	);
 }

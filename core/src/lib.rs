@@ -1,12 +1,26 @@
+use sqlx::{Pool, Sqlite};
+use tauri::Manager;
+
+mod database;
 mod file;
+
+pub struct AppState {
+    pub database: Pool<Sqlite>,
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let handle = app.handle();
+            let pool = tauri::async_runtime::block_on(async { database::connect(&handle).await })?;
+            app.manage(AppState { database: pool });
+            return Ok(());
+        })
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![file::get_file_metadata])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("Error while running application");
 }

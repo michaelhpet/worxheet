@@ -3,6 +3,7 @@ use tauri::Manager;
 
 mod database;
 mod file;
+mod worksheet;
 
 pub struct AppState {
     pub database: Pool<Sqlite>,
@@ -20,7 +21,11 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![file::get_file_metadata])
+        .invoke_handler(tauri::generate_handler![
+            file::get_file_metadata,
+            worksheet::get_worksheets,
+            worksheet::create_worksheet
+        ])
         .run(tauri::generate_context!())
         .expect("Error while running application");
 }

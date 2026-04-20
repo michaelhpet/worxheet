@@ -24,5 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "migrate"] }
+sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "migrate", "time"] }
+ulid = "1.2.1"
+time = { version = "0.3.47", features = ["formatting", "parsing", "serde"] }
 

@@ -4,6 +4,7 @@ import { FileCard } from "@/components/file-card";
 import { FilesUploader } from "@/components/files-uploader";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { invoke } from "@tauri-apps/api/core";
 
 export const Route = createFileRoute("/")({
 	component: Home,
@@ -21,6 +22,13 @@ function Home() {
 		setFiles((prev) => prev.filter((f) => f !== path));
 	};
 
+	const createWorksheet = async () => {
+		const worksheet = await invoke("create_worksheet", {
+			name: "New Worksheet",
+		});
+		console.log("Created worksheet:", worksheet);
+	};
+
 	return (
 		<main className="w-screen h-screen flex items-stretch">
 			<section className="w-2/3 h-full border-r">
@@ -36,7 +44,7 @@ function Home() {
 					<footer className="sticky bottom-0 w-full mt-auto bg-background">
 						<Separator />
 						<div className="flex items-center justify-end gap-2 p-3">
-							<Button>Continue</Button>
+							<Button onClick={createWorksheet}>Continue</Button>
 						</div>
 					</footer>
 				)}

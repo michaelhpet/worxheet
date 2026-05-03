@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
+use sqlx::prelude::FromRow;
 use tauri::State;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::AppState;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, FromRow)]
 pub struct Worksheet {
     pub id: String,
     pub name: String,
@@ -30,7 +31,7 @@ impl Worksheet {
 pub async fn get_worksheets(state: State<'_, AppState>) -> Result<Vec<Worksheet>, String> {
     let pool = &state.database;
 
-    let query = sqlx::query_as!(Worksheet, "SELECT * FROM worksheets");
+    let query = sqlx::query_as::<_, Worksheet>("SELECT * FROM worksheets");
     let worksheets = match query.fetch_all(pool).await {
         Err(_) => return Err(String::from("Could not fetch worksheets")),
         Ok(worksheets) => worksheets,
@@ -44,11 +45,9 @@ pub async fn create_worksheet(state: State<'_, AppState>, name: &str) -> Result<
     let pool = &state.database;
 
     let worksheet = Worksheet::new(name);
-    let query = sqlx::query!(
-        "INSERT INTO worksheets (id, name) VALUES (?, ?)",
-        worksheet.id,
-        worksheet.name
-    );
+    let query = sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
+        .bind(&worksheet.id)
+        .bind(&worksheet.name);
     match query.execute(pool).await {
         Err(_) => return Err(String::from("Failed to create new worksheet")),
         _ => (),

@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::os::unix::fs::MetadataExt;
 use std::string::String;
 
 #[derive(Serialize)]
@@ -31,6 +30,6 @@ pub fn get_file_metadata(path: &str) -> Result<FileMetadata, String> {
     return Ok(FileMetadata {
         name,
         extension,
-        size: metadata.size(),
+        size: metadata.len(),
     });
 }

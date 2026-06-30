@@ -3,6 +3,8 @@ import { listen, TauriEvent } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import clsx from "clsx";
 import { type DragEvent, useEffect, useEffectEvent, useState } from "react";
+
+import { SUPPORTED_EXTENSIONS } from "@/lib/constants";
 import { Button } from "./ui/button";
 import {
 	Empty,
@@ -13,23 +15,37 @@ import {
 	EmptyTitle,
 } from "./ui/empty";
 
+function isSupportedExtension(path: string): boolean {
+	const ext = path.toLowerCase().split(".").pop() || "";
+	return SUPPORTED_EXTENSIONS.includes(ext);
+}
+
 interface FilesUploaderProps {
 	onFiles: (files: string[]) => void;
 }
+
+const DOCUMENT_FILTER = {
+	name: "Documents",
+	extensions: SUPPORTED_EXTENSIONS,
+};
 
 export function FilesUploader(props: FilesUploaderProps) {
 	const [dragging, setDragging] = useState(false);
 
 	const findFiles = async () => {
-		const files = await open({ multiple: true });
+		const files = await open({
+			multiple: true,
+			filters: [DOCUMENT_FILTER],
+		});
 		if (files) {
-			props.onFiles(files);
+			props.onFiles(files.filter(isSupportedExtension));
 		}
 	};
 
 	const dropFiles = useEffectEvent(async () => {
 		return listen<{ paths: string[] }>(TauriEvent.DRAG_DROP, (event) => {
-			props.onFiles(event.payload.paths);
+			const supported = event.payload.paths.filter(isSupportedExtension);
+			props.onFiles(supported);
 		});
 	});
 
@@ -46,7 +62,7 @@ export function FilesUploader(props: FilesUploaderProps) {
 	useEffect(() => {
 		const unlisten = dropFiles();
 		return () => {
-			(async () => unlisten)();
+			unlisten.then((fn) => fn());
 		};
 	}, []);
 

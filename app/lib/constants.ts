@@ -11,6 +11,8 @@ import {
 	IconVideo,
 } from "@tabler/icons-react";
 
+export const SUPPORTED_EXTENSIONS = ["pdf", "ppt", "pptx", "doc", "docx"];
+
 export const FILE_SIZES = [
 	"Bytes",
 	"KB",

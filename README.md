@@ -10,9 +10,7 @@ The project is structured as a high-performance monolith:
 
 - Backend (`/core`): Rust + Tauri. Manages SQLite persistence, file system access, and IPC commands.
 
-- SQLite: Local relational storage for "Subjects" and metadata.
-
-- Pinecone: Remote vector store for semantic similarity search.
+- SQLite: Local relational storage for worksheets, file metadata, text chunks, vector embeddings, and generated artifacts.
 
 ## 🛠 Tech Stack
 
@@ -24,9 +22,11 @@ The project is structured as a high-performance monolith:
 
 - Build: Vite, pnpm
 
-- AI/LLM: `LlamaParse` (Ingestion), `nomic-embed-text` (Embeddings), (TBD) (HOTS Generation)
+- AI/LLM: `pdf_oxide` (PDF extraction), `bge-small-en-v1.5` (Embeddings, GGUF), `SmolLM2-360M-Instruct` (HOTS Generation, GGUF, ~271MB)
 
-- Database: SQLite (Embedded), Pinecone (Vector)
+- AI Runtime: `mistralrs` + `candle` (pure Rust, local inference)
+
+- Database: SQLite (Embedded, including vector storage as BLOBs)
 
 - Communication: Asynchronous IPC (Inter-Process Communication)
 
@@ -34,11 +34,11 @@ The project is structured as a high-performance monolith:
 
 - Ingestion: User creates a "Worksheet" and uploads files.
 
-- Parsing: Rust core triggers LlamaParse to convert PDFs/Images to structured Markdown.
+- Parsing: Rust core uses `pdf_oxide` to extract structured Markdown from PDFs locally (no cloud API).
 
-- Vectorization: Text chunks are embedded and stored (unique to each worksheet).
+- Vectorization: Text chunks are embedded via `bge-small-en-v1.5` (GGUF) running in `mistralrs` and stored as BLOBs in SQLite.
 
-- Generation: The system retrieves relevant chunks and applies Few-Shot Prompting to generate MCQ items and summaries.
+- Generation: Cosine similarity over SQLite retrieves relevant chunks; `SmolLM2-360M-Instruct` (GGUF) generates MCQ items and summaries via few-shot prompting — all local, no external API calls.
 
 - Consumption: Artifacts are saved to SQLite and rendered in the React Workspace.
 

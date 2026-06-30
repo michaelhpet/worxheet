@@ -32,11 +32,11 @@ The project is structured as a high-performance monolith:
 
 ## ⚙️ How it Works (The RAG Pipeline)
 
-- Ingestion: User creates a "Subject" and uploads files.
+- Ingestion: User creates a "Worksheet" and uploads files.
 
 - Parsing: Rust core triggers LlamaParse to convert PDFs/Images to structured Markdown.
 
-- Vectorization: Text chunks are embedded and stored in a Pinecone namespace unique to that Subject.
+- Vectorization: Text chunks are embedded and stored (unique to each worksheet).
 
 - Generation: The system retrieves relevant chunks and applies Few-Shot Prompting to generate MCQ items and summaries.
 

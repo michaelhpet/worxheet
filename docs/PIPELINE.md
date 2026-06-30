@@ -2,12 +2,12 @@
 
 ## Overview
 
-Artifact generation is automatic — the user uploads materials and clicks "Generate". There is no user query. The pipeline ingests all documents, chunks them, embeds them, clusters by topic, and generates artifacts from cluster centroids.
+Artifact generation is automatic — the user uploads materials and clicks "Generate". There is no user query. The pipeline ingests all documents, chunks them, embeds them, clusters by topic, and generates artifacts from evenly-sampled chunks per cluster.
 
 ## Pipeline Steps
 
 ```
-Upload → Parse → Chunk → Embed → k-means cluster → Pick centroids → SmolLM2 generate → Persist
+Upload → Parse → Chunk → Embed → k-means cluster → Sample by position → SmolLM2 generate → Persist
 ```
 
 ## Step-by-Step
@@ -72,27 +72,33 @@ fn choose_k(num_chunks: usize) -> usize {
 
 Output: `Vec<Cluster>` where each `Cluster` has a centroid vector and a list of member chunk IDs.
 
-### 5. Sample Centroids
+### 5. Sample by Position
 
-For each cluster, pick the chunk whose embedding is nearest to the cluster centroid (the "most representative" chunk of that topic).
+For each cluster, sort member chunks by their original document position and select chunks evenly across the full range.
+
+```
+Cluster "Photosynthesis" — 18 chunks, 6 samples
+  Selected: [c1, c4, c7, c11, c14, c18]  ← evenly spread by position
+```
 
 ```rust
-fn centroid_chunk(cluster: &Cluster, chunks: &[Chunk]) -> &Chunk {
-    cluster.member_ids
-        .iter()
-        .map(|id| chunks.iter().find(|c| c.id == *id).unwrap())
-        .min_by(|a, b| cosine_sim(a.embedding, cluster.centroid)
-            .partial_cmp(&cosine_sim(b.embedding, cluster.centroid))
-            .unwrap())
-        .unwrap()
+fn sample_by_position(chunks: &[&Chunk], max_samples: usize) -> Vec<&Chunk> {
+    if chunks.len() <= max_samples {
+        return chunks.to_vec();
+    }
+
+    let step = (chunks.len() - 1) as f64 / (max_samples - 1) as f64;
+    (0..max_samples)
+        .map(|i| chunks[(i as f64 * step).round() as usize])
+        .collect()
 }
 ```
 
-The centroid chunk's text becomes the context for generation.
+`max_samples` is derived per-cluster by dividing the available context window (~5K tokens after prompt + output overhead) by the average chunk token count, weighted by how many chunks belong to this cluster. Larger clusters get more samples proportionally.
 
 ### 6. Generate (SmolLM2-360M)
 
-One LLM call per cluster. Each call sends the centroid chunk text wrapped in an artifact-specific prompt.
+One LLM call per cluster. Each call sends the sampled chunks (concatenated in document order) wrapped in an artifact-specific prompt.
 
 ```
 Artifact types:
@@ -102,10 +108,10 @@ Artifact types:
 
 System prompt structure per call:
   "You are an educational assessment generator. Based on the following
-   textbook passage, generate [artifact_type]. Return only valid JSON.
+   textbook passages, generate [artifact_type]. Return only valid JSON.
    
-   Passage:
-   [centroid_chunk_text]"
+   Passages:
+   [sampled_chunks concatenated in position order]"
 ```
 
 Each generation result is a structured artifact (e.g., JSON for MCQ items with question, options, correct answer, explanation).
@@ -191,7 +197,7 @@ core/src/
 ├── worksheet.rs        # worksheet CRUD commands
 ├── chunk.rs            # text splitting logic
 ├── ingest.rs           # parse + chunk + embed pipeline
-├── retrieval.rs        # k-means clustering + centroid sampling
+├── retrieval.rs        # k-means clustering + position-based sampling
 ├── generation.rs       # SmolLM2 artifact generation
 └── schema.rs           # shared structs (Chunk, Cluster, Artifact, etc.)
 ```

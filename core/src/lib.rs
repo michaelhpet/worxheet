@@ -6,7 +6,7 @@ mod file;
 mod worksheet;
 
 pub struct AppState {
-    pub database: Pool<Sqlite>,
+    pub(crate) database: Pool<Sqlite>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

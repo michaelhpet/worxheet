@@ -35,7 +35,7 @@ function Home() {
 		validators: { onChange: worksheetSchema },
 		onSubmit: async ({ value }) => {
 			const name = value.name.trim() || "Untitled Worksheet";
-			await invoke("create_worksheet", { name });
+			await invoke("create_worksheet", { name, files });
 		},
 	});
 

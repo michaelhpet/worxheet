@@ -27,4 +27,11 @@ tauri-plugin-fs = "2"
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "migrate", "time"] }
 ulid = "1.2.1"
 time = { version = "0.3.47", features = ["formatting", "parsing", "serde"] }
+tokenizers = "0.21"
+pdf_oxide = "0.3"
+office_oxide = "0.1"
+mistralrs = { version = "0.8", features = ["accelerate"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
 

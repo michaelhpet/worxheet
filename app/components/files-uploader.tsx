@@ -16,8 +16,8 @@ import {
 } from "./ui/empty";
 
 function isSupportedExtension(path: string): boolean {
-	const ext = path.toLowerCase().split(".").pop() || "";
-	return SUPPORTED_EXTENSIONS.includes(ext);
+	const extension = path.toLowerCase().split(".").pop() || "";
+	return SUPPORTED_EXTENSIONS.includes(extension);
 }
 
 interface FilesUploaderProps {

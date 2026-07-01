@@ -24,18 +24,18 @@ async fn run_migrations(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
 }
 
 pub async fn connect(app: &AppHandle) -> Result<Pool<Sqlite>, String> {
-    let app_dir = app
+    let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?;
 
-    std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
-    let db_path = app_dir.join("database.sqlite");
-    let db_url = format!("sqlite:{}", db_path.display());
-    println!("Connecting to database: {}...", &db_url);
+    let database_path = app_data_dir.join("database.sqlite");
+    let database_url = format!("sqlite:{}", database_path.display());
+    println!("Connecting to database: {}...", &database_url);
 
-    let pool = create_pool(&db_url).await.map_err(|e| e.to_string())?;
+    let pool = create_pool(&database_url).await.map_err(|e| e.to_string())?;
 
     run_migrations(&pool).await.map_err(|e| e.to_string())?;
 

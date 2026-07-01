@@ -41,11 +41,10 @@ function Home() {
 
 	const onFiles = (newFiles: string[]) => {
 		if (!newFiles.length) return;
-		setFiles((prev) => [...prev, ...newFiles.filter((f) => !prev.includes(f))]);
-	};
+		setFiles((previous) => [...previous, ...newFiles.filter((file) => !previous.includes(file))]);
 
 	const removeFile = (path: string) => {
-		setFiles((prev) => prev.filter((f) => f !== path));
+		setFiles((previous) => previous.filter((file) => file !== path));
 	};
 
 	return (

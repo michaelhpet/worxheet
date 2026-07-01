@@ -1,8 +1,10 @@
 use sqlx::{Pool, Sqlite};
 use tauri::Manager;
 
+mod chunk;
 mod database;
 mod file;
+mod ingest;
 mod schema;
 mod worksheet;
 

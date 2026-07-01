@@ -28,7 +28,8 @@ pub fn run() {
             file::get_file_metadata,
             worksheet::get_worksheets,
             worksheet::get_worksheet,
-            worksheet::create_worksheet
+            worksheet::create_worksheet,
+            worksheet::delete_worksheet
         ])
         .run(tauri::generate_context!())
         .expect("Error while running application");

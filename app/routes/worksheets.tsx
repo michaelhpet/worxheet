@@ -1,4 +1,20 @@
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import {
@@ -9,8 +25,8 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
-import { useWorksheets, type Worksheet } from "@/data/worksheets";
-import { IconChevronLeft, IconChevronRight, IconFile, IconLayoutGrid, IconList, IconPlus, IconSelector, IconTable } from "@tabler/icons-react";
+import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
+import { IconChevronLeft, IconChevronRight, IconDotsVertical, IconFile, IconLayoutGrid, IconList, IconPlus, IconSelector, IconTable, IconTrash } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 
@@ -160,6 +176,55 @@ function formatDate(iso: string): string {
 	});
 }
 
+function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
+	const deleteWorksheet = useDeleteWorksheet();
+	const [alertOpen, setAlertOpen] = useState(false);
+
+	return (
+		<>
+			<DropdownMenu>
+				<DropdownMenuTrigger
+					render={
+						<Button
+							variant="ghost"
+							size="icon-xs"
+							onClick={(e: React.MouseEvent) => e.stopPropagation()}
+						/>
+					}
+				>
+					<IconDotsVertical />
+					<span className="sr-only">Actions</span>
+				</DropdownMenuTrigger>
+				<DropdownMenuContent align="end">
+					<DropdownMenuItem onClick={() => setAlertOpen(true)}>
+						<IconTrash />
+						Delete
+					</DropdownMenuItem>
+				</DropdownMenuContent>
+			</DropdownMenu>
+			<AlertDialog open={alertOpen} onOpenChange={setAlertOpen}>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>Delete worksheet?</AlertDialogTitle>
+						<AlertDialogDescription>
+							Are you sure you want to delete &ldquo;{worksheet.name}&rdquo;?
+						</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel>Cancel</AlertDialogCancel>
+						<AlertDialogAction
+							variant="destructive"
+							onClick={() => deleteWorksheet.mutate(worksheet.id)}
+						>
+							Delete
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
+		</>
+	);
+}
+
 function TableView({
 	worksheets,
 	page,
@@ -179,6 +244,7 @@ function TableView({
 					<TableHead>Name</TableHead>
 					<TableHead>Created</TableHead>
 					<TableHead>Updated</TableHead>
+					<TableHead className="w-12" />
 				</TableRow>
 			</TableHeader>
 			<TableBody>
@@ -199,6 +265,9 @@ function TableView({
 						<TableCell className="font-medium">{worksheet.name}</TableCell>
 						<TableCell>{formatDate(worksheet.created_at)}</TableCell>
 						<TableCell>{formatDate(worksheet.updated_at)}</TableCell>
+						<TableCell>
+							<WorksheetActions worksheet={worksheet} />
+						</TableCell>
 					</TableRow>
 				))}
 			</TableBody>
@@ -212,23 +281,28 @@ function GridView({ worksheets }: { worksheets: Worksheet[] }) {
 	return (
 		<div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
 			{worksheets.map((worksheet) => (
-				<button
+				<div
 					key={worksheet.id}
-					type="button"
+					className="relative flex flex-col gap-2 rounded-xl border p-4 hover:bg-muted/50 transition-colors cursor-pointer"
 					onClick={() =>
 						navigate({
 							to: "/worksheets/$id",
 							params: { id: worksheet.id },
 						})
 					}
-					className="flex flex-col gap-2 rounded-xl border p-4 text-left hover:bg-muted/50 transition-colors cursor-pointer"
 				>
+					<div
+						className="absolute top-2 right-2"
+						onClick={(e) => e.stopPropagation()}
+					>
+						<WorksheetActions worksheet={worksheet} />
+					</div>
 					<IconFile className="size-8 text-muted-foreground" />
 					<span className="font-medium truncate">{worksheet.name}</span>
 					<span className="text-sm text-muted-foreground">
 						Created {formatDate(worksheet.created_at)}
 					</span>
-				</button>
+				</div>
 			))}
 		</div>
 	);
@@ -256,8 +330,11 @@ function ListView({ worksheets }: { worksheets: Worksheet[] }) {
 							Created {formatDate(worksheet.created_at)}
 						</ItemDescription>
 					</ItemContent>
-					<ItemActions className="self-center">
-						<IconSelector className="size-4 text-muted-foreground" />
+					<ItemActions
+						className="self-center"
+						onClick={(e: React.MouseEvent) => e.stopPropagation()}
+					>
+						<WorksheetActions worksheet={worksheet} />
 					</ItemActions>
 				</Item>
 			))}

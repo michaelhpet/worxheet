@@ -81,6 +81,22 @@ pub async fn get_worksheet(
 }
 
 #[tauri::command]
+pub async fn delete_worksheet(
+    state: State<'_, AppState>,
+    id: &str,
+) -> Result<(), String> {
+    let pool = &state.database;
+
+    sqlx::query("DELETE FROM worksheets WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|_| String::from("Failed to delete worksheet"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn create_worksheet(
     state: State<'_, AppState>,
     name: &str,

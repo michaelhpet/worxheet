@@ -14,9 +14,10 @@ import {
 interface FileCardProps {
 	path: string;
 	onRemove: (path: string) => void;
+	className?: string;
 }
 
-export function FileCard(props: FileCardProps) {
+export function FileCard({ className, ...props }: FileCardProps) {
 	const { data, error, isLoading } = useFileMetadata(props);
 
 	if (isLoading) {
@@ -33,7 +34,7 @@ export function FileCard(props: FileCardProps) {
 	};
 
 	return (
-		<Item className="group border-b-border rounded-none last:border-b-0">
+		<Item className={cn("group border-b-border rounded-none last:border-b-0", className)}>
 			<ItemContent>
 				<ItemTitle className="break-all">{data.name}</ItemTitle>
 				<ItemDescription>

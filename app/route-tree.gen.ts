@@ -9,73 +9,48 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as WorksheetsRouteImport } from './routes/worksheets'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as WorksheetsNewRouteImport } from './routes/worksheets.new'
 import { Route as WorksheetsIdRouteImport } from './routes/worksheets.$id'
 
-const WorksheetsRoute = WorksheetsRouteImport.update({
-  id: '/worksheets',
-  path: '/worksheets',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const WorksheetsNewRoute = WorksheetsNewRouteImport.update({
-  id: '/new',
-  path: '/new',
-  getParentRoute: () => WorksheetsRoute,
-} as any)
 const WorksheetsIdRoute = WorksheetsIdRouteImport.update({
-  id: '/$id',
-  path: '/$id',
-  getParentRoute: () => WorksheetsRoute,
+  id: '/worksheets/$id',
+  path: '/worksheets/$id',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/worksheets': typeof WorksheetsRouteWithChildren
   '/worksheets/$id': typeof WorksheetsIdRoute
-  '/worksheets/new': typeof WorksheetsNewRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/worksheets': typeof WorksheetsRouteWithChildren
   '/worksheets/$id': typeof WorksheetsIdRoute
-  '/worksheets/new': typeof WorksheetsNewRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
-  '/worksheets': typeof WorksheetsRouteWithChildren
   '/worksheets/$id': typeof WorksheetsIdRoute
-  '/worksheets/new': typeof WorksheetsNewRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/worksheets' | '/worksheets/$id' | '/worksheets/new'
+  fullPaths: '/' | '/worksheets/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/worksheets' | '/worksheets/$id' | '/worksheets/new'
-  id: '__root__' | '/' | '/worksheets' | '/worksheets/$id' | '/worksheets/new'
+  to: '/' | '/worksheets/$id'
+  id: '__root__' | '/' | '/worksheets/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
-  WorksheetsRoute: typeof WorksheetsRouteWithChildren
+  WorksheetsIdRoute: typeof WorksheetsIdRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/worksheets': {
-      id: '/worksheets'
-      path: '/worksheets'
-      fullPath: '/worksheets'
-      preLoaderRoute: typeof WorksheetsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
@@ -83,40 +58,19 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/worksheets/new': {
-      id: '/worksheets/new'
-      path: '/new'
-      fullPath: '/worksheets/new'
-      preLoaderRoute: typeof WorksheetsNewRouteImport
-      parentRoute: typeof WorksheetsRoute
-    }
     '/worksheets/$id': {
       id: '/worksheets/$id'
-      path: '/$id'
+      path: '/worksheets/$id'
       fullPath: '/worksheets/$id'
       preLoaderRoute: typeof WorksheetsIdRouteImport
-      parentRoute: typeof WorksheetsRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
 
-interface WorksheetsRouteChildren {
-  WorksheetsIdRoute: typeof WorksheetsIdRoute
-  WorksheetsNewRoute: typeof WorksheetsNewRoute
-}
-
-const WorksheetsRouteChildren: WorksheetsRouteChildren = {
-  WorksheetsIdRoute: WorksheetsIdRoute,
-  WorksheetsNewRoute: WorksheetsNewRoute,
-}
-
-const WorksheetsRouteWithChildren = WorksheetsRoute._addFileChildren(
-  WorksheetsRouteChildren,
-)
-
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
-  WorksheetsRoute: WorksheetsRouteWithChildren,
+  WorksheetsIdRoute: WorksheetsIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -26,6 +26,15 @@ pub struct Artifact {
     pub content: String,
 }
 
+#[derive(Clone, Serialize)]
+pub struct Paginated<T: Serialize> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+    pub total_pages: i64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ArtifactType {
     MultipleChoiceQuiz,

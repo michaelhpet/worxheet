@@ -4,6 +4,7 @@ use tauri::State;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+use crate::schema::Paginated;
 use crate::AppState;
 
 #[derive(Serialize, Deserialize, FromRow)]
@@ -28,16 +29,55 @@ impl Worksheet {
 }
 
 #[tauri::command]
-pub async fn get_worksheets(state: State<'_, AppState>) -> Result<Vec<Worksheet>, String> {
+pub async fn get_worksheets(
+    state: State<'_, AppState>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+) -> Result<Paginated<Worksheet>, String> {
     let pool = &state.database;
 
-    let query = sqlx::query_as::<_, Worksheet>("SELECT * FROM worksheets");
-    let worksheets = match query.fetch_all(pool).await {
-        Err(_) => return Err(String::from("Could not fetch worksheets")),
-        Ok(worksheets) => worksheets,
-    };
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * per_page;
 
-    Ok(worksheets)
+    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM worksheets")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| String::from("Failed to count worksheets"))?;
+
+    let items = sqlx::query_as::<_, Worksheet>(
+        "SELECT * FROM worksheets ORDER BY created_at DESC LIMIT ? OFFSET ?",
+    )
+    .bind(per_page)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| String::from("Could not fetch worksheets"))?;
+
+    let total_pages = (total.0 as f64 / per_page as f64).ceil() as i64;
+
+    Ok(Paginated {
+        items,
+        total: total.0,
+        page,
+        per_page,
+        total_pages,
+    })
+}
+
+#[tauri::command]
+pub async fn get_worksheet(
+    state: State<'_, AppState>,
+    id: &str,
+) -> Result<Worksheet, String> {
+    let pool = &state.database;
+
+    sqlx::query_as::<_, Worksheet>("SELECT * FROM worksheets WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| String::from("Failed to fetch worksheet"))?
+        .ok_or_else(|| String::from("Worksheet not found"))
 }
 
 #[tauri::command]

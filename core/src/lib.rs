@@ -27,6 +27,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             file::get_file_metadata,
             worksheet::get_worksheets,
+            worksheet::get_worksheet,
             worksheet::create_worksheet
         ])
         .run(tauri::generate_context!())

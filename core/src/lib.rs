@@ -3,6 +3,7 @@ use tauri::Manager;
 
 mod database;
 mod file;
+mod schema;
 mod worksheet;
 
 pub struct AppState {

@@ -2,30 +2,37 @@
 
 ## Overview
 
-Artifact generation is automatic — the user uploads materials and clicks "Generate". There is no user query. The pipeline ingests all documents, chunks them, embeds them, clusters by topic, and generates artifacts from evenly-sampled chunks per cluster.
+This document describes the artifact-generation pipeline as currently implemented. The wired end-to-end path today covers uploading, parsing, chunking, and storing chunks in SQLite (`ingest.rs`). Embedding and generation are implemented as tested modules but are not yet exposed as Tauri commands or persisted to the database. Clustering / topic-sampling for multi-artifact generation is planned but not built.
 
 ## Pipeline Steps
 
 ```
-Upload → Parse → Chunk → Embed → k-means cluster → Sample by position → SmolLM2 generate → Persist
+Upload ─► Parse ─► Chunk ─► Store        [wired — ingest.rs]
+   Embed                                [module implemented + tested]
+   Generate (grammar-constrained JSON)  [module implemented + tested]
+   RAG retrieve / cluster / persist     [planned]
 ```
 
 ## Step-by-Step
 
-### 1. Parse
+### 1. Upload
 
-Extract text from uploaded files using the appropriate parser:
+`create_worksheet` inserts the worksheet and registers each selected file in the `files` table (path, name, extension, size). The wiring between the file dialog and the worksheet lives in the frontend (`create-worksheet-dialog.tsx`).
+
+### 2. Parse
+
+`ingest.rs::parse_file` extracts text from each uploaded file:
 
 | Format | Parser |
 |---|---|
-| PDF | `pdf_oxide` |
+| PDF | `pdf_oxide` (page-by-page extraction) |
 | PPTX, DOCX, PPT, DOC | `office_oxide` |
 
-Output: raw text per file.
+Output: raw text per file. File status is updated to `parsing` before extraction and `parsed` on success.
 
-### 2. Chunk
+### 3. Chunk
 
-Split extracted text into overlapping chunks.
+`chunk.rs::chunk_text` splits extracted text into overlapping chunks sized by the HF `tokenizers` tokenizer.
 
 ```
 Config:
@@ -40,164 +47,127 @@ Example:
   ...
 ```
 
-Each chunk is stored in SQLite with a reference to its source file and position.
+### 4. Store
 
-### 3. Embed
-
-Each chunk is passed through `bge-small-en-v1.5` (via `mistralrs`) to produce a 384-dimensional float32 vector.
-
-```
-Chunk text → bge-small → [0.12, -0.45, 0.78, ..., 0.03] (384 f32s)
-```
-
-Embeddings are stored as BLOBs in SQLite alongside their chunk, within the same transaction.
-
-### 4. Cluster (k-means)
-
-When generation is triggered, all embeddings for the worksheet are loaded and clustered.
+`ingest.rs::process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`.
 
 ```rust
-fn k_means(chunks: &[Chunk], k: usize, max_iters: usize) -> Vec<Cluster>
-
-fn choose_k(num_chunks: usize) -> usize {
-    (num_chunks / 20).clamp(5, 30)
-}
+// ingest.rs — public entry point
+pub async fn process_files(
+    pool: &sqlx::SqlitePool,
+    worksheet_id: &str,
+    file_ids: &[String],
+    tokenizer: &Tokenizer,
+) -> Result<Vec<Chunk>, String>
 ```
 
-- Implementation: standard Lloyd's algorithm
-- Initialization: k-means++ (spreads initial centroids to avoid empty clusters)
-- Distance: cosine similarity
-- Convergence: break when no assignments change, or after `max_iters` (default 50)
-- Expected runtime: <50ms for ~5000 384-dim vectors
+The `embedding` BLOB column is present but currently left `NULL` (see Embed below).
 
-Output: `Vec<Cluster>` where each `Cluster` has a centroid vector and a list of member chunk IDs.
+### 5. Embed (module implemented)
 
-### 5. Sample by Position
-
-For each cluster, sort member chunks by their original document position and select chunks evenly across the full range.
-
-```
-Cluster "Photosynthesis" — 18 chunks, 6 samples
-  Selected: [c1, c4, c7, c11, c14, c18]  ← evenly spread by position
-```
+`embed.rs::Embedder` wraps `bge-small-en-v1.5` (Q8_0 GGUF, 384-dim) via llama.cpp. Texts are embedded one per decode call and L2-normalized (unit norm), so cosine similarity is a plain dot product.
 
 ```rust
-fn sample_by_position(chunks: &[&Chunk], max_samples: usize) -> Vec<&Chunk> {
-    if chunks.len() <= max_samples {
-        return chunks.to_vec();
-    }
+// embed.rs — public entry point
+pub struct Embedder { /* ... */ }
 
-    let step = (chunks.len() - 1) as f64 / (max_samples - 1) as f64;
-    (0..max_samples)
-        .map(|i| chunks[(i as f64 * step).round() as usize])
-        .collect()
-}
+pub fn load(model_path: &Path) -> Result<Self, String>
+pub fn dimension(&self) -> usize          // 384
+pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String>
 ```
 
-`max_samples` is derived per-cluster by dividing the available context window (~5K tokens after prompt + output overhead) by the average chunk token count, weighted by how many chunks belong to this cluster. Larger clusters get more samples proportionally.
+Status: the module builds and passes unit tests (`test_embed_similarity`). Storing vectors into the `chunks.embedding` BLOB and exposing an embed command are pending.
 
-### 6. Generate (SmolLM2-360M)
+### 6. Generate (module implemented)
 
-One LLM call per cluster. Each call sends the sampled chunks (concatenated in document order) wrapped in an artifact-specific prompt.
+`generation.rs::Generator` wraps `SmolLM2-360M-Instruct` (Q8_0 GGUF, 8K context) via llama.cpp.
 
-```
-Artifact types:
-  - Quiz: "Generate 3 MCQ questions testing higher-order thinking..."
-  - Summary: "Write a focused summary..."
-  - MindMap: "Extract key concepts and their relationships..."
-
-System prompt structure per call:
-  "You are an educational assessment generator. Based on the following
-   textbook passages, generate [artifact_type]. Return only valid JSON.
-   
-   Passages:
-   [sampled_chunks concatenated in position order]"
+```rust
+// generation.rs — public entry points
+pub fn load(model_path: &Path) -> Result<Self, String>
+pub fn apply_chat_template(&self, system: &str, user: &str) -> Result<String, String>
+pub fn generate(
+    &self,
+    prompt: &str,
+    schema_json: Option<&str>,
+    params: &GenerationParams,
+) -> Result<String, String>
 ```
 
-Each generation result is a structured artifact (e.g., JSON for MCQ items with question, options, correct answer, explanation).
+Generation characteristics:
 
-### 7. Persist
+- **Chat template**: prompts are built with the model's built-in chat template (system + user messages, `add_generation_prompt`).
+- **Grammar-constrained output**: when `schema_json` is provided, the schema is compiled to a GBNF grammar (`json_schema_to_grammar`) and sampling runs under `LlamaSampler::grammar`. The model can only emit JSON matching the schema.
+- **Sampling chain**: `[grammar?, temp?, top_p, dist(seed)]` applied to the logits via `LlamaTokenDataArray::apply_sampler`. This manual array path is used deliberately to avoid the `llama-cpp-2` grammar-sampler crash on `sampler.sample(ctx, idx)` (utilityai/llama-cpp-rs#1007).
+- **Termination**: generation stops on the model's EOG token. When the grammar completes, the grammar sampler masks everything but EOG, so the loop ends cleanly.
+- **Parameters**: `temperature` (default 0.7), `top_p` (default 0.9), `max_tokens` (default 1024), `seed` (default 1234). Context window `N_CTX = 8192`, max prompt `6144` tokens.
+- **Artifact schema**: e.g. an MCQ object with `question` and 4 `options`; the caller supplies the JSON schema.
 
-Generated artifacts are saved to SQLite with references to the worksheet and the source chunk cluster.
+Status: the module builds and passes `test_generate_grammar_json` (validates the output parses as JSON matching the schema). It is not yet exposed as a Tauri command, does not yet receive RAG context, and does not yet write to `artifacts`.
 
-## Data Model (SQLite additions to `worksheets`)
+## Data Model (SQLite)
 
 ```sql
--- Already exists
-CREATE TABLE worksheets (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- New tables needed
 CREATE TABLE files (
     id TEXT PRIMARY KEY,
-    worksheet_id TEXT NOT NULL REFERENCES worksheets(id),
+    worksheet_id TEXT NOT NULL REFERENCES worksheets(id) ON DELETE CASCADE,
     path TEXT NOT NULL,
     name TEXT NOT NULL,
     extension TEXT NOT NULL,
     size INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'uploaded',   -- uploaded | parsing | parsed
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE chunks (
     id TEXT PRIMARY KEY,
-    worksheet_id TEXT NOT NULL REFERENCES worksheets(id),
-    file_id TEXT NOT NULL REFERENCES files(id),
+    worksheet_id TEXT NOT NULL REFERENCES worksheets(id) ON DELETE CASCADE,
+    file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     text TEXT NOT NULL,
-    embedding BLOB,  -- 1536 bytes (384 × f32)
+    embedding BLOB,                            -- 1536 bytes (384 × f32), currently NULL
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE artifacts (
     id TEXT PRIMARY KEY,
-    worksheet_id TEXT NOT NULL REFERENCES worksheets(id),
-    artifact_type TEXT NOT NULL,  -- 'quiz' | 'summary' | 'mind_map'
-    source_chunk_id TEXT REFERENCES chunks(id),
-    content TEXT NOT NULL,         -- JSON payload
+    worksheet_id TEXT NOT NULL REFERENCES worksheets(id) ON DELETE CASCADE,
+    artifact_type TEXT NOT NULL,               -- 'MultipleChoiceQuiz' | 'Summary' | ...
+    source TEXT NOT NULL,
+    content TEXT NOT NULL,                     -- JSON payload
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
 ## Connection to Frontend
 
-When the user clicks "Generate", the frontend calls:
+Currently exposed Tauri commands (`lib.rs` invoke handler):
 
-```rust
-#[tauri::command]
-async fn generate_artifacts(
-    state: State<'_, AppState>,
-    worksheet_id: String,
-    artifact_type: ArtifactType,  // Quiz | Summary | MindMap
-) -> Result<Vec<Artifact>, String>
-```
+- `get_file_metadata`
+- `get_worksheets`, `get_worksheet`, `create_worksheet`, `delete_worksheet`
 
-The command streams progress via Tauri events:
+Pending wiring (next steps):
 
-```rust
-app_handle.emit("generation-progress", ProgressEvent {
-    cluster_index: i,
-    total_clusters: k,
-});
-```
-
-The frontend displays a progress bar showing cluster N of K being processed.
+- `process_files` (ingest → chunks) as a command
+- Embed chunks and persist to `chunks.embedding`
+- RAG retrieval (embed the prompt, cosine similarity over chunk BLOBs, top-k context)
+- `generate_artifacts` → persist to `artifacts` → return to the frontend
+- Progress events during generation and a workspace view in the worksheet detail route
 
 ## Module Layout (core/src/)
 
 ```
 core/src/
-├── lib.rs              # register commands, manage state
+├── lib.rs              # register commands, manage AppState
 ├── main.rs             # Tauri entry
 ├── database.rs         # SQLite connection + migration runner
+├── llm.rs              # Process-wide llama.cpp backend singleton
+├── models.rs           # GGUF model paths + hf-hub download
 ├── file.rs             # get_file_metadata command
 ├── worksheet.rs        # worksheet CRUD commands
 ├── chunk.rs            # text splitting logic
-├── ingest.rs           # parse + chunk + embed pipeline
-├── retrieval.rs        # k-means clustering + position-based sampling
-├── generation.rs       # SmolLM2 artifact generation
+├── ingest.rs           # parse + chunk + store pipeline
+├── embed.rs            # bge-small embeddings (module)
+├── generation.rs       # SmolLM2 grammar-constrained generation (module)
 └── schema.rs           # shared structs (Chunk, Cluster, Artifact, etc.)
 ```

@@ -3,8 +3,12 @@ use tauri::Manager;
 
 mod chunk;
 mod database;
+mod embed;
 mod file;
+mod generation;
 mod ingest;
+mod llm;
+mod models;
 mod schema;
 mod worksheet;
 

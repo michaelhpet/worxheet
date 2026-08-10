@@ -30,7 +30,13 @@ time = { version = "0.3.47", features = ["formatting", "parsing", "serde"] }
 tokenizers = "0.21"
 pdf_oxide = "0.3"
 office_oxide = "0.1"
-mistralrs = { version = "0.8", features = ["accelerate"] }
+llama-cpp-2 = "0.1.154"
+encoding_rs = "0.8"
+hf-hub = "0.4"
+ndarray = "0.16"
+hdbscan-rs = "0.6.1"
+linfa = "0.8.1"
+linfa-clustering = "0.8.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

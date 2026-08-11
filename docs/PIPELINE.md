@@ -47,11 +47,12 @@ Example:
 
 ### 4. Store
 
-`pipeline.rs::run_process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`. The same command drives file parsing end-to-end; it is exposed to the frontend as the `process_files` command.
+`pipeline.rs::run_process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`. The same command drives file parsing end-to-end; it is exposed to the frontend as the `process_files` command and emits an `ingestion-progress` event (`{ worksheet_id, done, total }`) as each file completes.
 
 ```rust
 // pipeline.rs — public entry point
 pub async fn run_process_files(
+    app: Option<&AppHandle>,
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
@@ -115,7 +116,7 @@ Generation characteristics:
 - **Parameters**: `temperature` (default 0.7), `top_p` (default 0.9), `max_tokens` (default 1024), `seed` (default 1234). Context window `N_CTX = 8192`, max prompt `6144` tokens.
 - **Artifact schemas**: `schema.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders.
 
-Status: wired. `generate_artifacts` writes the validated artifact JSON to the `artifacts` table and returns it to the frontend. It emits `generation-progress` events via the `AppHandle` while sampling.
+Status: wired. `generate_artifacts` writes the validated artifact JSON to the `artifacts` table and returns it to the frontend. It emits `generation-progress` events (`{ worksheet_id, done, total }`) via the `AppHandle` after each artifact.
 
 ### 8. Persist (wired)
 
@@ -165,12 +166,15 @@ Exposed Tauri commands (`lib.rs` invoke handler):
 - `process_files` — parse + chunk + store selected files
 - `embed_worksheet` — embed all un-embedded chunks and persist BLOBs
 - `retrieve_chunks` — RAG retrieval (top-k chunks by cosine similarity)
-- `generate_artifacts` — auto-embed, retrieve context, generate + persist an artifact (takes `worksheet_id`, `artifact_type`, optional `topic`, `GenerationParams`)
+- `generate_artifacts` — auto-embed, retrieve context, generate + persist artifacts (takes `worksheet_id`, `artifact_type`, optional `count`, optional `GenerationParams`)
 - `get_artifacts` — list a worksheet's generated artifacts
 
-Pending (next steps):
+Progress events (listened via `@tauri-apps/api/event`):
 
-- React workspace view in the worksheet detail route (listing artifacts, generation controls, progress indicators for the `generation-progress` events)
+- `ingestion-progress` — `{ worksheet_id, done, total }` per file during `process_files`
+- `generation-progress` — `{ worksheet_id, done, total }` per artifact during `generate_artifacts`
+
+The React worksheet detail route (`app/routes/worksheets.$id.tsx`) composes a files panel (parse status + processing with progress) and an artifacts panel (type-filtered artifact cards + a generate dialog with count and advanced sampling params).
 
 ## Module Layout (core/src/)
 

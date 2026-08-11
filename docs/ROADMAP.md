@@ -21,8 +21,8 @@ Core RAG pipeline for text-based documents.
 - [x] HOTS generation (`SmolLM2-360M-Instruct` via `llama-cpp-2`, grammar-constrained JSON for all 5 artifact types, `generate_artifacts` command)
 - [ ] Clustering / topic sampling for multi-artifact generation (k-means or HDBSCAN; `ndarray`/`hdbscan-rs`/`linfa` deps reserved)
 - [x] Artifact persistence (MCQ items, summaries, mind-maps in SQLite `artifacts` table)
-- [ ] React workspace view for generated artifacts (worksheet detail route currently a placeholder)
-- [ ] Generation progress indicators (backend emits `generation-progress` events; no UI yet)
+- [x] React workspace view for generated artifacts (worksheet detail route: file processing, generate dialog, artifact cards)
+- [x] Generation progress indicators (`ingestion-progress` + `generation-progress` events surfaced as progress bars)
 
 ## Phase 2 — Document Coverage
 

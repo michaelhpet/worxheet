@@ -45,6 +45,8 @@ top-k chunks most similar to the artifact task.
 7. **Generate** *(done)*: `generate_artifacts` auto-embeds any un-embedded chunks, retrieves top-k context, builds a chat-template prompt, and generates an artifact constrained to a JSON schema via a GBNF grammar (`json_schema_to_grammar`). All five artifact types (`MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap`) are supported.
 8. **Persist** *(done)*: Generated artifacts are validated, inserted into the `artifacts` table, and returned to the frontend via `get_artifacts`.
 
+The React worksheet detail route (`app/routes/worksheets.$id.tsx`) is the user-facing workspace: a files panel (parse status badges, "Process files" with live `ingestion-progress`), and an artifacts panel (type-filtered cards, a generate dialog with count + advanced sampling params, and live `generation-progress` while artifacts are produced).
+
 ## Inference
 
 Both models run in the single llama.cpp backend created once per process.
@@ -61,8 +63,8 @@ Both models run in the single llama.cpp backend created once per process.
 ```
 worxheet/
 ├── app/                          # React frontend
-│   ├── components/               # UI components (create-worksheet-dialog, files-uploader, ui/…)
-│   ├── data/                     # TanStack Query hooks + IPC wrappers
+│   ├── components/               # UI components (workspace/, create-worksheet-dialog, files-uploader, ui/…)
+│   ├── data/                     # TanStack Query hooks + IPC wrappers (worksheets, files, artifacts, progress events)
 │   ├── lib/                      # Types, utils, constants
 │   ├── routes/                   # File-based TanStack Router routes
 │   ├── index.css                 # Tailwind v4 entry
@@ -96,7 +98,7 @@ worxheet/
 ## Key Design Decisions
 
 ### Local-first, zero cloud dependencies
-All inference runs on-device via `llama-cpp-2`. No API keys, no third-party model serving. This guarantees privacy and offline operation. Models are downloaded once at first launch and stored in the app data directory.
+All inference runs on-device via `llama-cpp-2`. No API keys, no third-party model serving. This guarantees privacy and offline operation. Models are downloaded once, lazily on first use, and stored in the app data directory.
 
 ### Embeddings stored as SQLite BLOBs instead of a vector database
 At the expected scale (<10,000 chunks per worksheet), brute-force cosine similarity over float32 arrays stored in SQLite BLOBs takes under 1ms. No vector DB (LanceDB, Pinecone, etc.) is needed. This avoids adding ~170MB+ of dependencies and keeps the architecture simple.

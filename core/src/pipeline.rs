@@ -61,17 +61,20 @@ pub async fn get_files(
         .collect())
 }
 
-/// Parse, chunk, and store the given files of a worksheet.
+/// Parse, chunk, and store the given files of a worksheet. Emits
+/// `ingestion-progress` events as each file completes.
 #[tauri::command]
 pub async fn process_files(
     state: State<'_, AppState>,
+    app: AppHandle,
     worksheet_id: String,
     file_ids: Vec<String>,
 ) -> Result<Vec<Chunk>, String> {
-    run_process_files(&state.database, &state.models, &worksheet_id, &file_ids).await
+    run_process_files(Some(&app), &state.database, &state.models, &worksheet_id, &file_ids).await
 }
 
 pub async fn run_process_files(
+    app: Option<&AppHandle>,
     pool: &sqlx::SqlitePool,
     models: &Arc<ModelPool>,
     worksheet_id: &str,
@@ -82,7 +85,21 @@ pub async fn run_process_files(
         .await
         .map_err(|e| format!("Tokenizer task failed: {e}"))??;
 
-    ingest::process_files(pool, worksheet_id, file_ids, &tokenizer).await
+    let total = file_ids.len();
+    let mut on_progress = |done: usize, _total: usize| {
+        if let Some(app) = app {
+            let _ = app.emit(
+                "ingestion-progress",
+                serde_json::json!({
+                    "worksheet_id": worksheet_id,
+                    "done": done,
+                    "total": total,
+                }),
+            );
+        }
+    };
+
+    ingest::process_files(pool, worksheet_id, file_ids, &tokenizer, Some(&mut on_progress)).await
 }
 
 /// Embed every chunk of a worksheet that does not yet have an embedding and
@@ -501,7 +518,7 @@ mod tests {
         let pool = setup_db().await;
         let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
 
-        let chunks = run_process_files(&pool, &models, &worksheet_id, &[file_id])
+        let chunks = run_process_files(None, &pool, &models, &worksheet_id, &[file_id])
             .await
             .expect("process_files should succeed");
         assert!(!chunks.is_empty());
@@ -554,7 +571,7 @@ mod tests {
         };
         let pool = setup_db().await;
         let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
-        run_process_files(&pool, &models, &worksheet_id, &[file_id])
+        run_process_files(None, &pool, &models, &worksheet_id, &[file_id])
             .await
             .expect("process_files should succeed");
 

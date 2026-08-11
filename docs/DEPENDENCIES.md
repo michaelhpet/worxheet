@@ -18,17 +18,18 @@
 | `llama-cpp-sys-2` | FFI layer for llama.cpp | Generated bindings plus the bundled C++ llama.cpp source. Compiled at build time via `cc`/`cmake` (requires `cmake` + a C++ compiler, ~5 min). |
 | `tokenizers` 0.21 | Tokenization | Hugging Face tokenizers used by `chunk_text` to size and split document chunks. |
 | `encoding_rs` | Text decoding | Decodes generated tokens to UTF-8 in `generation.rs`. |
-| `hf-hub` 0.4 | Model download | Downloads the GGUF models from Hugging Face on first launch (`models.rs`). |
+| `hf-hub` 0.4 | Model download | Downloads the GGUF/tokenizer artifacts from Hugging Face on first use (`models.rs`). |
 | `ndarray`, `hdbscan-rs`, `linfa`, `linfa-clustering` | Clustering | Reserved for the planned clustering stage. Currently unused in code. |
 
-## AI Models (downloaded on first launch)
+## AI Models (downloaded on first use)
 
 | Model | Format | Size | Purpose |
 |---|---|---|---|
 | `bge-small-en-v1.5` Q8_0 | GGUF | ~27 MB | Text embedding. 384-dimensional vectors, L2-normalized. Repo: `ggml-org/bge-small-en-v1.5-Q8_0-GGUF` |
 | `SmolLM2-360M-Instruct` Q8_0 | GGUF | ~365 MB | Text generation. Grammar-constrained JSON artifacts (MCQs, summaries, mind-maps). 8K context window. Repo: `HuggingFaceTB/SmolLM2-360M-Instruct-GGUF` |
+| `SmolLM2-360M-Instruct` `tokenizer.json` | JSON | ~2 MB | BPE tokenizer used by `chunk_text` to size and split document chunks. Repo: `HuggingFaceTB/SmolLM2-360M-Instruct` |
 
-Models are stored under the app data directory (`models/`). Tests may override the location with the `WORXHEET_MODELS_DIR` environment variable.
+Models are stored under the app data directory (`models/`). `models.rs` lazily downloads each artifact on first use (via the `ModelPool`); tests may override the location with the `WORXHEET_MODELS_DIR` environment variable.
 
 ## Frontend Dependencies (package.json)
 
@@ -43,7 +44,7 @@ Models are stored under the app data directory (`models/`). Tests may override t
 | `@tauri-apps/plugin-opener` | Frontend binding for opening external files |
 | `react` / `react-dom` 19 | UI runtime |
 | `tailwindcss` 4 | Utility-first CSS framework |
-| `@base-ui/react` | Headless UI primitives (button, dialog, field, etc.) |
+| `@base-ui/react` | Headless UI primitives (button, dialog, field, progress, etc.) |
 | `shadcn` | Component CLI/registry used for the `ui/` components |
 | `zod` | Runtime schema validation for forms and IPC payloads |
 | `class-variance-authority` | Component variant API (used by shadcn components) |

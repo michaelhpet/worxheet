@@ -36,11 +36,13 @@ pub async fn process_files(
     worksheet_id: &str,
     file_ids: &[String],
     tokenizer: &Tokenizer,
+    mut on_progress: Option<&mut (dyn FnMut(usize, usize) + Send)>,
 ) -> Result<Vec<Chunk>, String> {
     let mut all_chunks = Vec::new();
     let mut position_counter = 0i32;
+    let total = file_ids.len();
 
-    for file_id in file_ids {
+    for (index, file_id) in file_ids.iter().enumerate() {
         let row = sqlx::query_as::<_, (String, String, String)>(
             "SELECT path, extension, name FROM files WHERE id = ? AND worksheet_id = ?",
         )
@@ -94,6 +96,10 @@ pub async fn process_files(
             .execute(pool)
             .await
             .map_err(|_| format!("Failed to update file status"))?;
+
+        if let Some(on_progress) = on_progress.as_deref_mut() {
+            on_progress(index + 1, total);
+        }
     }
 
     sqlx::query("UPDATE worksheets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
@@ -191,7 +197,7 @@ mod tests {
         let worksheet_id = seed_worksheet(&pool).await;
         let tokenizer = test_tokenizer();
 
-        let result = process_files(&pool, &worksheet_id, &[], &tokenizer)
+        let result = process_files(&pool, &worksheet_id, &[], &tokenizer, None)
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -204,7 +210,7 @@ mod tests {
         let tokenizer = test_tokenizer();
         let bad_id = ulid::Ulid::new().to_string();
 
-        let result = process_files(&pool, &worksheet_id, &[bad_id], &tokenizer).await;
+        let result = process_files(&pool, &worksheet_id, &[bad_id], &tokenizer, None).await;
         assert!(result.is_err());
     }
 
@@ -228,7 +234,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = process_files(&pool, &worksheet_id, &[file_id], &tokenizer).await;
+        let result = process_files(&pool, &worksheet_id, &[file_id], &tokenizer, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unsupported"));
     }
@@ -254,7 +260,7 @@ mod tests {
         .await
         .unwrap();
 
-        let chunks = process_files(&pool, &worksheet_id, &[file_id.clone()], &tokenizer)
+        let chunks = process_files(&pool, &worksheet_id, &[file_id.clone()], &tokenizer, None)
             .await
             .unwrap();
 
@@ -291,7 +297,7 @@ mod tests {
         .await
         .unwrap();
 
-        let chunks = process_files(&pool, &worksheet_id, &[file_id.clone()], &tokenizer)
+        let chunks = process_files(&pool, &worksheet_id, &[file_id.clone()], &tokenizer, None)
             .await
             .unwrap();
 
@@ -304,5 +310,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "parsed");
+    }
+
+    #[tokio::test]
+    async fn test_process_files_reports_progress() {
+        let pool = setup_test_db().await;
+        let worksheet_id = seed_worksheet(&pool).await;
+        let tokenizer = test_tokenizer();
+
+        let mut file_ids = Vec::new();
+        for (idx, ext) in ["pdf", "docx"].iter().enumerate() {
+            let file_id = ulid::Ulid::new().to_string();
+            let path = format!("{}/test.{}", FIXTURE_DIR, ext);
+            sqlx::query(
+                "INSERT INTO files (id, worksheet_id, path, name, extension, size) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&file_id)
+            .bind(&worksheet_id)
+            .bind(&path)
+            .bind(format!("test.{ext}"))
+            .bind(*ext)
+            .bind((idx + 1) as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+            file_ids.push(file_id);
+        }
+
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        process_files(
+            &pool,
+            &worksheet_id,
+            &file_ids,
+            &tokenizer,
+            Some(&mut |done, total| calls.push((done, total))),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls, vec![(1, 2), (2, 2)]);
     }
 }

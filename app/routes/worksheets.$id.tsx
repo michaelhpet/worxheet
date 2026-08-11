@@ -1,3 +1,5 @@
+import { ArtifactsPanel } from "@/components/workspace/artifacts-panel";
+import { FilesPanel } from "@/components/workspace/files-panel";
 import { useWorksheet } from "@/data/worksheets";
 import { createFileRoute, Link } from "@tanstack/react-router";
 
@@ -27,7 +29,7 @@ function WorksheetDetail() {
 
 	return (
 		<main className="w-screen h-screen flex flex-col">
-			<header className="flex items-center gap-4 px-6 py-4 border-b">
+			<header className="flex items-center gap-4 px-6 py-4 border-b shrink-0">
 				<Link
 					to="/"
 					className="text-sm text-muted-foreground hover:text-foreground transition-colors"
@@ -36,8 +38,11 @@ function WorksheetDetail() {
 				</Link>
 				<h1 className="text-xl font-semibold">{worksheet.name}</h1>
 			</header>
-			<div className="flex-1 flex items-center justify-center">
-				<p className="text-muted-foreground">Workspace coming soon</p>
+			<div className="flex-1 overflow-auto">
+				<div className="mx-auto flex max-w-6xl flex-col gap-6 p-6 lg:grid lg:grid-cols-[minmax(0,360px)_minmax(0,1fr)] lg:items-start">
+					<FilesPanel worksheetId={id} />
+					<ArtifactsPanel worksheetId={id} />
+				</div>
 			</div>
 		</main>
 	);

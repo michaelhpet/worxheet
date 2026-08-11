@@ -22,9 +22,9 @@ The project is structured as a high-performance monolith:
 
 - Build: Vite, pnpm
 
-- AI/LLM: `pdf_oxide` (PDF extraction), `bge-small-en-v1.5` (Embeddings, GGUF), `SmolLM2-360M-Instruct` (HOTS Generation, GGUF, ~271MB)
+- AI/LLM: `pdf_oxide` + `office_oxide` (document extraction), `bge-small-en-v1.5` (Embeddings, GGUF, ~27MB), `SmolLM2-360M-Instruct` (HOTS Generation, GGUF, ~365MB)
 
-- AI Runtime: `mistralrs` + `candle` (pure Rust, local inference)
+- AI Runtime: `llama-cpp-2` (local inference, grammar-constrained sampling)
 
 - Database: SQLite (Embedded, including vector storage as BLOBs)
 
@@ -34,13 +34,13 @@ The project is structured as a high-performance monolith:
 
 - Ingestion: User creates a "Worksheet" and uploads files.
 
-- Parsing: Rust core uses `pdf_oxide` to extract structured Markdown from PDFs locally (no cloud API).
+- Parsing: Rust core uses `pdf_oxide` (PDF) and `office_oxide` (PPTX/DOCX/PPT/DOC) to extract text locally (no cloud API).
 
-- Vectorization: Text chunks are embedded via `bge-small-en-v1.5` (GGUF) running in `mistralrs` and stored as BLOBs in SQLite.
+- Vectorization: Text chunks are embedded via `bge-small-en-v1.5` (GGUF) running in `llama-cpp-2` and stored as BLOBs in SQLite.
 
-- Generation: Cosine similarity over SQLite retrieves relevant chunks; `SmolLM2-360M-Instruct` (GGUF) generates MCQ items and summaries via few-shot prompting — all local, no external API calls.
+- Generation: Cosine similarity over SQLite retrieves relevant chunks; `SmolLM2-360M-Instruct` (GGUF) generates grammar-constrained JSON artifacts (MCQs, essays, fill-in-the-blank, summaries, mind-maps) — all local, no external API calls.
 
-- Consumption: Artifacts are saved to SQLite and rendered in the React Workspace.
+- Consumption: Artifacts are saved to SQLite and rendered in the React workspace.
 
 ## 📄 License
 

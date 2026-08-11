@@ -98,6 +98,17 @@ impl Generator {
             ));
         }
 
+        // Cap generation so the total sequence never overflows the context
+        // window, leaving one slot for the token currently being decoded.
+        let prompt_tokens = tokens.len() as i32;
+        let budget = params.max_tokens.min(N_CTX as i32 - prompt_tokens - 1);
+        if budget <= 0 {
+            return Err(format!(
+                "Prompt fills the {N_CTX}-token context window ({} prompt tokens leave no room for output)",
+                prompt_tokens
+            ));
+        }
+
         let mut batch = LlamaBatch::new(512, 1);
         let last_index = (tokens.len() - 1) as i32;
         for (i, token) in (0..).zip(&tokens) {
@@ -128,8 +139,9 @@ impl Generator {
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
         let mut n_cur = batch.n_tokens();
+        let mut generated = 0i32;
 
-        while n_cur <= params.max_tokens {
+        while generated < budget {
             let idx = (batch.n_tokens() - 1) as i32;
             let logits = ctx.get_logits_ith(idx);
             let mut data_array = LlamaTokenDataArray::from_iter(
@@ -157,6 +169,7 @@ impl Generator {
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| format!("Failed to add generated token: {e}"))?;
             n_cur += 1;
+            generated += 1;
             ctx.decode(&mut batch)
                 .map_err(|e| format!("Failed to decode generated token: {e}"))?;
         }

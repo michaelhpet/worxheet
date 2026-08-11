@@ -23,7 +23,7 @@ interface CreateWorksheetDialogProps {
 }
 
 const worksheetSchema = z.object({
-	name: z.string().min(1, "Worksheet name is required"),
+	name: z.string().trim(),
 });
 
 export function CreateWorksheetDialog({
@@ -92,8 +92,7 @@ export function CreateWorksheetDialog({
 										onChange={(e) => field.handleChange(e.target.value)}
 										onBlur={field.handleBlur}
 										aria-invalid={
-											field.state.meta.isTouched &&
-											!field.state.meta.isValid
+											field.state.meta.isTouched && !field.state.meta.isValid
 										}
 									/>
 									{field.state.meta.isTouched &&

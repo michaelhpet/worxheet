@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -39,11 +40,13 @@ impl Embedder {
             return Ok(Vec::new());
         }
 
+        let n_ctx_train = self.model.n_ctx_train();
         let threads = std::thread::available_parallelism()
             .map(|n| n.get() as i32)
             .unwrap_or(4);
         let ctx_params = LlamaContextParams::default()
             .with_embeddings(true)
+            .with_n_ctx(NonZeroU32::new(n_ctx_train))
             .with_n_threads_batch(threads);
         let mut ctx = self
             .model
@@ -54,16 +57,15 @@ impl Embedder {
         let mut output = Vec::with_capacity(texts.len());
 
         for text in texts {
-            let tokens = self
+            let mut tokens = self
                 .model
                 .str_to_token(text, AddBos::Always)
                 .map_err(|e| format!("Failed to tokenize text: {e}"))?;
+            // Chunks are sized up to 512 tokens, but re-tokenization and the
+            // BOS token can push them past the model's context window. Truncate
+            // from the end instead of failing so every chunk is embeddable.
             if tokens.len() > n_ctx {
-                return Err(format!(
-                    "Text exceeds embedding context window ({} > {} tokens)",
-                    tokens.len(),
-                    n_ctx
-                ));
+                tokens.truncate(n_ctx);
             }
 
             let mut batch = LlamaBatch::new(n_ctx, 1);
@@ -163,5 +165,26 @@ mod tests {
         let embedder = Embedder::load(&path).expect("should load model");
         let result = embedder.embed(&[]).expect("empty batch should succeed");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_embed_long_text_truncates() {
+        let path = models_dir().join("bge-small-en-v1.5-q8_0.gguf");
+        if !path.exists() {
+            eprintln!("skipping: embedding model not found at {}", path.display());
+            return;
+        }
+        let embedder = Embedder::load(&path).expect("should load model");
+
+        // ~700 tokens of plain text, well past the 512-token window.
+        let long_text = "the mitochondrion is the powerhouse of the cell ".repeat(700);
+        let vectors = embedder
+            .embed(&[&long_text])
+            .expect("long text should embed (truncated) instead of erroring");
+
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].len(), 384);
+        let norm: f32 = vectors[0].iter().map(|v| v * v).sum();
+        assert!((norm - 1.0).abs() < 1e-3, "vectors should be normalized");
     }
 }

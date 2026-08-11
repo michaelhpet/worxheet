@@ -6,8 +6,14 @@ import {
 } from "@tabler/icons-react";
 
 import { useFiles, useProcessFiles, type FileStatus } from "@/data/files";
+import {
+	formatDownloadProgress,
+	modelDownloadLabel,
+	useModelDownload,
+} from "@/data/model-downloads";
 import { usePipelineProgress } from "@/data/progress";
 import { FILE_TYPES } from "@/lib/constants";
+import { toErrorMessage } from "@/lib/errors";
 import { cn, formatBytes } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -54,6 +60,7 @@ export function FilesPanel({ worksheetId }: FilesPanelProps) {
 	const { data: files, isLoading } = useFiles(worksheetId);
 	const processFiles = useProcessFiles(worksheetId);
 	const progress = usePipelineProgress("ingestion-progress", worksheetId);
+	const download = useModelDownload();
 
 	const allFiles = files ?? [];
 	const unparsed = allFiles.filter((file) => file.status !== "parsed");
@@ -121,7 +128,27 @@ export function FilesPanel({ worksheetId }: FilesPanelProps) {
 				)}
 			</CardContent>
 			<CardFooter className="flex-col items-stretch gap-2">
-				{processing && (
+				{processing && download?.active && (
+					<div className="flex flex-col gap-1">
+						<div className="flex items-center justify-between text-xs text-muted-foreground">
+							<span className="flex items-center gap-1.5">
+								<IconLoader className="size-3.5 animate-spin" />
+								Downloading {modelDownloadLabel(download.kind)}
+							</span>
+							<span className="tabular-nums">
+								{formatDownloadProgress(download.done, download.total)}
+							</span>
+						</div>
+						<Progress
+							value={
+								download.total > 0
+									? Math.round((download.done / download.total) * 100)
+									: 0
+							}
+						/>
+					</div>
+				)}
+				{processing && !download?.active && (
 					<div className="flex flex-col gap-1">
 						<div className="flex items-center justify-between text-xs text-muted-foreground">
 							<span className="flex items-center gap-1.5">
@@ -153,6 +180,11 @@ export function FilesPanel({ worksheetId }: FilesPanelProps) {
 						<IconRefresh />
 						All files processed
 					</Button>
+				)}
+				{processFiles.error && (
+					<p className="text-sm text-destructive">
+						{toErrorMessage(processFiles.error)}
+					</p>
 				)}
 			</CardFooter>
 		</Card>

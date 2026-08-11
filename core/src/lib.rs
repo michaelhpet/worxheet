@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use sqlx::{Pool, Sqlite};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
-use crate::models::ModelPool;
+use crate::models::{ModelFileKind, ModelPool, ProgressSink};
 
 mod chunk;
 mod database;
@@ -33,7 +33,23 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .map_err(|e| e.to_string())?;
-            let models = Arc::new(ModelPool::new(models::models_dir(&app_data_dir)));
+            let on_model_download: Arc<ProgressSink> = {
+                let app = handle.clone();
+                Arc::new(move |kind: ModelFileKind, done: u64, total: u64| {
+                    let _ = app.emit(
+                        "model-download",
+                        serde_json::json!({
+                            "kind": kind.as_str(),
+                            "done": done,
+                            "total": total,
+                        }),
+                    );
+                })
+            };
+            let models = Arc::new(ModelPool::with_progress(
+                models::models_dir(&app_data_dir),
+                Some(on_model_download),
+            ));
             app.manage(AppState {
                 database: pool,
                 models,

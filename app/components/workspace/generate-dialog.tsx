@@ -20,8 +20,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { useGenerateArtifacts } from "@/data/artifacts";
+import {
+	formatDownloadProgress,
+	modelDownloadLabel,
+	useModelDownload,
+} from "@/data/model-downloads";
 import { usePipelineProgress } from "@/data/progress";
 import { ARTIFACT_TYPE_OPTIONS, type ArtifactType } from "@/lib/artifact-types";
+import { toErrorMessage } from "@/lib/errors";
 import { cn } from "@/lib/utils";
 
 interface GenerateDialogProps {
@@ -46,6 +52,7 @@ export function GenerateDialog({
 
 	const generate = useGenerateArtifacts(worksheetId);
 	const progress = usePipelineProgress("generation-progress", worksheetId);
+	const download = useModelDownload();
 
 	const percent =
 		progress && progress.total > 0
@@ -207,7 +214,27 @@ export function GenerateDialog({
 						</div>
 					)}
 
-					{busy && (
+					{busy && download?.active && (
+						<div className="flex flex-col gap-1">
+							<div className="flex items-center justify-between text-xs text-muted-foreground">
+								<span className="flex items-center gap-1.5">
+									<IconLoader className="size-3.5 animate-spin" />
+									Downloading {modelDownloadLabel(download.kind)}
+								</span>
+								<span className="tabular-nums">
+									{formatDownloadProgress(download.done, download.total)}
+								</span>
+							</div>
+							<Progress
+								value={
+									download.total > 0
+										? Math.round((download.done / download.total) * 100)
+										: 0
+								}
+							/>
+						</div>
+					)}
+					{busy && !download?.active && (
 						<div className="flex flex-col gap-1">
 							<div className="flex items-center justify-between text-xs text-muted-foreground">
 								<span className="flex items-center gap-1.5">
@@ -223,7 +250,9 @@ export function GenerateDialog({
 					)}
 
 					{generate.error && (
-						<p className="text-sm text-destructive">{generate.error.message}</p>
+						<p className="text-sm text-destructive">
+							{toErrorMessage(generate.error)}
+						</p>
 					)}
 				</div>
 

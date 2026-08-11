@@ -22,6 +22,7 @@ impl Embedder {
     }
 
     /// Embedding vector width of the loaded model.
+    #[allow(dead_code)] // used by tests and useful for consumers
     pub fn dimension(&self) -> usize {
         self.model.n_embd() as usize
     }

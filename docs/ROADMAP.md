@@ -1,6 +1,6 @@
 # Roadmap
 
-Status legend: `[x]` done · `[~]` module implemented, end-to-end wiring pending · `[ ]` not started.
+Status legend: `[x]` done · `[ ]` not started.
 
 ## Phase 1 — MVP
 
@@ -14,15 +14,15 @@ Core RAG pipeline for text-based documents.
 - [x] PPTX / DOCX text extraction via `office_oxide`
 - [x] Text chunking (recursive split, 512 tokens / 128 overlap)
 - [x] Parse → chunk → store pipeline (`ingest.rs`, wired into SQLite)
-- [x] Model auto-download via `hf-hub` (Q8_0 GGUFs, `models.rs`)
-- [~] Embedding module (`bge-small-en-v1.5` via `llama-cpp-2`, `embed.rs`) — built + tested; not yet exposed as a command
-- [ ] Embedding storage as SQLite BLOBs (`chunks.embedding` currently `NULL`)
-- [ ] RAG retrieval (cosine similarity in Rust over chunk BLOBs)
-- [~] HOTS generation module (`SmolLM2-360M-Instruct` via `llama-cpp-2`, grammar-constrained JSON, `generation.rs`) — built + tested; not yet wired to a command, RAG context, or persistence
+- [x] Model auto-download via `hf-hub` (Q8_0 GGUFs + `tokenizer.json`, `models.rs`; lazy `ModelPool`)
+- [x] Embedding pipeline (`bge-small-en-v1.5` via `llama-cpp-2`, `embed.rs` + `embed_worksheet` command)
+- [x] Embedding storage as SQLite BLOBs (`chunks.embedding`)
+- [x] RAG retrieval (cosine similarity in Rust over chunk BLOBs, `retrieve_chunks` command)
+- [x] HOTS generation (`SmolLM2-360M-Instruct` via `llama-cpp-2`, grammar-constrained JSON for all 5 artifact types, `generate_artifacts` command)
 - [ ] Clustering / topic sampling for multi-artifact generation (k-means or HDBSCAN; `ndarray`/`hdbscan-rs`/`linfa` deps reserved)
-- [ ] Artifact persistence (MCQ items, summaries, mind-maps in SQLite `artifacts` table)
+- [x] Artifact persistence (MCQ items, summaries, mind-maps in SQLite `artifacts` table)
 - [ ] React workspace view for generated artifacts (worksheet detail route currently a placeholder)
-- [ ] Generation progress indicators
+- [ ] Generation progress indicators (backend emits `generation-progress` events; no UI yet)
 
 ## Phase 2 — Document Coverage
 

@@ -2,15 +2,13 @@
 
 ## Overview
 
-This document describes the artifact-generation pipeline as currently implemented. The wired end-to-end path today covers uploading, parsing, chunking, and storing chunks in SQLite (`ingest.rs`). Embedding and generation are implemented as tested modules but are not yet exposed as Tauri commands or persisted to the database. Clustering / topic-sampling for multi-artifact generation is planned but not built.
+This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, chunk, store, embed, retrieve, generate, persist — is wired end-to-end through Tauri commands (`pipeline.rs`) and SQLite. Clustering / topic-sampling for multi-artifact generation is planned but not built; for now `generate_artifacts` uses the top-k chunks most similar to the artifact task as context.
 
 ## Pipeline Steps
 
 ```
-Upload ─► Parse ─► Chunk ─► Store        [wired — ingest.rs]
-   Embed                                [module implemented + tested]
-   Generate (grammar-constrained JSON)  [module implemented + tested]
-   RAG retrieve / cluster / persist     [planned]
+Upload ─► Parse ─► Chunk ─► Store ─► Embed ─► Retrieve ─► Generate ─► Persist
+   [wired — pipeline.rs commands + SQLite]
 ```
 
 ## Step-by-Step
@@ -49,23 +47,23 @@ Example:
 
 ### 4. Store
 
-`ingest.rs::process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`.
+`pipeline.rs::run_process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`. The same command drives file parsing end-to-end; it is exposed to the frontend as the `process_files` command.
 
 ```rust
-// ingest.rs — public entry point
-pub async fn process_files(
-    pool: &sqlx::SqlitePool,
+// pipeline.rs — public entry point
+pub async fn run_process_files(
+    pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
-    tokenizer: &Tokenizer,
+    models: &Arc<ModelPool>,
 ) -> Result<Vec<Chunk>, String>
 ```
 
-The `embedding` BLOB column is present but currently left `NULL` (see Embed below).
+The `embedding` BLOB column starts `NULL` and is populated by the embed step.
 
-### 5. Embed (module implemented)
+### 5. Embed (wired)
 
-`embed.rs::Embedder` wraps `bge-small-en-v1.5` (Q8_0 GGUF, 384-dim) via llama.cpp. Texts are embedded one per decode call and L2-normalized (unit norm), so cosine similarity is a plain dot product.
+`pipeline.rs::run_embed_worksheet` lazily loads the embedding model from `ModelPool` and runs `embed.rs::Embedder` (wraps `bge-small-en-v1.5`, Q8_0 GGUF, 384-dim). Un-embedded chunks are read from the DB, embedded (L2-normalized, so cosine similarity is a plain dot product), and written back to `chunks.embedding` as a float32 BLOB.
 
 ```rust
 // embed.rs — public entry point
@@ -76,11 +74,25 @@ pub fn dimension(&self) -> usize          // 384
 pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String>
 ```
 
-Status: the module builds and passes unit tests (`test_embed_similarity`). Storing vectors into the `chunks.embedding` BLOB and exposing an embed command are pending.
+Status: wired. `embed_worksheet` persists vectors to the BLOB column; `generate_artifacts` also auto-embeds any chunks that are still missing vectors, so a worksheet can skip the explicit embed step.
 
-### 6. Generate (module implemented)
+### 6. Retrieve (wired)
 
-`generation.rs::Generator` wraps `SmolLM2-360M-Instruct` (Q8_0 GGUF, 8K context) via llama.cpp.
+`pipeline.rs::run_retrieve_chunks` embeds a query and returns the top-k chunks by cosine similarity (`retrieval.rs`). BLOBs are decoded to `Vec<f32>` and compared by dot product on the L2-normalized vectors.
+
+```rust
+// retrieval.rs — public entry point
+pub async fn retrieve(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<RetrievedChunk>, String>
+```
+
+### 7. Generate (wired)
+
+`pipeline.rs::run_generate_artifacts` wraps `generation.rs::Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) auto-embeds any un-embedded chunks, (2) retrieves the top-k chunks most similar to the artifact task, (3) builds the task prompt with that context, and (4) generates schema-constrained JSON.
 
 ```rust
 // generation.rs — public entry points
@@ -97,13 +109,17 @@ pub fn generate(
 Generation characteristics:
 
 - **Chat template**: prompts are built with the model's built-in chat template (system + user messages, `add_generation_prompt`).
-- **Grammar-constrained output**: when `schema_json` is provided, the schema is compiled to a GBNF grammar (`json_schema_to_grammar`) and sampling runs under `LlamaSampler::grammar`. The model can only emit JSON matching the schema.
+- **Grammar-constrained output**: the artifact JSON schema is compiled to a GBNF grammar (`json_schema_to_grammar`) and sampling runs under `LlamaSampler::grammar`. The model can only emit JSON matching the schema.
 - **Sampling chain**: `[grammar?, temp?, top_p, dist(seed)]` applied to the logits via `LlamaTokenDataArray::apply_sampler`. This manual array path is used deliberately to avoid the `llama-cpp-2` grammar-sampler crash on `sampler.sample(ctx, idx)` (utilityai/llama-cpp-rs#1007).
 - **Termination**: generation stops on the model's EOG token. When the grammar completes, the grammar sampler masks everything but EOG, so the loop ends cleanly.
 - **Parameters**: `temperature` (default 0.7), `top_p` (default 0.9), `max_tokens` (default 1024), `seed` (default 1234). Context window `N_CTX = 8192`, max prompt `6144` tokens.
-- **Artifact schema**: e.g. an MCQ object with `question` and 4 `options`; the caller supplies the JSON schema.
+- **Artifact schemas**: `schema.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders.
 
-Status: the module builds and passes `test_generate_grammar_json` (validates the output parses as JSON matching the schema). It is not yet exposed as a Tauri command, does not yet receive RAG context, and does not yet write to `artifacts`.
+Status: wired. `generate_artifacts` writes the validated artifact JSON to the `artifacts` table and returns it to the frontend. It emits `generation-progress` events via the `AppHandle` while sampling.
+
+### 8. Persist (wired)
+
+Validated artifacts are inserted into the `artifacts` table (with `artifact_type` and `source`) and listed back to the frontend by the `get_artifacts` command.
 
 ## Data Model (SQLite)
 
@@ -125,7 +141,7 @@ CREATE TABLE chunks (
     file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     text TEXT NOT NULL,
-    embedding BLOB,                            -- 1536 bytes (384 × f32), currently NULL
+    embedding BLOB,                            -- 1536 bytes (384 × f32), NULL until embed step runs
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -141,33 +157,37 @@ CREATE TABLE artifacts (
 
 ## Connection to Frontend
 
-Currently exposed Tauri commands (`lib.rs` invoke handler):
+Exposed Tauri commands (`lib.rs` invoke handler):
 
 - `get_file_metadata`
 - `get_worksheets`, `get_worksheet`, `create_worksheet`, `delete_worksheet`
+- `get_files` — list a worksheet's files with parse status
+- `process_files` — parse + chunk + store selected files
+- `embed_worksheet` — embed all un-embedded chunks and persist BLOBs
+- `retrieve_chunks` — RAG retrieval (top-k chunks by cosine similarity)
+- `generate_artifacts` — auto-embed, retrieve context, generate + persist an artifact (takes `worksheet_id`, `artifact_type`, optional `topic`, `GenerationParams`)
+- `get_artifacts` — list a worksheet's generated artifacts
 
-Pending wiring (next steps):
+Pending (next steps):
 
-- `process_files` (ingest → chunks) as a command
-- Embed chunks and persist to `chunks.embedding`
-- RAG retrieval (embed the prompt, cosine similarity over chunk BLOBs, top-k context)
-- `generate_artifacts` → persist to `artifacts` → return to the frontend
-- Progress events during generation and a workspace view in the worksheet detail route
+- React workspace view in the worksheet detail route (listing artifacts, generation controls, progress indicators for the `generation-progress` events)
 
 ## Module Layout (core/src/)
 
 ```
 core/src/
-├── lib.rs              # register commands, manage AppState
+├── lib.rs              # register commands, manage AppState (database + models)
 ├── main.rs             # Tauri entry
 ├── database.rs         # SQLite connection + migration runner
 ├── llm.rs              # Process-wide llama.cpp backend singleton
-├── models.rs           # GGUF model paths + hf-hub download
+├── models.rs           # GGUF/tokenizer paths + hf-hub download + lazy ModelPool
 ├── file.rs             # get_file_metadata command
 ├── worksheet.rs        # worksheet CRUD commands
 ├── chunk.rs            # text splitting logic
 ├── ingest.rs           # parse + chunk + store pipeline
-├── embed.rs            # bge-small embeddings (module)
-├── generation.rs       # SmolLM2 grammar-constrained generation (module)
-└── schema.rs           # shared structs (Chunk, Cluster, Artifact, etc.)
+├── embed.rs            # bge-small embeddings
+├── retrieval.rs        # embedding BLOB encode/decode + cosine retrieval
+├── generation.rs       # SmolLM2 grammar-constrained generation
+├── pipeline.rs         # end-to-end commands + testable run_* cores
+└── schema.rs           # shared structs (Chunk, Artifact, ArtifactType, GenerationParams, …)
 ```

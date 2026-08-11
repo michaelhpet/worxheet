@@ -1,6 +1,8 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 
+use serde::Deserialize;
+
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -12,6 +14,7 @@ use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::json_schema_to_grammar;
 
 use crate::llm::backend;
+use crate::schema::ArtifactType;
 
 const N_CTX: u32 = 8192;
 const MAX_PROMPT_TOKENS: i32 = 6144;
@@ -21,6 +24,7 @@ pub struct Generator {
     model: LlamaModel,
 }
 
+#[derive(Clone, Deserialize)]
 pub struct GenerationParams {
     pub temperature: f32,
     pub top_p: f32,
@@ -159,6 +163,102 @@ impl Generator {
 
         Ok(output.trim().to_string())
     }
+}
+
+/// JSON schema constraining the generated artifact for a given type.
+pub fn schema_for(artifact_type: &ArtifactType) -> &'static str {
+    match artifact_type {
+        ArtifactType::MultipleChoiceQuiz => r#"{
+            "type": "object",
+            "properties": {
+                "question": { "type": "string" },
+                "options": { "type": "array", "items": { "type": "string" }, "minItems": 4, "maxItems": 4 },
+                "answer": { "type": "integer" },
+                "explanation": { "type": "string" }
+            },
+            "required": ["question", "options", "answer", "explanation"]
+        }"#,
+        ArtifactType::EssayQuiz => r#"{
+            "type": "object",
+            "properties": {
+                "question": { "type": "string" },
+                "instructions": { "type": "string" },
+                "model_answer": { "type": "string" }
+            },
+            "required": ["question", "instructions", "model_answer"]
+        }"#,
+        ArtifactType::CompletionQuiz => r#"{
+            "type": "object",
+            "properties": {
+                "sentence": { "type": "string" },
+                "answer": { "type": "string" },
+                "hint": { "type": "string" }
+            },
+            "required": ["sentence", "answer", "hint"]
+        }"#,
+        ArtifactType::Summary => r#"{
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "summary": { "type": "string" },
+                "key_points": { "type": "array", "items": { "type": "string" }, "minItems": 3, "maxItems": 6 }
+            },
+            "required": ["title", "summary", "key_points"]
+        }"#,
+        ArtifactType::MindMap => r#"{
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string" },
+                "branches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "children": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["label", "children"]
+                    }
+                }
+            },
+            "required": ["topic", "branches"]
+        }"#,
+    }
+}
+
+/// System prompt used when building the chat template for a generation call.
+pub fn system_prompt_for(_artifact_type: &ArtifactType) -> &'static str {
+    "You are an educational assessment generator. Base every answer strictly \
+     on the provided source passages. Reply only with valid JSON matching the schema."
+}
+
+/// User-facing instructions for the requested artifact type. `context` holds the
+/// retrieved source chunks.
+pub fn user_message_for(artifact_type: &ArtifactType, context: &str) -> String {
+    let task = match artifact_type {
+        ArtifactType::MultipleChoiceQuiz => {
+            "Generate ONE multiple-choice question testing higher-order thinking \
+             (analysis, application, or evaluation). It must have exactly 4 plausible \
+             options and the index of the correct answer."
+        }
+        ArtifactType::EssayQuiz => {
+            "Generate ONE essay question requiring students to explain, compare, or \
+             evaluate concepts from the text, with clear instructions and a model answer."
+        }
+        ArtifactType::CompletionQuiz => {
+            "Generate ONE fill-in-the-blank sentence drawn from the text, with the \
+             expected answer and a hint."
+        }
+        ArtifactType::Summary => {
+            "Write a focused summary of the passages, capturing the main ideas and \
+             key points."
+        }
+        ArtifactType::MindMap => {
+            "Extract the central topic and its major branches, each branch with a short \
+             list of child concepts."
+        }
+    };
+    format!("{task}\n\nPassages:\n{context}")
 }
 
 #[cfg(test)]

@@ -21,7 +21,6 @@ export interface GenerationParams {
 
 export interface GenerateArtifactsArgs {
 	artifactType: ArtifactType;
-	count?: number;
 	params?: GenerationParams;
 }
 
@@ -42,7 +41,6 @@ export function useGenerateArtifacts(worksheetId: string) {
 			invoke("generate_artifacts", {
 				worksheetId,
 				artifactType: args.artifactType,
-				count: args.count,
 				params: args.params,
 			}),
 		onSuccess: () => {

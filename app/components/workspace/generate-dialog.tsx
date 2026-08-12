@@ -1,11 +1,10 @@
 import {
 	IconChevronDown,
 	IconLoader,
-	IconMinus,
 	IconPlus,
 	IconSettings,
 } from "@tabler/icons-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -43,7 +42,6 @@ export function GenerateDialog({
 }: GenerateDialogProps) {
 	const [artifactType, setArtifactType] =
 		useState<ArtifactType>("MultipleChoiceQuiz");
-	const [count, setCount] = useState(1);
 	const [advanced, setAdvanced] = useState(false);
 	const [temperature, setTemperature] = useState("0.7");
 	const [topP, setTopP] = useState("0.9");
@@ -51,8 +49,17 @@ export function GenerateDialog({
 	const [seed, setSeed] = useState("1234");
 
 	const generate = useGenerateArtifacts(worksheetId);
-	const progress = usePipelineProgress("generation-progress", worksheetId);
+	const { progress, reset } = usePipelineProgress(
+		"generation-progress",
+		worksheetId,
+	);
 	const download = useModelDownload();
+
+	// Drop any progress left from a finished run so a fresh generation starts
+	// clean instead of showing the previous run's completed counts.
+	useEffect(() => {
+		if (open) reset();
+	}, [open, reset]);
 
 	const percent =
 		progress && progress.total > 0
@@ -60,10 +67,10 @@ export function GenerateDialog({
 			: 0;
 
 	const handleSubmit = () => {
+		reset();
 		generate.mutate(
 			{
 				artifactType,
-				count,
 				params: {
 					temperature: Number(temperature) || undefined,
 					top_p: Number(topP) || undefined,
@@ -123,30 +130,10 @@ export function GenerateDialog({
 					</div>
 
 					<Field className="flex flex-row items-center justify-between gap-3">
-						<Label>Number of artifacts</Label>
-						<div className="flex items-center gap-2">
-							<Button
-								type="button"
-								variant="outline"
-								size="icon-sm"
-								disabled={busy || count <= 1}
-								onClick={() => setCount((value) => Math.max(1, value - 1))}
-							>
-								<IconMinus />
-							</Button>
-							<span className="w-8 text-center text-sm tabular-nums">
-								{count}
-							</span>
-							<Button
-								type="button"
-								variant="outline"
-								size="icon-sm"
-								disabled={busy || count >= 10}
-								onClick={() => setCount((value) => Math.min(10, value + 1))}
-							>
-								<IconPlus />
-							</Button>
-						</div>
+						<Label>Coverage</Label>
+						<span className="text-xs text-muted-foreground">
+							Every topic in this worksheet gets covered automatically.
+						</span>
 					</Field>
 
 					<Button
@@ -242,7 +229,7 @@ export function GenerateDialog({
 									Generating
 								</span>
 								<span className="tabular-nums">
-									{progress?.done ?? 0}/{progress?.total ?? count}
+									{progress?.done ?? 0}/{progress?.total ?? 0}
 								</span>
 							</div>
 							<Progress value={percent} />

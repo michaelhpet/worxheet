@@ -1,9 +1,8 @@
 ## Architecture
 
 - Monolith: `app/` (React 19 frontend) + `core/` (Rust/Tauri backend)
-- All AI inference runs locally via `mistralrs` + `candle`; zero cloud dependencies
+- All AI inference runs locally; zero cloud dependencies
 - SQLite with WAL mode; migrations in `core/migrations/`
-- Embeddings stored as 384×f32 BLOBs in SQLite; brute-force cosine similarity (no vector DB)
 
 ## Commands
 
@@ -23,10 +22,6 @@
 - Path alias `@/` → `app/`
 - TanStack Router v1: file-based routes in `app/routes/`, generated tree at `app/route-tree.gen.ts`
 - Zod v4 + TanStack React Form v1.33.0
-
-## Rust specifics
-
-- k-means clustering + position-based even sampling (not centroid picking)
 
 ## Testing
 

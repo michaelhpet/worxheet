@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 export interface PipelineProgress {
 	done: number;
@@ -17,6 +17,8 @@ export function usePipelineProgress(
 	worksheetId: string | undefined,
 ) {
 	const [progress, setProgress] = useState<PipelineProgress | null>(null);
+
+	const reset = useCallback(() => setProgress(null), []);
 
 	useEffect(() => {
 		if (!worksheetId) return;
@@ -41,5 +43,5 @@ export function usePipelineProgress(
 		};
 	}, [event, worksheetId]);
 
-	return progress;
+	return { progress, reset };
 }

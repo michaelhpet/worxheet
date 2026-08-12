@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, chunk, store, embed, retrieve, generate, persist — is wired end-to-end through Tauri commands (`pipeline.rs`) and SQLite. Clustering / topic-sampling for multi-artifact generation is planned but not built; for now `generate_artifacts` uses the top-k chunks most similar to the artifact task as context.
+This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, chunk, store, embed, cluster, generate, persist — is wired end-to-end through Tauri commands (`pipeline.rs`) and SQLite. Generation exhausts the material: it runs one unit per HDBSCAN topic cluster (question types produce one or more items each; `Summary`/`MindMap` yield a single worksheet-wide artifact) instead of using a user-chosen count over the top-k most similar chunks.
 
 ## Pipeline Steps
 
@@ -93,7 +93,9 @@ pub async fn retrieve(
 
 ### 7. Generate (wired)
 
-`pipeline.rs::run_generate_artifacts` wraps `generation.rs::Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) auto-embeds any un-embedded chunks, (2) retrieves the top-k chunks most similar to the artifact task, (3) builds the task prompt with that context, and (4) generates schema-constrained JSON.
+`pipeline.rs::run_generate_artifacts` wraps `generation.rs::Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) auto-embeds any un-embedded chunks, (2) splits the material into one context unit per topic cluster (HDBSCAN noise skipped, clusters ordered by source position), (3) builds a per-unit prompt, and (4) generates schema-constrained JSON. Question-style types persist one artifact per item (1-8 per cluster); `Summary` and `MindMap` merge every unit's section into one worksheet-wide artifact. Each unit derives its seed from the base (`seed + unit_index`) so an exhaustive batch never repeats.
+
+Best-effort: a unit whose output truncates or fails to parse is retried once with a doubled (capped 4096) token budget, then skipped so one bad cluster cannot discard the rest of the batch.
 
 ```rust
 // generation.rs — public entry points
@@ -114,9 +116,9 @@ Generation characteristics:
 - **Sampling chain**: `[grammar?, temp?, top_p, dist(seed)]` applied to the logits via `LlamaTokenDataArray::apply_sampler`. This manual array path is used deliberately to avoid the `llama-cpp-2` grammar-sampler crash on `sampler.sample(ctx, idx)` (utilityai/llama-cpp-rs#1007).
 - **Termination**: generation stops on the model's EOG token. When the grammar completes, the grammar sampler masks everything but EOG, so the loop ends cleanly.
 - **Parameters**: `temperature` (default 0.7), `top_p` (default 0.9), `max_tokens` (default 1024), `seed` (default 1234). Context window `N_CTX = 8192`, max prompt `6144` tokens.
-- **Artifact schemas**: `schema.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders.
+- **Artifact schemas**: `generation.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders. Question-style schemas wrap 1-8 items in an array so one cluster yields multiple artifacts; `Summary`/`MindMap` keep single-object schemas whose per-cluster outputs the pipeline concatenates.
 
-Status: wired. `generate_artifacts` writes the validated artifact JSON to the `artifacts` table and returns it to the frontend. It emits `generation-progress` events (`{ worksheet_id, done, total }`) via the `AppHandle` after each artifact.
+Status: wired. `generate_artifacts` writes the validated artifact JSON to the `artifacts` table and returns it to the frontend. It emits `generation-progress` events (`{ worksheet_id, done, total }`) via the `AppHandle` once per generation unit, plus a reset event (`done: 0`) at the start of a run.
 
 ### 8. Persist (wired)
 
@@ -166,15 +168,15 @@ Exposed Tauri commands (`lib.rs` invoke handler):
 - `process_files` — parse + chunk + store selected files
 - `embed_worksheet` — embed all un-embedded chunks and persist BLOBs
 - `retrieve_chunks` — RAG retrieval (top-k chunks by cosine similarity)
-- `generate_artifacts` — auto-embed, retrieve context, generate + persist artifacts (takes `worksheet_id`, `artifact_type`, optional `count`, optional `GenerationParams`)
+- `generate_artifacts` — auto-embed, split material into per-cluster units, generate + persist artifacts (takes `worksheet_id`, `artifact_type`, optional `GenerationParams`; count is derived from the clusters)
 - `get_artifacts` — list a worksheet's generated artifacts
 
 Progress events (listened via `@tauri-apps/api/event`):
 
 - `ingestion-progress` — `{ worksheet_id, done, total }` per file during `process_files`
-- `generation-progress` — `{ worksheet_id, done, total }` per artifact during `generate_artifacts`
+- `generation-progress` — `{ worksheet_id, done, total }` per generation unit during `generate_artifacts`; a `{ done: 0 }` reset is emitted at the start of every run
 
-The React worksheet detail route (`app/routes/worksheets.$id.tsx`) composes a files panel (parse status + processing with progress) and an artifacts panel (type-filtered artifact cards + a generate dialog with count and advanced sampling params).
+The React worksheet detail route (`app/routes/worksheets.$id.tsx`) composes a files panel (parse status + processing with progress) and an artifacts panel (type-filtered artifact cards + a generate dialog without a count control and with advanced sampling params).
 
 ## Module Layout (core/src/)
 

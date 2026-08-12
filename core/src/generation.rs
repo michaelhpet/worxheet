@@ -80,7 +80,9 @@ impl Generator {
         params: &GenerationParams,
     ) -> Result<String, String> {
         let n_ctx = NonZeroU32::new(N_CTX).expect("non-zero context size");
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(Some(n_ctx))
+            .with_n_batch(N_CTX);
         let mut ctx = self
             .model
             .new_context(backend()?, ctx_params)
@@ -109,7 +111,7 @@ impl Generator {
             ));
         }
 
-        let mut batch = LlamaBatch::new(512, 1);
+        let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
         let last_index = (tokens.len() - 1) as i32;
         for (i, token) in (0..).zip(&tokens) {
             batch
@@ -178,36 +180,84 @@ impl Generator {
     }
 }
 
+/// The JSON array field holding per-cluster items for a question-style artifact
+/// type. Whole-worksheet types (Summary, MindMap) return `None`.
+pub fn items_field_for(artifact_type: &ArtifactType) -> Option<&'static str> {
+    match artifact_type {
+        ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz => Some("questions"),
+        ArtifactType::CompletionQuiz => Some("items"),
+        ArtifactType::Summary | ArtifactType::MindMap => None,
+    }
+}
+
 /// JSON schema constraining the generated artifact for a given type.
+///
+/// Question-style types wrap their items in an array so a single cluster can
+/// yield one or more questions; every item is persisted as its own artifact.
+/// Summary and MindMap use a single object per cluster, which the pipeline
+/// concatenates into one worksheet-wide artifact.
 pub fn schema_for(artifact_type: &ArtifactType) -> &'static str {
     match artifact_type {
         ArtifactType::MultipleChoiceQuiz => r#"{
             "type": "object",
             "properties": {
-                "question": { "type": "string" },
-                "options": { "type": "array", "items": { "type": "string" }, "minItems": 4, "maxItems": 4 },
-                "answer": { "type": "integer" },
-                "explanation": { "type": "string" }
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string" },
+                            "options": { "type": "array", "items": { "type": "string" }, "minItems": 4, "maxItems": 4 },
+                            "answer": { "type": "integer" },
+                            "explanation": { "type": "string" }
+                        },
+                        "required": ["question", "options", "answer", "explanation"]
+                    }
+                }
             },
-            "required": ["question", "options", "answer", "explanation"]
+            "required": ["questions"]
         }"#,
         ArtifactType::EssayQuiz => r#"{
             "type": "object",
             "properties": {
-                "question": { "type": "string" },
-                "instructions": { "type": "string" },
-                "model_answer": { "type": "string" }
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string" },
+                            "instructions": { "type": "string" },
+                            "model_answer": { "type": "string" }
+                        },
+                        "required": ["question", "instructions", "model_answer"]
+                    }
+                }
             },
-            "required": ["question", "instructions", "model_answer"]
+            "required": ["questions"]
         }"#,
         ArtifactType::CompletionQuiz => r#"{
             "type": "object",
             "properties": {
-                "sentence": { "type": "string" },
-                "answer": { "type": "string" },
-                "hint": { "type": "string" }
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sentence": { "type": "string" },
+                            "answer": { "type": "string" },
+                            "hint": { "type": "string" }
+                        },
+                        "required": ["sentence", "answer", "hint"]
+                    }
+                }
             },
-            "required": ["sentence", "answer", "hint"]
+            "required": ["items"]
         }"#,
         ArtifactType::Summary => r#"{
             "type": "object",
@@ -224,11 +274,16 @@ pub fn schema_for(artifact_type: &ArtifactType) -> &'static str {
                 "topic": { "type": "string" },
                 "branches": {
                     "type": "array",
+                    "maxItems": 8,
                     "items": {
                         "type": "object",
                         "properties": {
                             "label": { "type": "string" },
-                            "children": { "type": "array", "items": { "type": "string" } }
+                            "children": {
+                                "type": "array",
+                                "maxItems": 12,
+                                "items": { "type": "string" }
+                            }
                         },
                         "required": ["label", "children"]
                     }
@@ -250,25 +305,27 @@ pub fn system_prompt_for(_artifact_type: &ArtifactType) -> &'static str {
 pub fn user_message_for(artifact_type: &ArtifactType, context: &str) -> String {
     let task = match artifact_type {
         ArtifactType::MultipleChoiceQuiz => {
-            "Generate ONE multiple-choice question testing higher-order thinking \
-             (analysis, application, or evaluation). It must have exactly 4 plausible \
+            "Generate between one and eight multiple-choice questions testing \
+             higher-order thinking (analysis, application, or evaluation), drawn \
+             from the passages. Every question must have exactly 4 plausible \
              options and the index of the correct answer."
         }
         ArtifactType::EssayQuiz => {
-            "Generate ONE essay question requiring students to explain, compare, or \
-             evaluate concepts from the text, with clear instructions and a model answer."
+            "Generate between one and eight essay questions requiring students to \
+             explain, compare, or evaluate concepts from the passages, each with \
+             clear instructions and a model answer."
         }
         ArtifactType::CompletionQuiz => {
-            "Generate ONE fill-in-the-blank sentence drawn from the text, with the \
-             expected answer and a hint."
+            "Generate between one and eight fill-in-the-blank sentences drawn from \
+             the passages, each with the expected answer and a hint."
         }
         ArtifactType::Summary => {
-            "Write a focused summary of the passages, capturing the main ideas and \
-             key points."
+            "Write a focused summary section for this slice of the source, \
+             capturing its main ideas and key points."
         }
         ArtifactType::MindMap => {
-            "Extract the central topic and its major branches, each branch with a short \
-             list of child concepts."
+            "Extract the topic covered by this slice of the source and its major \
+             branches, each branch with a short list of child concepts."
         }
     };
     format!("{task}\n\nPassages:\n{context}")
@@ -343,5 +400,34 @@ mod tests {
 
         assert!(parsed.get("question").is_some());
         assert_eq!(parsed["options"].as_array().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn test_all_schemas_compile_to_grammar() {
+        for artifact_type in [
+            ArtifactType::MultipleChoiceQuiz,
+            ArtifactType::EssayQuiz,
+            ArtifactType::CompletionQuiz,
+            ArtifactType::Summary,
+            ArtifactType::MindMap,
+        ] {
+            let schema = schema_for(&artifact_type);
+            let grammar = json_schema_to_grammar(schema).unwrap_or_else(|error| {
+                panic!("{artifact_type:?} schema should compile into grammar: {error}")
+            });
+            assert!(!grammar.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_items_field_for() {
+        assert_eq!(
+            items_field_for(&ArtifactType::MultipleChoiceQuiz),
+            Some("questions")
+        );
+        assert_eq!(items_field_for(&ArtifactType::EssayQuiz), Some("questions"));
+        assert_eq!(items_field_for(&ArtifactType::CompletionQuiz), Some("items"));
+        assert_eq!(items_field_for(&ArtifactType::Summary), None);
+        assert_eq!(items_field_for(&ArtifactType::MindMap), None);
     }
 }

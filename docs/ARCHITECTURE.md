@@ -30,11 +30,11 @@ Worxheet is a local-first desktop monolith. The entire application — UI, busin
 Implementation status of each stage:
 
 ```
-Upload ─► Parse ─► Chunk ─► Store ─► Embed ─► Retrieve ─► Generate ─► Persist
+Upload ─► Parse ─► Chunk ─► Store ─► Embed ─► Cluster ─► Generate ─► Persist
 ```
-All stages are wired into Tauri commands and SQLite. Clustering/topic-sampling for
-multi-artifact generation remains planned; for now `generate_artifacts` retrieves the
-top-k chunks most similar to the artifact task.
+All stages are wired into Tauri commands and SQLite. `process_files` embeds and
+runs HDBSCAN clustering after chunking, and `generate_artifacts` exhausts the
+material one unit per topic cluster instead of retrieving a fixed top-k window.
 
 1. **Upload** *(done)*: User creates a worksheet and selects files (PDF, PPTX, DOCX) via the Tauri dialog plugin. `create_worksheet` registers the files in SQLite.
 2. **Parse** *(done)*: `ingest.rs` extracts text using `pdf_oxide` (PDF) or `office_oxide` (PPTX/DOCX/PPT/DOC), then updates `files.status` (`uploaded → parsing → parsed`).
@@ -42,7 +42,7 @@ top-k chunks most similar to the artifact task.
 4. **Store** *(done)*: `process_files` inserts chunks into the `chunks` table (text + position + file/worksheet reference).
 5. **Embed** *(done)*: `embed_worksheet` embeds chunks without an embedding via `bge-small-en-v1.5` (Q8_0, 384-dim, L2-normalized) and stores the vectors in the `chunks.embedding` BLOB.
 6. **Retrieve** *(done)*: `retrieve_chunks` embeds a query and returns the top-k chunks by cosine similarity over the BLOBs (`retrieval.rs`).
-7. **Generate** *(done)*: `generate_artifacts` auto-embeds any un-embedded chunks, retrieves top-k context, builds a chat-template prompt, and generates an artifact constrained to a JSON schema via a GBNF grammar (`json_schema_to_grammar`). All five artifact types (`MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap`) are supported.
+7. **Generate** *(done)*: `generate_artifacts` auto-embeds any un-embedded chunks, splits the material into one prompt per topic cluster (ordered by source position), and generates schema-constrained JSON via a GBNF grammar (`json_schema_to_grammar`). Question types (`MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`) emit 1-8 items per cluster, each persisted as its own artifact; `Summary` and `MindMap` merge per-cluster sections into a single worksheet-wide artifact. Per-unit seeds (`seed + index`) keep the batch from repeating itself.
 8. **Persist** *(done)*: Generated artifacts are validated, inserted into the `artifacts` table, and returned to the frontend via `get_artifacts`.
 
 The React worksheet detail route (`app/routes/worksheets.$id.tsx`) is the user-facing workspace: a files panel (parse status badges, "Process files" with live `ingestion-progress`), and an artifacts panel (type-filtered cards, a generate dialog with count + advanced sampling params, and live `generation-progress` while artifacts are produced).

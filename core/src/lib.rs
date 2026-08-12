@@ -6,6 +6,7 @@ use tauri::{Emitter, Manager};
 use crate::models::{ModelFileKind, ModelPool, ProgressSink};
 
 mod chunk;
+mod cluster;
 mod database;
 mod embed;
 mod file;

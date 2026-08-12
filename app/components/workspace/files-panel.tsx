@@ -59,7 +59,7 @@ const STATUS_BADGE: Record<
 export function FilesPanel({ worksheetId }: FilesPanelProps) {
 	const { data: files, isLoading } = useFiles(worksheetId);
 	const processFiles = useProcessFiles(worksheetId);
-	const progress = usePipelineProgress("ingestion-progress", worksheetId);
+	const { progress } = usePipelineProgress("ingestion-progress", worksheetId);
 	const download = useModelDownload();
 
 	const allFiles = files ?? [];

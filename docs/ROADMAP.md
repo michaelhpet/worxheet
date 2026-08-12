@@ -19,7 +19,7 @@ Core RAG pipeline for text-based documents.
 - [x] Embedding storage as SQLite BLOBs (`chunks.embedding`)
 - [x] RAG retrieval (cosine similarity in Rust over chunk BLOBs, `retrieve_chunks` command)
 - [x] HOTS generation (`SmolLM2-360M-Instruct` via `llama-cpp-2`, grammar-constrained JSON for all 5 artifact types, `generate_artifacts` command)
-- [ ] Clustering / topic sampling for multi-artifact generation (k-means or HDBSCAN; `ndarray`/`hdbscan-rs`/`linfa` deps reserved)
+- [x] Clustering / topic sampling for multi-artifact generation (HDBSCAN via `hdbscan-rs`; `process_files` persists clusters, `generate_artifacts` exhausts the material per cluster)
 - [x] Artifact persistence (MCQ items, summaries, mind-maps in SQLite `artifacts` table)
 - [x] React workspace view for generated artifacts (worksheet detail route: file processing, generate dialog, artifact cards)
 - [x] Generation progress indicators (`ingestion-progress` + `generation-progress` events surfaced as progress bars)

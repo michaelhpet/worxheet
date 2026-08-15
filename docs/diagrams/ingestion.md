@@ -1,0 +1,96 @@
+# Ingestion Pipeline
+
+Zoom into the ingest path driven by `run_process_files` (`core/src/pipeline.rs`)
+and `ingest::process_files` (`core/src/ingest.rs`). This phase produces
+persisted, embedded, topic-clustered chunks — the input to generation.
+
+```mermaid
+flowchart TB
+    subgraph PROCESS_FILES["run_process_files (pipeline.rs)"]
+        direction TB
+        START(["process_files(worksheet_id, file_ids)"])
+        TOK["spawn_blocking → ModelPool.tokenizer()"]
+        INGEST["ingest::process_files(...)"]
+        EMBED["embed_missing_chunks(...)"]
+        CLUSTER["rebuild_clusters(...)"]
+        REFRESH["re-read embeddings → return chunks"]
+
+        START --> TOK --> INGEST --> EMBED --> CLUSTER --> REFRESH
+    end
+
+    subgraph INGEST_MOD["ingest.rs — per file"]
+        direction TB
+        QF["query files row (path, ext, name)"]
+        ST1["UPDATE files SET status='parsing'"]
+        PARSE["parse_file(path, ext)"]
+        CHUNK["chunk_text(text, 512, 128, tokenizer)"]
+        INSERT["for each chunk: INSERT chunks<br/>(id, worksheet_id, file_id, position, text)"]
+        ST2["UPDATE files SET status='parsed'"]
+        PROG["emit ingestion-progress {done, total}"]
+
+        QF --> ST1 --> PARSE --> CHUNK --> INSERT --> ST2 --> PROG
+    end
+
+    INGEST --> QF
+
+    subgraph EMBED_MOD["embed_missing_chunks"]
+        direction TB
+        QN["SELECT chunks WHERE embedding IS NULL"]
+        BEMB["spawn_blocking → ModelPool.embedder().embed(texts)"]
+        UP["for each: UPDATE chunks SET embedding=BLOB"]
+
+        QN --> BEMB --> UP
+    end
+
+    EMBED --> QN
+
+    subgraph CLUSTER_MOD["rebuild_clusters (cluster.rs)"]
+        direction TB
+        QE["SELECT embedded chunks ORDER BY position"]
+        HDB["spawn_blocking → assign_clusters(vectors)<br/>HDBSCAN min_cluster_size = n/200 clamp(3,16)"]
+        CLEAR["DELETE FROM clusters WHERE worksheet_id=?"]
+        PERSIST["INSERT centroids → clusters table"]
+        LABEL["UPDATE chunks SET cluster_index"]
+
+        QE --> HDB --> CLEAR --> PERSIST --> LABEL
+    end
+
+    CLUSTER --> QE
+
+    PARSE -. "pdf_oxide (pdf) | office_oxide (pptx/docx/ppt/doc)" .-> PARSERS["text extraction crates"]
+```
+
+## The moving parts
+
+1. **Tokenizer** — `run_process_files` grabs the HF `tokenizers` tokenizer from
+   the `ModelPool` (downloaded lazily) and passes it to the ingest loop. Only
+   the ~2MB `tokenizer.json` is needed for chunking, so it is fetched
+   independently of the models.
+
+2. **Parse** — `ingest.rs::parse_file` dispatches on extension:
+   - `pdf` → `pdf_oxide`, page-by-page `extract_text_auto`
+   - `pptx | docx | ppt | doc` → `office_oxide::extract_text`
+   - anything else → error (unsupported)
+   File status moves `uploaded → parsing → parsed` around the work.
+
+3. **Chunk** — `chunk.rs::chunk_text` tokenizes the whole document, then slides
+   a window of `chunk_size=512` tokens with `overlap=128`, decoding each window
+   back to text. Overlap is clamped to `chunk_size/2`. Short docs return as one
+   chunk.
+
+4. **Store** — each chunk is inserted with a global `position` counter (in
+   document order across files), its worksheet and file ids, and `embedding=NULL`.
+
+5. **Embed** — `embed_missing_chunks` selects every chunk still missing a
+   vector, embeds them in one `spawn_blocking` call via the bge-small embedder
+   (384-dim, L2-normalized), and writes each vector back as a little-endian
+   float32 BLOB (`retrieval.rs::embedding_to_bytes`).
+
+6. **Cluster** — `rebuild_clusters` runs HDBSCAN over all embedded chunks
+   (`cluster.rs::assign_clusters`), persists one centroid per topic cluster into
+   the `clusters` table, and writes each chunk's `cluster_index` (or NULL for
+   noise). `min_cluster_size` scales as `n/200` clamped to `[3,16]`; tiny
+   worksheets fall back to a single cluster.
+
+> Note: `retrieve_chunks` is a separate query path (see `sequence.md`) — cosine
+> similarity over stored BLOBs — but it is not part of ingestion.

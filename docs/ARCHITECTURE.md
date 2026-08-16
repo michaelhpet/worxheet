@@ -77,14 +77,18 @@ worxheet/
 │   │   ├── database.rs           # SQLite connection + migration runner
 │   │   ├── llm.rs                # Process-wide llama.cpp backend singleton
 │   │   ├── models.rs             # GGUF model paths + hf-hub download + lazy ModelPool
-│   │   ├── file.rs               # File metadata command
-│   │   ├── worksheet.rs          # Worksheet CRUD commands
+│   │   ├── commands/             # Thin #[tauri::command] wrappers (State → domain logic)
+│   │   │   ├── file.rs           # get_file_metadata command
+│   │   │   ├── worksheet.rs      # Worksheet CRUD commands
+│   │   │   └── pipeline.rs       # End-to-end commands (process_files, generate_artifacts, …)
+│   │   ├── file.rs               # File metadata logic
+│   │   ├── worksheet.rs          # Worksheet CRUD logic
 │   │   ├── chunk.rs              # Recursive text splitting
 │   │   ├── ingest.rs             # Parse + chunk + store pipeline
 │   │   ├── embed.rs              # bge-small embedding module
 │   │   ├── retrieval.rs          # Embedding BLOB encode/decode + cosine retrieval
 │   │   ├── generation.rs         # SmolLM2 grammar-constrained generation
-│   │   ├── pipeline.rs           # End-to-end commands (process_files, embed_worksheet, retrieve_chunks, generate_artifacts, …)
+│   │   ├── pipeline.rs           # Testable pipeline cores (process_files, embed_worksheet, retrieve_chunks, generate_artifacts, …)
 │   │   ├── schema.rs             # Shared structs (Chunk, Artifact, ArtifactType, …)
 │   ├── Cargo.toml
 │   └── tauri.conf.json

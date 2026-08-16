@@ -7,6 +7,7 @@ use crate::models::{ModelFileKind, ModelPool, ProgressSink};
 
 mod chunk;
 mod cluster;
+mod commands;
 mod database;
 mod embed;
 mod file;
@@ -30,10 +31,7 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle();
             let pool = tauri::async_runtime::block_on(async { database::connect(&handle).await })?;
-            let app_data_dir = handle
-                .path()
-                .app_data_dir()
-                .map_err(|e| e.to_string())?;
+            let app_data_dir = handle.path().app_data_dir().map_err(|e| e.to_string())?;
             let on_model_download: Arc<ProgressSink> = {
                 let app = handle.clone();
                 Arc::new(move |kind: ModelFileKind, done: u64, total: u64| {
@@ -61,17 +59,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            file::get_file_metadata,
-            worksheet::get_worksheets,
-            worksheet::get_worksheet,
-            worksheet::create_worksheet,
-            worksheet::delete_worksheet,
-            pipeline::get_files,
-            pipeline::process_files,
-            pipeline::embed_worksheet,
-            pipeline::retrieve_chunks,
-            pipeline::generate_artifacts,
-            pipeline::get_artifacts
+            commands::file::get_file_metadata,
+            commands::worksheet::get_worksheets,
+            commands::worksheet::get_worksheet,
+            commands::worksheet::create_worksheet,
+            commands::worksheet::delete_worksheet,
+            commands::pipeline::get_files,
+            commands::pipeline::process_files,
+            commands::pipeline::embed_worksheet,
+            commands::pipeline::retrieve_chunks,
+            commands::pipeline::generate_artifacts,
+            commands::pipeline::get_artifacts
         ])
         .run(tauri::generate_context!())
         .expect("Error while running application");

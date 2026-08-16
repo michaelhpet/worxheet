@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter};
 use ulid::Ulid;
 
 use crate::cluster::{self, MAX_CONTEXT_CHUNKS};
@@ -12,7 +12,6 @@ use crate::ingest;
 use crate::models::ModelPool;
 use crate::retrieval;
 use crate::schema::{Artifact, ArtifactType, Chunk};
-use crate::AppState;
 
 #[derive(Serialize)]
 pub struct FileInfo {
@@ -31,22 +30,16 @@ pub struct RetrievedChunk {
     pub score: f32,
 }
 
-/// List the files attached to a worksheet (used by the frontend to obtain file
-/// IDs before running the ingestion pipeline).
-#[tauri::command]
-pub async fn get_files(
-    state: State<'_, AppState>,
-    worksheet_id: String,
-) -> Result<Vec<FileInfo>, String> {
-    let pool = state.database.clone();
+/// List the files attached to a worksheet.
+pub async fn get_files(pool: &sqlx::SqlitePool, worksheet_id: &str) -> Result<Vec<FileInfo>, String> {
     let rows = sqlx::query_as::<_, (String, String, String, i64, String)>(
         "SELECT id, name, extension, size, status
          FROM files
          WHERE worksheet_id = ?
          ORDER BY created_at",
     )
-    .bind(&worksheet_id)
-    .fetch_all(&pool)
+    .bind(worksheet_id)
+    .fetch_all(pool)
     .await
     .map_err(|_| String::from("Failed to fetch files"))?;
 
@@ -64,17 +57,7 @@ pub async fn get_files(
 
 /// Parse, chunk, and store the given files of a worksheet. Emits
 /// `ingestion-progress` events as each file completes.
-#[tauri::command]
 pub async fn process_files(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    worksheet_id: String,
-    file_ids: Vec<String>,
-) -> Result<Vec<Chunk>, String> {
-    run_process_files(Some(&app), &state.database, &state.models, &worksheet_id, &file_ids).await
-}
-
-pub async fn run_process_files(
     app: Option<&AppHandle>,
     pool: &sqlx::SqlitePool,
     models: &Arc<ModelPool>,
@@ -256,15 +239,7 @@ async fn rebuild_clusters(
 
 /// Embed every chunk of a worksheet that does not yet have an embedding and
 /// store the vectors as BLOBs. Returns the number of chunks embedded.
-#[tauri::command]
 pub async fn embed_worksheet(
-    state: State<'_, AppState>,
-    worksheet_id: String,
-) -> Result<usize, String> {
-    run_embed_worksheet(&state.database, &state.models, &worksheet_id).await
-}
-
-pub async fn run_embed_worksheet(
     pool: &sqlx::SqlitePool,
     models: &Arc<ModelPool>,
     worksheet_id: &str,
@@ -273,17 +248,7 @@ pub async fn run_embed_worksheet(
 }
 
 /// RAG retrieval: embed the query and return the top-k most similar chunks.
-#[tauri::command]
 pub async fn retrieve_chunks(
-    state: State<'_, AppState>,
-    worksheet_id: String,
-    query: String,
-    top_k: Option<usize>,
-) -> Result<Vec<RetrievedChunk>, String> {
-    run_retrieve_chunks(&state.database, &state.models, &worksheet_id, &query, top_k).await
-}
-
-pub async fn run_retrieve_chunks(
     pool: &sqlx::SqlitePool,
     models: &Arc<ModelPool>,
     worksheet_id: &str,
@@ -324,26 +289,7 @@ pub async fn run_retrieve_chunks(
 /// artifact assembled from per-cluster sections in source order. HDBSCAN noise
 /// chunks are skipped. Every unit generates with a derived seed so a batch
 /// never repeats itself. Emits `generation-progress` events.
-#[tauri::command]
 pub async fn generate_artifacts(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    worksheet_id: String,
-    artifact_type: ArtifactType,
-    params: Option<GenerationParams>,
-) -> Result<Vec<Artifact>, String> {
-    run_generate_artifacts(
-        Some(&app),
-        &state.database,
-        &state.models,
-        &worksheet_id,
-        &artifact_type,
-        params,
-    )
-    .await
-}
-
-pub async fn run_generate_artifacts(
     app: Option<&AppHandle>,
     pool: &sqlx::SqlitePool,
     models: &Arc<ModelPool>,
@@ -687,20 +633,18 @@ fn assemble_artifacts(
 }
 
 /// List the persisted artifacts of a worksheet.
-#[tauri::command]
 pub async fn get_artifacts(
-    state: State<'_, AppState>,
-    worksheet_id: String,
+    pool: &sqlx::SqlitePool,
+    worksheet_id: &str,
 ) -> Result<Vec<Artifact>, String> {
-    let pool = state.database.clone();
     let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
         "SELECT id, worksheet_id, artifact_type, source, content
          FROM artifacts
          WHERE worksheet_id = ?
          ORDER BY created_at",
     )
-    .bind(&worksheet_id)
-    .fetch_all(&pool)
+    .bind(worksheet_id)
+    .fetch_all(pool)
     .await
     .map_err(|_| String::from("Failed to fetch artifacts"))?;
 
@@ -796,7 +740,7 @@ mod tests {
         let pool = setup_db().await;
         let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
 
-        let chunks = run_process_files(None, &pool, &models, &worksheet_id, &[file_id])
+        let chunks = process_files(None, &pool, &models, &worksheet_id, &[file_id])
             .await
             .expect("process_files should succeed");
         assert!(!chunks.is_empty());
@@ -818,13 +762,13 @@ mod tests {
             .unwrap();
         assert!(cluster_count >= 1, "processing should persist clusters");
 
-        let embedded = run_embed_worksheet(&pool, &models, &worksheet_id)
+        let embedded = embed_worksheet(&pool, &models, &worksheet_id)
             .await
             .expect("embed_worksheet should succeed");
         assert_eq!(embedded, 0, "no work left after processing");
 
         let results =
-            run_retrieve_chunks(&pool, &models, &worksheet_id, "cell biology", Some(3))
+            retrieve_chunks(&pool, &models, &worksheet_id, "cell biology", Some(3))
                 .await
                 .expect("retrieve should succeed");
         assert!(!results.is_empty());
@@ -845,7 +789,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_generate_artifacts(
+        let err = generate_artifacts(
             None,
             &pool,
             &models,
@@ -865,7 +809,7 @@ mod tests {
         };
         let pool = setup_db().await;
         let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
-        run_process_files(None, &pool, &models, &worksheet_id, &[file_id])
+        process_files(None, &pool, &models, &worksheet_id, &[file_id])
             .await
             .expect("process_files should succeed");
 
@@ -874,7 +818,7 @@ mod tests {
             max_tokens: 1024,
             ..Default::default()
         };
-        let artifacts = run_generate_artifacts(
+        let artifacts = generate_artifacts(
             None,
             &pool,
             &models,
@@ -943,7 +887,7 @@ mod tests {
             max_tokens: 1024,
             ..Default::default()
         };
-        let artifacts = run_generate_artifacts(
+        let artifacts = generate_artifacts(
             None,
             &pool,
             &models,
@@ -982,7 +926,7 @@ mod tests {
             ..Default::default()
         };
 
-        let summaries = run_generate_artifacts(
+        let summaries = generate_artifacts(
             None,
             &pool,
             &models,
@@ -998,7 +942,7 @@ mod tests {
         assert!(summary_value.get("summary").is_some());
         assert!(summary_value.get("key_points").is_some());
 
-        let mind_maps = run_generate_artifacts(
+        let mind_maps = generate_artifacts(
             None,
             &pool,
             &models,

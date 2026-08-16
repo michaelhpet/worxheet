@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
-use tauri::State;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::schema::Paginated;
-use crate::AppState;
 
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Worksheet {
@@ -28,14 +26,11 @@ impl Worksheet {
     }
 }
 
-#[tauri::command]
 pub async fn get_worksheets(
-    state: State<'_, AppState>,
+    pool: &sqlx::SqlitePool,
     page: Option<i64>,
     per_page: Option<i64>,
 ) -> Result<Paginated<Worksheet>, String> {
-    let pool = &state.database;
-
     let page = page.unwrap_or(1).max(1);
     let per_page = per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -65,13 +60,7 @@ pub async fn get_worksheets(
     })
 }
 
-#[tauri::command]
-pub async fn get_worksheet(
-    state: State<'_, AppState>,
-    id: &str,
-) -> Result<Worksheet, String> {
-    let pool = &state.database;
-
+pub async fn get_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<Worksheet, String> {
     sqlx::query_as::<_, Worksheet>("SELECT * FROM worksheets WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
@@ -80,13 +69,7 @@ pub async fn get_worksheet(
         .ok_or_else(|| String::from("Worksheet not found"))
 }
 
-#[tauri::command]
-pub async fn delete_worksheet(
-    state: State<'_, AppState>,
-    id: &str,
-) -> Result<(), String> {
-    let pool = &state.database;
-
+pub async fn delete_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<(), String> {
     sqlx::query("DELETE FROM worksheets WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -96,14 +79,11 @@ pub async fn delete_worksheet(
     Ok(())
 }
 
-#[tauri::command]
 pub async fn create_worksheet(
-    state: State<'_, AppState>,
+    pool: &sqlx::SqlitePool,
     name: &str,
     files: Vec<String>,
 ) -> Result<Worksheet, String> {
-    let pool = &state.database;
-
     let mut transaction = pool
         .begin()
         .await

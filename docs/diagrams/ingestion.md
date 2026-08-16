@@ -1,12 +1,12 @@
 # Ingestion Pipeline
 
-Zoom into the ingest path driven by `run_process_files` (`core/src/pipeline.rs`)
+Zoom into the ingest path driven by `pipeline::process_files` (`core/src/pipeline.rs`)
 and `ingest::process_files` (`core/src/ingest.rs`). This phase produces
 persisted, embedded, topic-clustered chunks — the input to generation.
 
 ```mermaid
 flowchart TB
-    subgraph PROCESS_FILES["run_process_files (pipeline.rs)"]
+    subgraph PROCESS_FILES["process_files (pipeline.rs)"]
         direction TB
         START(["process_files(worksheet_id, file_ids)"])
         TOK["spawn_blocking → ModelPool.tokenizer()"]
@@ -62,7 +62,7 @@ flowchart TB
 
 ## The moving parts
 
-1. **Tokenizer** — `run_process_files` grabs the HF `tokenizers` tokenizer from
+1. **Tokenizer** — `process_files` grabs the HF `tokenizers` tokenizer from
    the `ModelPool` (downloaded lazily) and passes it to the ingest loop. Only
    the ~2MB `tokenizer.json` is needed for chunking, so it is fetched
    independently of the models.

@@ -1,6 +1,6 @@
 # Generation Pipeline
 
-Zoom into `run_generate_artifacts` (`core/src/pipeline.rs`). This is where RAG
+Zoom into `pipeline::generate_artifacts` (`core/src/pipeline.rs`). This is where RAG
 meets generation: it exhausts the material by producing one unit per HDBSCAN
 topic cluster, generates grammar-constrained JSON per unit, then assembles and
 persists artifacts. The LLM is `SmolLM2-360M-Instruct` (Q8_0, 8K context).

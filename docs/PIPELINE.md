@@ -47,11 +47,11 @@ Example:
 
 ### 4. Store
 
-`pipeline.rs::run_process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`. The same command drives file parsing end-to-end; it is exposed to the frontend as the `process_files` command and emits an `ingestion-progress` event (`{ worksheet_id, done, total }`) as each file completes.
+`pipeline.rs::process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`. The same logic drives file parsing end-to-end; it is exposed to the frontend as the `process_files` command (thin wrapper in `commands/pipeline.rs`) and emits an `ingestion-progress` event (`{ worksheet_id, done, total }`) as each file completes.
 
 ```rust
 // pipeline.rs — public entry point
-pub async fn run_process_files(
+pub async fn process_files(
     app: Option<&AppHandle>,
     pool: &SqlitePool,
     worksheet_id: &str,
@@ -64,7 +64,7 @@ The `embedding` BLOB column starts `NULL` and is populated by the embed step.
 
 ### 5. Embed (wired)
 
-`pipeline.rs::run_embed_worksheet` lazily loads the embedding model from `ModelPool` and runs `embed.rs::Embedder` (wraps `bge-small-en-v1.5`, Q8_0 GGUF, 384-dim). Un-embedded chunks are read from the DB, embedded (L2-normalized, so cosine similarity is a plain dot product), and written back to `chunks.embedding` as a float32 BLOB.
+`pipeline.rs::embed_worksheet` lazily loads the embedding model from `ModelPool` and runs `embed.rs::Embedder` (wraps `bge-small-en-v1.5`, Q8_0 GGUF, 384-dim). Un-embedded chunks are read from the DB, embedded (L2-normalized, so cosine similarity is a plain dot product), and written back to `chunks.embedding` as a float32 BLOB.
 
 ```rust
 // embed.rs — public entry point
@@ -79,7 +79,7 @@ Status: wired. `embed_worksheet` persists vectors to the BLOB column; `generate_
 
 ### 6. Retrieve (wired)
 
-`pipeline.rs::run_retrieve_chunks` embeds a query and returns the top-k chunks by cosine similarity (`retrieval.rs`). BLOBs are decoded to `Vec<f32>` and compared by dot product on the L2-normalized vectors.
+`pipeline.rs::retrieve_chunks` embeds a query and returns the top-k chunks by cosine similarity (`retrieval.rs`). BLOBs are decoded to `Vec<f32>` and compared by dot product on the L2-normalized vectors.
 
 ```rust
 // retrieval.rs — public entry point
@@ -93,7 +93,7 @@ pub async fn retrieve(
 
 ### 7. Generate (wired)
 
-`pipeline.rs::run_generate_artifacts` wraps `generation.rs::Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) auto-embeds any un-embedded chunks, (2) splits the material into one context unit per topic cluster (HDBSCAN noise skipped, clusters ordered by source position), (3) builds a per-unit prompt, and (4) generates schema-constrained JSON. Question-style types persist one artifact per item (1-8 per cluster); `Summary` and `MindMap` merge every unit's section into one worksheet-wide artifact. Each unit derives its seed from the base (`seed + unit_index`) so an exhaustive batch never repeats.
+`pipeline.rs::generate_artifacts` wraps `generation.rs::Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) auto-embeds any un-embedded chunks, (2) splits the material into one context unit per topic cluster (HDBSCAN noise skipped, clusters ordered by source position), (3) builds a per-unit prompt, and (4) generates schema-constrained JSON. Question-style types persist one artifact per item (1-8 per cluster); `Summary` and `MindMap` merge every unit's section into one worksheet-wide artifact. Each unit derives its seed from the base (`seed + unit_index`) so an exhaustive batch never repeats.
 
 Best-effort: a unit whose output truncates or fails to parse is retried once with a doubled (capped 4096) token budget, then skipped so one bad cluster cannot discard the rest of the batch.
 
@@ -187,13 +187,17 @@ core/src/
 ├── database.rs         # SQLite connection + migration runner
 ├── llm.rs              # Process-wide llama.cpp backend singleton
 ├── models.rs           # GGUF/tokenizer paths + hf-hub download + lazy ModelPool
-├── file.rs             # get_file_metadata command
-├── worksheet.rs        # worksheet CRUD commands
+├── commands/           # thin #[tauri::command] wrappers (State → domain logic)
+│   ├── file.rs         # get_file_metadata command
+│   ├── worksheet.rs    # worksheet CRUD commands
+│   └── pipeline.rs     # end-to-end commands (process_files, embed_worksheet, …)
+├── file.rs             # get_file_metadata logic
+├── worksheet.rs        # worksheet CRUD logic
 ├── chunk.rs            # text splitting logic
 ├── ingest.rs           # parse + chunk + store pipeline
 ├── embed.rs            # bge-small embeddings
 ├── retrieval.rs        # embedding BLOB encode/decode + cosine retrieval
 ├── generation.rs       # SmolLM2 grammar-constrained generation
-├── pipeline.rs         # end-to-end commands + testable run_* cores
+├── pipeline.rs         # testable pipeline cores (process_files, generate_artifacts, …)
 └── schema.rs           # shared structs (Chunk, Artifact, ArtifactType, GenerationParams, …)
 ```

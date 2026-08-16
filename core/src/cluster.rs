@@ -289,7 +289,9 @@ pub(crate) fn pick_evenly(members: &[usize], count: usize) -> Vec<usize> {
         return members.to_vec();
     }
     let stride = n as f64 / count as f64;
-    (0..count).map(|i| members[(i as f64 * stride).floor() as usize]).collect()
+    (0..count)
+        .map(|i| members[(i as f64 * stride).floor() as usize])
+        .collect()
 }
 
 #[cfg(test)]
@@ -337,9 +339,7 @@ mod tests {
     fn test_even_sample_spreads_by_position_and_respects_budget() {
         let labels = vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1];
         let positions: Vec<i32> = (0..10).collect();
-        let relevance = vec![
-            0.9, 0.1, 0.1, 0.1, 0.1, 0.8, 0.1, 0.1, 0.1, 0.1,
-        ];
+        let relevance = vec![0.9, 0.1, 0.1, 0.1, 0.1, 0.8, 0.1, 0.1, 0.1, 0.1];
         let picked = even_sample_context(&labels, &positions, &relevance, 6);
         assert!(picked.len() <= 6);
         assert!(picked.len() >= 2);
@@ -379,7 +379,11 @@ mod tests {
         let positions: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6];
         let units = cluster_contexts(&labels, &positions, 10);
         assert_eq!(units.len(), 2, "noise chunks must be skipped");
-        assert_eq!(units[0], vec![1, 2, 6], "cluster 1 starts earliest at position 1");
+        assert_eq!(
+            units[0],
+            vec![1, 2, 6],
+            "cluster 1 starts earliest at position 1"
+        );
         assert_eq!(units[1], vec![3, 4], "cluster 0 starts at position 3");
     }
 

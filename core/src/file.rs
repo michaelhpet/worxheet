@@ -61,7 +61,6 @@ pub struct FileMetadata {
     size: u64,
 }
 
-#[tauri::command]
 pub fn get_file_metadata(path: &str) -> Result<FileMetadata, String> {
     let path_data = std::path::Path::new(path);
 

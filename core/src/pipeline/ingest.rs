@@ -1,10 +1,54 @@
 use tokenizers::Tokenizer;
 
-use crate::chunk::chunk_text;
 use crate::schema::Chunk;
 
 const CHUNK_SIZE: usize = 512;
 const CHUNK_OVERLAP: usize = 128;
+
+/// Split a document into overlapping token-sized chunks.
+pub fn chunk_text(
+    text: &str,
+    chunk_size: usize,
+    overlap: usize,
+    tokenizer: &Tokenizer,
+) -> Result<Vec<String>, String> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| format!("Tokenization failed: {}", e))?;
+    let token_ids = encoding.get_ids();
+    let token_count = token_ids.len();
+
+    if token_count <= chunk_size {
+        return Ok(vec![text.to_string()]);
+    }
+
+    let clamped_overlap = overlap.min(chunk_size / 2);
+    let stride = chunk_size - clamped_overlap;
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+
+    while start < token_count {
+        let end = std::cmp::min(start + chunk_size, token_count);
+        let chunk_token_ids = &token_ids[start..end];
+        let chunk_text = tokenizer
+            .decode(chunk_token_ids, true)
+            .map_err(|e| format!("Decoding failed: {}", e))?;
+        chunks.push(chunk_text);
+
+        if end == token_count {
+            break;
+        }
+
+        start += stride;
+    }
+
+    Ok(chunks)
+}
 
 pub fn parse_file(path: &str, extension: &str) -> Result<String, String> {
     match extension.to_lowercase().as_str() {
@@ -31,6 +75,8 @@ pub fn parse_file(path: &str, extension: &str) -> Result<String, String> {
     }
 }
 
+/// Parse, chunk, and store the given files of a worksheet. Reports progress as
+/// each file completes through `on_progress` if provided.
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
@@ -43,8 +89,8 @@ pub async fn process_files(
     let total = file_ids.len();
 
     for (index, file_id) in file_ids.iter().enumerate() {
-        let row = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT path, extension, name FROM files WHERE id = ? AND worksheet_id = ?",
+        let row = sqlx::query_as::<_, (String, String)>(
+            "SELECT path, extension FROM files WHERE id = ? AND worksheet_id = ?",
         )
         .bind(file_id)
         .bind(worksheet_id)
@@ -53,13 +99,7 @@ pub async fn process_files(
         .map_err(|_| format!("Failed to query file {}", file_id))?
         .ok_or_else(|| format!("File not found: {}", file_id))?;
 
-        let (path, extension, _name) = row;
-
-        sqlx::query("UPDATE files SET status = 'parsing' WHERE id = ?")
-            .bind(file_id)
-            .execute(pool)
-            .await
-            .map_err(|_| format!("Failed to update file status"))?;
+        let (path, extension) = row;
 
         let text = parse_file(&path, &extension)?;
 
@@ -90,12 +130,6 @@ pub async fn process_files(
 
             position_counter += 1;
         }
-
-        sqlx::query("UPDATE files SET status = 'parsed' WHERE id = ?")
-            .bind(file_id)
-            .execute(pool)
-            .await
-            .map_err(|_| format!("Failed to update file status"))?;
 
         if let Some(on_progress) = on_progress.as_deref_mut() {
             on_progress(index + 1, total);
@@ -149,6 +183,38 @@ mod tests {
             .await
             .unwrap();
         id
+    }
+
+    // --- chunk_text tests ---
+
+    #[test]
+    fn test_empty_text() {
+        let tokenizer = test_tokenizer();
+        let result = chunk_text("", 512, 128, &tokenizer).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_short_text() {
+        let tokenizer = test_tokenizer();
+        let result = chunk_text("Hello world", 512, 128, &tokenizer).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_long_text_produces_multiple_chunks() {
+        let tokenizer = test_tokenizer();
+        let text = "word ".repeat(10000);
+        let result = chunk_text(&text, 512, 128, &tokenizer).unwrap();
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn test_overlap_clamping() {
+        let tokenizer = test_tokenizer();
+        let text = "word ".repeat(5000);
+        let result = chunk_text(&text, 512, 500, &tokenizer).unwrap();
+        assert!(result.len() >= 2);
     }
 
     // --- parse_file tests ---
@@ -260,20 +326,18 @@ mod tests {
         .await
         .unwrap();
 
-        let chunks = process_files(&pool, &worksheet_id, &[file_id.clone()], &tokenizer, None)
-            .await
-            .unwrap();
+        let chunks = process_files(
+            &pool,
+            &worksheet_id,
+            std::slice::from_ref(&file_id),
+            &tokenizer,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(!chunks.is_empty(), "Should produce at least one chunk");
         assert!(chunks[0].text.contains("Hello World"));
-
-        // Verify file status updated
-        let status: String = sqlx::query_scalar("SELECT status FROM files WHERE id = ?")
-            .bind(&file_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "parsed");
     }
 
     #[tokio::test]
@@ -297,19 +361,18 @@ mod tests {
         .await
         .unwrap();
 
-        let chunks = process_files(&pool, &worksheet_id, &[file_id.clone()], &tokenizer, None)
-            .await
-            .unwrap();
+        let chunks = process_files(
+            &pool,
+            &worksheet_id,
+            std::slice::from_ref(&file_id),
+            &tokenizer,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(!chunks.is_empty(), "Should produce at least one chunk");
         assert!(chunks[0].text.contains("Hello World"));
-
-        let status: String = sqlx::query_scalar("SELECT status FROM files WHERE id = ?")
-            .bind(&file_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(status, "parsed");
     }
 
     #[tokio::test]

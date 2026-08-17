@@ -1,23 +1,32 @@
-import { IconFileSearch, IconSparkles } from "@tabler/icons-react";
+import {
+	IconAlertTriangle,
+	IconFileSearch,
+	IconLoader,
+} from "@tabler/icons-react";
 import { useState } from "react";
 
 import { useArtifacts } from "@/data/artifacts";
-import { useFiles } from "@/data/files";
+import {
+	formatDownloadProgress,
+	modelDownloadLabel,
+	useModelDownload,
+	type ModelDownload,
+} from "@/data/model-downloads";
+import { usePipelineStatus, type PipelineStatus } from "@/data/pipeline";
 import { ARTIFACT_TYPE_OPTIONS, type ArtifactType } from "@/lib/artifact-types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
 	Empty,
-	EmptyContent,
 	EmptyDescription,
 	EmptyHeader,
 	EmptyMedia,
 	EmptyTitle,
 } from "@/components/ui/empty";
+import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArtifactCard } from "./artifact-card";
-import { GenerateDialog } from "./generate-dialog";
 
 type Filter = "all" | ArtifactType;
 
@@ -35,12 +44,14 @@ interface ArtifactsPanelProps {
 
 export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 	const { data: artifacts, isLoading } = useArtifacts(worksheetId);
-	const { data: files } = useFiles(worksheetId);
+	const { data: status } = usePipelineStatus(worksheetId);
+	const download = useModelDownload();
 	const [filter, setFilter] = useState<Filter>("all");
-	const [dialogOpen, setDialogOpen] = useState(false);
 
 	const allArtifacts = artifacts ?? [];
-	const hasParsedFiles = (files ?? []).some((file) => file.status === "parsed");
+	const running = status?.status === "running";
+	const failed = status?.status === "failed";
+	const done = status?.status === "done";
 	const visible =
 		filter === "all"
 			? allArtifacts
@@ -55,19 +66,22 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 	return (
 		<Card>
 			<CardHeader>
-				<CardTitle className="flex items-center justify-between">
-					<span>Generated artifacts</span>
-					<Button
-						size="sm"
-						disabled={!hasParsedFiles}
-						onClick={() => setDialogOpen(true)}
-					>
-						<IconSparkles />
-						Generate
-					</Button>
-				</CardTitle>
+				<CardTitle>Generated artifacts</CardTitle>
 			</CardHeader>
 			<CardContent className="gap-4">
+				<StatusBanner status={status} download={download} />
+
+				{running && <ProgressBar status={status} />}
+
+				{failed && (
+					<div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+						<IconAlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+						<p className="text-sm text-destructive">
+							{status?.error ?? "Pipeline failed"}
+						</p>
+					</div>
+				)}
+
 				<div className="flex flex-wrap items-center gap-1 rounded-lg border p-0.5">
 					{FILTER_OPTIONS.map((option) => (
 						<Button
@@ -98,22 +112,22 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 								<IconFileSearch className="size-7" />
 							</EmptyMedia>
 							<EmptyTitle>
-								{hasParsedFiles ? "No artifacts yet" : "No files processed"}
+								{failed
+									? "Generation failed"
+									: running
+										? "Generating artifacts"
+										: done
+											? "No artifacts yet"
+											: "No artifacts yet"}
 							</EmptyTitle>
 							<EmptyDescription>
-								{hasParsedFiles
-									? "Generate your first artifact to get started."
-									: "Process the worksheet's files before generating artifacts."}
+								{failed
+									? "Fix the reported error and create the worksheet again."
+									: running
+										? "The worksheet is still being processed."
+										: "Artifacts will appear here once the worksheet is processed."}
 							</EmptyDescription>
 						</EmptyHeader>
-						{hasParsedFiles && (
-							<EmptyContent>
-								<Button variant="secondary" onClick={() => setDialogOpen(true)}>
-									<IconSparkles />
-									Generate
-								</Button>
-							</EmptyContent>
-						)}
 					</Empty>
 				) : (
 					<div className="flex flex-col gap-3">
@@ -123,12 +137,82 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 					</div>
 				)}
 			</CardContent>
-
-			<GenerateDialog
-				worksheetId={worksheetId}
-				open={dialogOpen}
-				onOpenChange={setDialogOpen}
-			/>
 		</Card>
+	);
+}
+
+function StatusBanner({
+	status,
+	download,
+}: {
+	status?: PipelineStatus;
+	download: ModelDownload | null;
+}) {
+	if (!status || status.status !== "running") return null;
+
+	if (download?.active) {
+		return (
+			<div className="flex items-center gap-2 text-sm text-muted-foreground">
+				<IconLoader className="size-4 animate-spin" />
+				Downloading {modelDownloadLabel(download.kind)}
+				<span className="tabular-nums">
+					{formatDownloadProgress(download.done, download.total)}
+				</span>
+			</div>
+		);
+	}
+
+	if (status.phase === "generating") {
+		const label = ARTIFACT_TYPE_OPTIONS.find(
+			(option) => option.value === status.artifact_type,
+		)?.label;
+		return (
+			<div className="flex items-center gap-2 text-sm text-muted-foreground">
+				<IconLoader className="size-4 animate-spin" />
+				Generating {label ?? status.artifact_type}
+			</div>
+		);
+	}
+
+	return (
+		<div className="flex items-center gap-2 text-sm text-muted-foreground">
+			<IconLoader className="size-4 animate-spin" />
+			Processing files
+		</div>
+	);
+}
+
+function ProgressBar({ status }: { status: PipelineStatus }) {
+	if (status.phase === "generating") {
+		const percent =
+			status.total > 0 ? Math.round((status.done / status.total) * 100) : 0;
+		return (
+			<div className="flex flex-col gap-1">
+				<div className="flex items-center justify-between text-xs text-muted-foreground">
+					<span>
+						Type {Math.min(status.types_done + 1, status.types_total)}/
+						{status.types_total}
+					</span>
+					<span className="tabular-nums">
+						{status.done}/{status.total}
+					</span>
+				</div>
+				<Progress value={percent} />
+			</div>
+		);
+	}
+
+	const percent =
+		status.total > 0 ? Math.round((status.done / status.total) * 100) : 0;
+	return (
+		<div className="flex flex-col gap-1">
+			<div className="flex items-center justify-between text-xs text-muted-foreground">
+				<span>Files</span>
+				<span className="tabular-nums">
+					{status.done}/{status.total}
+				</span>
+			</div>
+			<Progress value={percent} />
+		</div>
 	);
 }

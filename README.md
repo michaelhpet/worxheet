@@ -38,9 +38,19 @@ The project is structured as a high-performance monolith:
 
 - Vectorization: Text chunks are embedded via `bge-small-en-v1.5` (GGUF) running in `llama-cpp-2` and stored as BLOBs in SQLite.
 
-- Generation: Cosine similarity over SQLite retrieves relevant chunks; `SmolLM2-360M-Instruct` (GGUF) generates grammar-constrained JSON artifacts (MCQs, essays, fill-in-the-blank, summaries, mind-maps) — all local, no external API calls.
+- Clustering: Embedded chunks are grouped into topic clusters (HDBSCAN) so generation exhausts the whole material.
+
+- Generation: Each topic cluster is turned into grammar-constrained JSON artifacts (MCQs, essays, fill-in-the-blank, summaries, mind-maps) by `SmolLM2-360M-Instruct` (GGUF) — all local, no external API calls.
 
 - Consumption: Artifacts are saved to SQLite and rendered in the React workspace.
+
+## ⚙️ Automatic Pipeline
+
+Creating a worksheet with files automatically starts a background job
+(`core/src/pipeline/jobs.rs`) that runs ingest → embed → cluster → generate
+for all five artifact types. The worksheet detail page shows live progress
+(polling `get_pipeline_status`) and then the generated artifacts; there are no
+process or generate buttons.
 
 ## 📄 License
 

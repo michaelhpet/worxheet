@@ -1,9 +1,12 @@
 use hdbscan_rs::{Hdbscan, StoreCenters};
 use ndarray::Array2;
+use sqlx::SqlitePool;
+
+use super::embed::{bytes_to_embedding, embedding_to_bytes};
 
 /// Cap on the number of context chunks fed into a single generation prompt.
 /// At 512 tokens per chunk, 10 chunks plus chat-template overhead stays under
-/// `generation::MAX_PROMPT_TOKENS` (6144); 12 would overflow it.
+/// the generation model's prompt budget (6144 tokens); 12 would overflow it.
 pub const MAX_CONTEXT_CHUNKS: usize = 10;
 
 /// HDBSCAN `min_cluster_size` scales with the number of chunks. Tuned against
@@ -151,100 +154,6 @@ fn normalize(vector: &mut [f32]) {
     }
 }
 
-/// Select up to `budget` chunk indices for a generation prompt.
-///
-/// Every group is ordered by its maximum query relevance, then the budget is
-/// spread evenly across the top groups and each group's picks are spread evenly
-/// by position (never the centroid), per AGENTS.md. HDBSCAN noise chunks take
-/// part as single-member groups so no document content is ever dropped.
-///
-/// Unused by the exhaustive generation path (`cluster_contexts` replaces it)
-/// but kept as a tested utility for relevance-ranked single-prompt sampling.
-#[allow(dead_code)]
-pub fn even_sample_context(
-    cluster_labels: &[i32],
-    positions: &[i32],
-    relevance: &[f32],
-    budget: usize,
-) -> Vec<usize> {
-    let n_chunks = cluster_labels.len();
-    if n_chunks == 0 || budget == 0 {
-        return Vec::new();
-    }
-
-    if cluster_labels.iter().all(|label| *label < 0) {
-        // Everything labelled noise: fall back to spreading by position across
-        // all chunks regardless of cluster.
-        let mut all: Vec<usize> = (0..n_chunks).collect();
-        all.sort_by(|a, b| positions[*a].cmp(&positions[*b]));
-        return pick_evenly(&all, budget);
-    }
-
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut group_relevance: Vec<f32> = Vec::new();
-    let mut group_peak: Vec<usize> = Vec::new();
-
-    let max_label = cluster_labels.iter().copied().max().unwrap_or(-1);
-    for label in 0..=max_label {
-        let mut members: Vec<usize> = (0..n_chunks)
-            .filter(|index| cluster_labels[*index] == label)
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        let peak = *members
-            .iter()
-            .max_by(|a, b| {
-                relevance[**a]
-                    .partial_cmp(&relevance[**b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .expect("non-empty members have a peak");
-        members.sort_by(|a, b| positions[*a].cmp(&positions[*b]));
-        groups.push(members);
-        group_relevance.push(relevance[peak]);
-        group_peak.push(peak);
-    }
-
-    // Noise chunks take part as their own single-member groups.
-    for index in 0..n_chunks {
-        if cluster_labels[index] < 0 {
-            groups.push(vec![index]);
-            group_relevance.push(relevance[index]);
-            group_peak.push(index);
-        }
-    }
-
-    let mut order: Vec<usize> = (0..groups.len()).collect();
-    order.sort_by(|a, b| {
-        group_relevance[*b]
-            .partial_cmp(&group_relevance[*a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let selected = order.len().min(budget);
-    let base = budget / selected;
-    let remainder = budget % selected;
-
-    let mut picked: Vec<usize> = Vec::with_capacity(budget);
-    for (index, &group) in order.iter().take(selected).enumerate() {
-        let slots = base + usize::from(index < remainder);
-        picked.extend(pick_evenly(&groups[group], slots));
-    }
-
-    // Top up from the single most relevant chunk of any remaining groups.
-    if picked.len() < budget {
-        for &group in order.iter().skip(selected) {
-            if picked.len() >= budget {
-                break;
-            }
-            picked.push(group_peak[group]);
-        }
-    }
-
-    picked
-}
-
 /// Split the material into per-cluster generation units.
 ///
 /// HDBSCAN noise chunks are skipped; only real topic clusters are used. Units
@@ -294,6 +203,75 @@ pub(crate) fn pick_evenly(members: &[usize], count: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Recompute HDBSCAN clusters over every embedded chunk of a worksheet and
+/// persist the centroids plus each chunk's cluster assignment.
+pub async fn rebuild_clusters(pool: &SqlitePool, worksheet_id: &str) -> Result<(), String> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT id, embedding
+         FROM chunks
+         WHERE worksheet_id = ? AND embedding IS NOT NULL
+         ORDER BY position",
+    )
+    .bind(worksheet_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| String::from("Failed to query embedded chunks"))?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+    let vectors: Vec<Vec<f32>> = rows
+        .iter()
+        .map(|(_, blob)| bytes_to_embedding(blob))
+        .collect::<Result<_, _>>()?;
+
+    let assignment =
+        tauri::async_runtime::spawn_blocking(move || assign_clusters(&vectors))
+            .await
+            .map_err(|e| format!("Clustering task failed: {e}"))??;
+
+    let mut sizes = vec![0usize; assignment.centroids.len()];
+    for label in &assignment.labels {
+        if *label >= 0 {
+            sizes[*label as usize] += 1;
+        }
+    }
+
+    sqlx::query("DELETE FROM clusters WHERE worksheet_id = ?")
+        .bind(worksheet_id)
+        .execute(pool)
+        .await
+        .map_err(|_| String::from("Failed to clear old clusters"))?;
+
+    for (cluster_index, centroid) in assignment.centroids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO clusters (worksheet_id, cluster_index, centroid, size)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(worksheet_id)
+        .bind(cluster_index as i32)
+        .bind(embedding_to_bytes(centroid))
+        .bind(sizes[cluster_index] as i64)
+        .execute(pool)
+        .await
+        .map_err(|_| String::from("Failed to store cluster"))?;
+    }
+
+    for (id, label) in ids.iter().zip(&assignment.labels) {
+        let index: Option<i32> = (*label >= 0).then_some(*label);
+        sqlx::query("UPDATE chunks SET cluster_index = ? WHERE id = ?")
+            .bind(index)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|_| String::from("Failed to update chunk cluster"))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,44 +311,6 @@ mod tests {
         let assignment = assign_clusters(&vectors).expect("should fall back");
         assert_eq!(assignment.centroids.len(), 1);
         assert_eq!(assignment.labels, vec![0, 0]);
-    }
-
-    #[test]
-    fn test_even_sample_spreads_by_position_and_respects_budget() {
-        let labels = vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1];
-        let positions: Vec<i32> = (0..10).collect();
-        let relevance = vec![0.9, 0.1, 0.1, 0.1, 0.1, 0.8, 0.1, 0.1, 0.1, 0.1];
-        let picked = even_sample_context(&labels, &positions, &relevance, 6);
-        assert!(picked.len() <= 6);
-        assert!(picked.len() >= 2);
-        assert!(!picked.contains(&10));
-        let mut sorted = picked.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), picked.len(), "no duplicates");
-        assert!(picked.contains(&0), "most relevant chunk should be picked");
-    }
-
-    #[test]
-    fn test_even_sample_noise_falls_back_to_position_spread() {
-        let labels = vec![-1; 8];
-        let positions: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
-        let relevance = vec![0.0; 8];
-        let picked = even_sample_context(&labels, &positions, &relevance, 4);
-        assert_eq!(picked, vec![0, 2, 4, 6]);
-    }
-
-    #[test]
-    fn test_even_sample_includes_noise_chunks() {
-        let labels = vec![-1, -1, 0, 0, 0];
-        let positions: Vec<i32> = vec![0, 1, 2, 3, 4];
-        let relevance = vec![0.9, 0.8, 0.3, 0.2, 0.1];
-        let picked = even_sample_context(&labels, &positions, &relevance, 3);
-        assert_eq!(picked.len(), 3);
-        assert!(
-            picked.contains(&0) && picked.contains(&1),
-            "noise chunks should be sampled, got {picked:?}"
-        );
     }
 
     #[test]

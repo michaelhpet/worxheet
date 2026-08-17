@@ -16,8 +16,21 @@ import {
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
-import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
+import {
+	Empty,
+	EmptyContent,
+	EmptyDescription,
+	EmptyHeader,
+	EmptyMedia,
+	EmptyTitle,
+} from "@/components/ui/empty";
+import {
+	Item,
+	ItemActions,
+	ItemContent,
+	ItemDescription,
+	ItemTitle,
+} from "@/components/ui/item";
 import {
 	Table,
 	TableBody,
@@ -26,8 +39,23 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
-import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
-import { IconChevronLeft, IconChevronRight, IconDotsVertical, IconFile, IconLayoutGrid, IconList, IconPlus, IconSelector, IconTable, IconTrash } from "@tabler/icons-react";
+import {
+	useDeleteWorksheet,
+	useWorksheets,
+	type Worksheet,
+} from "@/data/worksheets";
+import {
+	IconChevronLeft,
+	IconChevronRight,
+	IconDotsVertical,
+	IconFile,
+	IconLayoutGrid,
+	IconList,
+	IconPlus,
+	IconSelector,
+	IconTable,
+	IconTrash,
+} from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 
@@ -43,7 +71,8 @@ const VIEW_MODE_KEY = "worksheet-view-mode";
 
 function getStoredViewMode(): ViewMode {
 	const stored = localStorage.getItem(VIEW_MODE_KEY);
-	if (stored === "table" || stored === "grid" || stored === "list") return stored;
+	if (stored === "table" || stored === "grid" || stored === "list")
+		return stored;
 	return "table";
 }
 
@@ -132,10 +161,7 @@ function Home() {
 							))}
 						</div>
 
-						<Button
-							variant="default"
-							onClick={() => setCreateDialogOpen(true)}
-						>
+						<Button variant="default" onClick={() => setCreateDialogOpen(true)}>
 							<IconPlus />
 							New worksheet
 						</Button>

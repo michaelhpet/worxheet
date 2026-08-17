@@ -37,6 +37,31 @@ pub struct Paginated<T: Serialize> {
     pub total_pages: i64,
 }
 
+/// Live state of the automatic worksheet pipeline, shared with the frontend
+/// through `get_pipeline_status` and the `pipeline-progress` event.
+#[derive(Clone, Debug, Serialize)]
+pub struct PipelineStatus {
+    /// One of `idle`, `running`, `done`, `failed`.
+    pub status: String,
+    /// `ingesting` or `generating` while running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Artifact type currently being generated (generation phase only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    /// Units completed in the current phase.
+    pub done: usize,
+    /// Total units in the current phase.
+    pub total: usize,
+    /// Artifact types completed so far.
+    pub types_done: usize,
+    /// Total artifact types to generate.
+    pub types_total: usize,
+    /// Error message when `status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ArtifactType {
     MultipleChoiceQuiz,

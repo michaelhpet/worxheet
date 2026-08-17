@@ -18,15 +18,20 @@ Local-first RAG application: study material is uploaded, parsed, chunked, embedd
 Upload ─► Parse ─► Chunk ─► Store ─► Embed ─► Cluster ─► Generate ─► Persist
 ```
 
-All stages run through Tauri commands in `core/src/pipeline.rs`, with the heavy
+Creating a worksheet automatically starts a background job
+(`core/src/pipeline/jobs.rs`) that runs the whole pipeline end-to-end — the
+frontend only waits for it to finish and then shows the artifacts. The heavy
 compute (`parse_file`, `chunk_text`, embedding, HDBSCAN clustering, LLM
-generation) dispatched off the async runtime via `spawn_blocking`. Persistence
-is SQLite; vectors live as BLOB columns rather than in a vector database.
+generation) is dispatched off the async runtime via `spawn_blocking`.
+Persistence is SQLite; vectors live as BLOB columns rather than in a vector
+database.
 
-- **Rust core** (`core/src/`) — all AI inference, document extraction, and
-  storage. See [PIPELINE.md](PIPELINE.md) for a prose walkthrough of every stage.
-- **Frontend** (`app/`) — React UI that drives the pipeline through IPC and
-  renders live progress from emitted events.
+- **Rust core** (`core/src/`) — all AI inference, document extraction, storage,
+  and the background job runner. See [PIPELINE.md](PIPELINE.md) for a prose
+  walkthrough of every stage.
+- **Frontend** (`app/`) — React UI that creates worksheets and renders live
+  pipeline progress (`usePipelineStatus`, polling `get_pipeline_status`) plus
+  the generated artifacts.
 
 ## Related docs
 

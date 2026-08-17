@@ -1,25 +1,25 @@
 # Generation Pipeline
 
-Zoom into `pipeline::generate_artifacts` (`core/src/pipeline.rs`). This is where RAG
-meets generation: it exhausts the material by producing one unit per HDBSCAN
+Zoom into `pipeline::generate_artifacts` (`core/src/pipeline/generate.rs`). This is where
+RAG meets generation: it exhausts the material by producing one unit per HDBSCAN
 topic cluster, generates grammar-constrained JSON per unit, then assembles and
-persists artifacts. The LLM is `SmolLM2-360M-Instruct` (Q8_0, 8K context).
+persists artifacts. The LLM is `SmolLM2-360M-Instruct` (Q8_0, 8K context). It
+runs as part of the automatic pipeline job for each of the five artifact types.
 
 ```mermaid
 flowchart TB
-    START(["generate_artifacts(worksheet_id, type, params?)"])
-    RESET["emit generation-progress {done:0, total:0}"]
-    QCH["SELECT chunks (position, text, cluster_index, embedding) ORDER BY position"]
+    START(["generate_artifacts(worksheet_id, type, on_progress)"])
+    RESET["emit pipeline-progress {phase:generating, types_done, types_total}"]
+    QCH["SELECT chunks (position, text, cluster_index) ORDER BY position"]
     CHK{chunks empty?}
-    EMBEDMISS["auto-embed chunks missing vectors (BLOB write-back)"]
     UNITS{"any chunk has cluster_index >= 0?"}
     CTX1["cluster_contexts(labels, positions, MAX_CONTEXT_CHUNKS=10)<br/>one unit per topic cluster, noise skipped, by source position"]
     CTX2["fallback: single unit = pick_evenly(all, 10)"]
-    PREP["build contexts + unit_sources (chunk ids per unit)<br/>emit generation-progress {total: units}"]
+    PREP["build contexts + unit_sources (chunk ids per unit)<br/>emit pipeline-progress {done:0, total: units}"]
 
     START --> RESET --> QCH --> CHK
     CHK -- "yes" --> ERR["return 'No chunks found'"]
-    CHK -- "no" --> EMBEDMISS --> UNITS
+    CHK -- "no" --> UNITS
     UNITS -- "yes" --> CTX1
     UNITS -- "no (legacy)" --> CTX2
     CTX1 --> PREP
@@ -34,7 +34,7 @@ flowchart TB
         RETRY["retry: max_tokens doubled (cap 4096)"]
         OK["push output + source"]
         FAIL["record failure, skip unit"]
-        PROGE["emit generation-progress {done: index+1}"]
+        PROGE["emit pipeline-progress {done: index+1}"]
 
         SEED --> PROMPT --> GEN --> PARSE
         PARSE -- "no" --> RETRY --> GEN
@@ -66,25 +66,26 @@ flowchart TB
 
 ## The moving parts
 
-1. **Fetch + auto-embed** — all chunks are read with their optional
-   `cluster_index` and `embedding`. Any chunk still missing a vector is embedded
-   on the fly so a worksheet can skip the explicit embed step.
+1. **Fetch** — all chunks are read with their optional `cluster_index`. The
+   auto-embed step runs before generation in `process_files`, so every chunk
+   already has a vector.
 
-2. **Unit selection** — `cluster_contexts` (`cluster.rs`) groups chunks by
-   cluster, orders clusters by the source position of their earliest chunk, and
-   samples up to `MAX_CONTEXT_CHUNKS=10` members per cluster evenly by position.
-   HDBSCAN noise (`cluster_index = -1`) is skipped. Legacy worksheets with no
-   clusters fall back to a single unit spread evenly across the whole material.
+2. **Unit selection** — `cluster_contexts` (`pipeline/cluster.rs`) groups chunks
+   by cluster, orders clusters by the source position of their earliest chunk,
+   and samples up to `MAX_CONTEXT_CHUNKS=10` members per cluster evenly by
+   position. HDBSCAN noise (`cluster_index = -1`) is skipped. Legacy worksheets
+   with no clusters fall back to a single unit spread evenly across the whole
+   material.
 
-3. **Prompt building** — `generation.rs` provides a shared system prompt
+3. **Prompt building** — `pipeline/generate.rs` provides a shared system prompt
    (`system_prompt_for`) and a per-type task prompt (`user_message_for`) that
    embeds the retrieved passages. The model's built-in chat template wraps the
    system + user messages (`apply_chat_template`).
 
-4. **Grammar-constrained generation** — each unit's JSON schema
-   (`schema_for`) is compiled into a GBNF grammar via `json_schema_to_grammar`
-   and sampled under a chain `[grammar?, temp?, top_p, dist(seed)]`. The model
-   can only emit schema-valid JSON. Sampling uses the apply-sampler path
+4. **Grammar-constrained generation** — each unit's JSON schema (`schema_for`)
+   is compiled into a GBNF grammar via `json_schema_to_grammar` and sampled
+   under a chain `[grammar?, temp?, top_p, dist(seed)]`. The model can only emit
+   schema-valid JSON. Sampling uses the apply-sampler path
    (`LlamaTokenDataArray::apply_sampler`) to avoid a known `sampler.sample`
    crash in llama-cpp-2.
 
@@ -103,8 +104,8 @@ flowchart TB
 
 7. **Persist** — each artifact (new ULID id, type, comma-joined source chunk
    ids, JSON content) is inserted into the `artifacts` table and returned to the
-   frontend. `generation-progress` is emitted once per unit plus a `{done:0}`
-   reset at the start of the run.
+   frontend. `pipeline-progress` is emitted once per unit plus a per-type reset
+   at the start of each artifact type.
 
 ## Sampling parameters (`GenerationParams`, defaults)
 

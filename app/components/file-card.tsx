@@ -34,7 +34,12 @@ export function FileCard({ className, ...props }: FileCardProps) {
 	};
 
 	return (
-		<Item className={cn("group border-b-border rounded-none last:border-b-0", className)}>
+		<Item
+			className={cn(
+				"group border-b-border rounded-none last:border-b-0",
+				className,
+			)}
+		>
 			<ItemContent>
 				<ItemTitle className="break-all">{data.name}</ItemTitle>
 				<ItemDescription>

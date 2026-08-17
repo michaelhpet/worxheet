@@ -2,35 +2,35 @@
 
 ## Overview
 
-This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, chunk, store, embed, cluster, generate, persist — is wired end-to-end through Tauri commands (`pipeline.rs`) and SQLite. Generation exhausts the material: it runs one unit per HDBSCAN topic cluster (question types produce one or more items each; `Summary`/`MindMap` yield a single worksheet-wide artifact) instead of using a user-chosen count over the top-k most similar chunks.
+This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, chunk, store, embed, cluster, generate, persist — runs automatically in the background after a worksheet is created: creating a worksheet with files starts a job that exhausts the material end-to-end, and the frontend just waits for it to finish and then shows the artifacts. Generation runs one unit per HDBSCAN topic cluster (question types produce one or more items each; `Summary`/`MindMap` yield a single worksheet-wide artifact).
 
 ## Pipeline Steps
 
 ```
-Upload ─► Parse ─► Chunk ─► Store ─► Embed ─► Retrieve ─► Generate ─► Persist
-   [wired — pipeline.rs commands + SQLite]
+Create worksheet ─► Parse ─► Chunk ─► Store ─► Embed ─► Cluster ─► Generate ─► Persist
+   [automatic — pipeline/jobs.rs background job + SQLite]
 ```
 
 ## Step-by-Step
 
-### 1. Upload
+### 1. Upload (automatic kick-off)
 
-`create_worksheet` inserts the worksheet and registers each selected file in the `files` table (path, name, extension, size). The wiring between the file dialog and the worksheet lives in the frontend (`create-worksheet-dialog.tsx`).
+`create_worksheet` inserts the worksheet and registers each selected file in the `files` table (path, name, extension, size). When the worksheet is created with at least one file, the command also calls `pipeline::jobs::start_job`, which spawns the background pipeline for that worksheet. The frontend wiring lives in `create-worksheet-dialog.tsx`.
 
 ### 2. Parse
 
-`ingest.rs::parse_file` extracts text from each uploaded file:
+`pipeline/ingest.rs::parse_file` extracts text from each uploaded file:
 
 | Format | Parser |
 |---|---|
 | PDF | `pdf_oxide` (page-by-page extraction) |
 | PPTX, DOCX, PPT, DOC | `office_oxide` |
 
-Output: raw text per file. File status is updated to `parsing` before extraction and `parsed` on success.
+Output: raw text per file.
 
 ### 3. Chunk
 
-`chunk.rs::chunk_text` splits extracted text into overlapping chunks sized by the HF `tokenizers` tokenizer.
+`pipeline/ingest.rs::chunk_text` splits extracted text into overlapping chunks sized by the HF `tokenizers` tokenizer.
 
 ```
 Config:
@@ -47,67 +47,40 @@ Example:
 
 ### 4. Store
 
-`pipeline.rs::process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`. The same logic drives file parsing end-to-end; it is exposed to the frontend as the `process_files` command (thin wrapper in `commands/pipeline.rs`) and emits an `ingestion-progress` event (`{ worksheet_id, done, total }`) as each file completes.
+`pipeline/mod.rs::process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`.
 
 ```rust
-// pipeline.rs — public entry point
+// pipeline/mod.rs — public entry point
 pub async fn process_files(
-    app: Option<&AppHandle>,
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     models: &Arc<ModelPool>,
+    on_progress: Option<ProgressFn>,
 ) -> Result<Vec<Chunk>, String>
 ```
 
 The `embedding` BLOB column starts `NULL` and is populated by the embed step.
 
-### 5. Embed (wired)
+### 5. Embed
 
-`pipeline.rs::embed_worksheet` lazily loads the embedding model from `ModelPool` and runs `embed.rs::Embedder` (wraps `bge-small-en-v1.5`, Q8_0 GGUF, 384-dim). Un-embedded chunks are read from the DB, embedded (L2-normalized, so cosine similarity is a plain dot product), and written back to `chunks.embedding` as a float32 BLOB.
-
-```rust
-// embed.rs — public entry point
-pub struct Embedder { /* ... */ }
-
-pub fn load(model_path: &Path) -> Result<Self, String>
-pub fn dimension(&self) -> usize          // 384
-pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String>
-```
-
-Status: wired. `embed_worksheet` persists vectors to the BLOB column; `generate_artifacts` also auto-embeds any chunks that are still missing vectors, so a worksheet can skip the explicit embed step.
-
-### 6. Retrieve (wired)
-
-`pipeline.rs::retrieve_chunks` embeds a query and returns the top-k chunks by cosine similarity (`retrieval.rs`). BLOBs are decoded to `Vec<f32>` and compared by dot product on the L2-normalized vectors.
+`pipeline/embed.rs::embed_missing_chunks` lazily loads the embedding model from `ModelPool` and runs `Embedder` (wraps `bge-small-en-v1.5`, Q8_0 GGUF, 384-dim). Un-embedded chunks are read from the DB, embedded (L2-normalized, so cosine similarity is a plain dot product), and written back to `chunks.embedding` as a float32 BLOB.
 
 ```rust
-// retrieval.rs — public entry point
-pub async fn retrieve(
-    pool: &SqlitePool,
-    worksheet_id: &str,
-    query: &str,
-    k: usize,
-) -> Result<Vec<RetrievedChunk>, String>
+// pipeline/embed.rs — public entry points
+pub fn embedding_to_bytes(vec: &[f32]) -> Vec<u8>   // little-endian float32 BLOB
+pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> // reverse
 ```
 
-### 7. Generate (wired)
+### 6. Cluster
 
-`pipeline.rs::generate_artifacts` wraps `generation.rs::Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) auto-embeds any un-embedded chunks, (2) splits the material into one context unit per topic cluster (HDBSCAN noise skipped, clusters ordered by source position), (3) builds a per-unit prompt, and (4) generates schema-constrained JSON. Question-style types persist one artifact per item (1-8 per cluster); `Summary` and `MindMap` merge every unit's section into one worksheet-wide artifact. Each unit derives its seed from the base (`seed + unit_index`) so an exhaustive batch never repeats.
+`pipeline/cluster.rs::rebuild_clusters` runs HDBSCAN over all embedded chunks, persists one centroid per topic cluster into the `clusters` table, and writes each chunk's `cluster_index` (or NULL for noise). `min_cluster_size` scales as `n/200` clamped to `[3,16]`; tiny worksheets fall back to a single cluster.
+
+### 7. Generate
+
+`pipeline/generate.rs::generate_artifacts` wraps `Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) splits the material into one context unit per topic cluster (HDBSCAN noise skipped, clusters ordered by source position), (2) builds a per-unit prompt, and (3) generates schema-constrained JSON. Question-style types persist one artifact per item (1-8 per cluster); `Summary` and `MindMap` merge every unit's section into one worksheet-wide artifact. Each unit derives its seed from the base (`seed + unit_index`) so an exhaustive batch never repeats.
 
 Best-effort: a unit whose output truncates or fails to parse is retried once with a doubled (capped 4096) token budget, then skipped so one bad cluster cannot discard the rest of the batch.
-
-```rust
-// generation.rs — public entry points
-pub fn load(model_path: &Path) -> Result<Self, String>
-pub fn apply_chat_template(&self, system: &str, user: &str) -> Result<String, String>
-pub fn generate(
-    &self,
-    prompt: &str,
-    schema_json: Option<&str>,
-    params: &GenerationParams,
-) -> Result<String, String>
-```
 
 Generation characteristics:
 
@@ -116,17 +89,34 @@ Generation characteristics:
 - **Sampling chain**: `[grammar?, temp?, top_p, dist(seed)]` applied to the logits via `LlamaTokenDataArray::apply_sampler`. This manual array path is used deliberately to avoid the `llama-cpp-2` grammar-sampler crash on `sampler.sample(ctx, idx)` (utilityai/llama-cpp-rs#1007).
 - **Termination**: generation stops on the model's EOG token. When the grammar completes, the grammar sampler masks everything but EOG, so the loop ends cleanly.
 - **Parameters**: `temperature` (default 0.7), `top_p` (default 0.9), `max_tokens` (default 1024), `seed` (default 1234). Context window `N_CTX = 8192`, max prompt `6144` tokens.
-- **Artifact schemas**: `generation.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders. Question-style schemas wrap 1-8 items in an array so one cluster yields multiple artifacts; `Summary`/`MindMap` keep single-object schemas whose per-cluster outputs the pipeline concatenates.
+- **Artifact schemas**: `pipeline/generate.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders. Question-style schemas wrap 1-8 items in an array so one cluster yields multiple artifacts; `Summary`/`MindMap` keep single-object schemas whose per-cluster outputs the pipeline concatenates.
 
-Status: wired. `generate_artifacts` writes the validated artifact JSON to the `artifacts` table and returns it to the frontend. It emits `generation-progress` events (`{ worksheet_id, done, total }`) via the `AppHandle` once per generation unit, plus a reset event (`done: 0`) at the start of a run.
-
-### 8. Persist (wired)
+### 8. Persist
 
 Validated artifacts are inserted into the `artifacts` table (with `artifact_type` and `source`) and listed back to the frontend by the `get_artifacts` command.
+
+## Job runner (pipeline/jobs.rs)
+
+`PipelineJobs` (kept in Tauri state as `Arc<PipelineJobs>`) runs one pipeline at a time:
+
+- A `tokio::sync::Mutex` gate serializes pipelines — only one llama.cpp inference job runs at once, regardless of how many worksheets are created quickly.
+- `start_job` marks the worksheet `running` in the DB and spawns the job on the Tauri async runtime.
+- `run_pipeline` → `process_files` (ingest + embed + cluster), clears the worksheet's existing `artifacts` rows, then generates each of the five artifact types in order.
+- Progress is persisted and streamed as a single `pipeline-progress` event; on completion the worksheet's `pipeline_status` is set to `done` (or `failed` with an error message in `pipeline_error`).
+- `resume_stale` runs at app startup and re-kicks any worksheet stuck in `running` (e.g. after a crash), so a job is never lost silently.
 
 ## Data Model (SQLite)
 
 ```sql
+CREATE TABLE worksheets (
+    id VARCHAR(255) NOT NULL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    pipeline_status VARCHAR(255) NOT NULL DEFAULT 'idle',   -- idle | running | done | failed
+    pipeline_error TEXT                                      -- set when status = 'failed'
+);
+
 CREATE TABLE files (
     id TEXT PRIMARY KEY,
     worksheet_id TEXT NOT NULL REFERENCES worksheets(id) ON DELETE CASCADE,
@@ -134,7 +124,6 @@ CREATE TABLE files (
     name TEXT NOT NULL,
     extension TEXT NOT NULL,
     size INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'uploaded',   -- uploaded | parsing | parsed
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -158,46 +147,45 @@ CREATE TABLE artifacts (
 );
 ```
 
+Pipeline status columns were added by `migrations/20260816000000_pipeline_status.sql`.
+
 ## Connection to Frontend
 
 Exposed Tauri commands (`lib.rs` invoke handler):
 
 - `get_file_metadata`
 - `get_worksheets`, `get_worksheet`, `create_worksheet`, `delete_worksheet`
-- `get_files` — list a worksheet's files with parse status
-- `process_files` — parse + chunk + store selected files
-- `embed_worksheet` — embed all un-embedded chunks and persist BLOBs
-- `retrieve_chunks` — RAG retrieval (top-k chunks by cosine similarity)
-- `generate_artifacts` — auto-embed, split material into per-cluster units, generate + persist artifacts (takes `worksheet_id`, `artifact_type`, optional `GenerationParams`; count is derived from the clusters)
 - `get_artifacts` — list a worksheet's generated artifacts
+- `get_pipeline_status` — read the worksheet's current pipeline status
 
-Progress events (listened via `@tauri-apps/api/event`):
+`create_worksheet` starts the background job when files are provided; `delete_worksheet` stops/removes any in-flight job.
 
-- `ingestion-progress` — `{ worksheet_id, done, total }` per file during `process_files`
-- `generation-progress` — `{ worksheet_id, done, total }` per generation unit during `generate_artifacts`; a `{ done: 0 }` reset is emitted at the start of every run
+Progress event (listened via `@tauri-apps/api/event`):
 
-The React worksheet detail route (`app/routes/worksheets.$id.tsx`) composes a files panel (parse status + processing with progress) and an artifacts panel (type-filtered artifact cards + a generate dialog without a count control and with advanced sampling params).
+- `pipeline-progress` — `{ worksheet_id, status, phase, artifact_type, done, total, types_done, types_total, error }` emitted throughout the run
+- `model-download` — `{ kind, done, total }` while the first run downloads GGUFs
+
+The React worksheet detail route (`app/routes/worksheets.$id.tsx`) renders a status banner (`usePipelineStatus` in `app/data/pipeline.ts`, polling `get_pipeline_status` every ~1.2s while running) and an artifacts panel (type-filtered artifact cards). There are no process/generate buttons — creating a worksheet is the entire interaction.
 
 ## Module Layout (core/src/)
 
 ```
 core/src/
-├── lib.rs              # register commands, manage AppState (database + models)
+├── lib.rs              # register commands, manage AppState (database + models + jobs), resume_stale
 ├── main.rs             # Tauri entry
 ├── database.rs         # SQLite connection + migration runner
-├── llm.rs              # Process-wide llama.cpp backend singleton
-├── models.rs           # GGUF/tokenizer paths + hf-hub download + lazy ModelPool
+├── models.rs           # GGUF/tokenizer paths + hf-hub download + lazy ModelPool + Embedder + Generator
 ├── commands/           # thin #[tauri::command] wrappers (State → domain logic)
 │   ├── file.rs         # get_file_metadata command
-│   ├── worksheet.rs    # worksheet CRUD commands
-│   └── pipeline.rs     # end-to-end commands (process_files, embed_worksheet, …)
-├── file.rs             # get_file_metadata logic
-├── worksheet.rs        # worksheet CRUD logic
-├── chunk.rs            # text splitting logic
-├── ingest.rs           # parse + chunk + store pipeline
-├── embed.rs            # bge-small embeddings
-├── retrieval.rs        # embedding BLOB encode/decode + cosine retrieval
-├── generation.rs       # SmolLM2 grammar-constrained generation
-├── pipeline.rs         # testable pipeline cores (process_files, generate_artifacts, …)
-└── schema.rs           # shared structs (Chunk, Artifact, ArtifactType, GenerationParams, …)
+│   ├── worksheet.rs    # worksheet CRUD commands (create_worksheet starts a job)
+│   └── pipeline.rs     # get_artifacts, get_pipeline_status commands
+├── worksheet.rs        # worksheet CRUD + file metadata logic
+├── pipeline/           # background pipeline (testable cores)
+│   ├── mod.rs          # orchestration (process_files) + integration tests
+│   ├── ingest.rs       # parse_file + chunk_text + ingest loop
+│   ├── embed.rs        # bge-small embeddings + BLOB encode/decode
+│   ├── cluster.rs      # HDBSCAN clustering + cluster_contexts + rebuild_clusters
+│   ├── generate.rs     # SmolLM2 grammar-constrained generation + assemble_artifacts
+│   └── jobs.rs         # PipelineJobs runner (start_job, resume_stale, get_status)
+└── schema.rs           # shared structs (Chunk, Artifact, ArtifactType, PipelineStatus, …)
 ```

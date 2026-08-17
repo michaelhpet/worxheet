@@ -17,9 +17,9 @@
 | `llama-cpp-2` 0.1.154 | Local LLM inference | llama.cpp bindings used for **both** `bge-small-en-v1.5` embeddings and `SmolLM2-360M-Instruct` generation, including the GBNF grammar sampler for structured output. |
 | `llama-cpp-sys-2` | FFI layer for llama.cpp | Generated bindings plus the bundled C++ llama.cpp source. Compiled at build time via `cc`/`cmake` (requires `cmake` + a C++ compiler, ~5 min). |
 | `tokenizers` 0.21 | Tokenization | Hugging Face tokenizers used by `chunk_text` to size and split document chunks. |
-| `encoding_rs` | Text decoding | Decodes generated tokens to UTF-8 in `generation.rs`. |
+| `encoding_rs` | Text decoding | Decodes generated tokens to UTF-8 in `pipeline/generate.rs`. |
 | `hf-hub` 0.4 | Model download | Downloads the GGUF/tokenizer artifacts from Hugging Face on first use (`models.rs`). |
-| `ndarray`, `hdbscan-rs`, `linfa`, `linfa-clustering` | Clustering | Reserved for the planned clustering stage. Currently unused in code. |
+| `ndarray`, `hdbscan-rs`, `linfa`, `linfa-clustering` | Clustering | HDBSCAN topic clustering over chunk embeddings (`pipeline/cluster.rs`). |
 
 ## AI Models (downloaded on first use)
 

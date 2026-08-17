@@ -13,16 +13,15 @@ Core RAG pipeline for text-based documents.
 - [x] PDF text extraction via `pdf_oxide`
 - [x] PPTX / DOCX text extraction via `office_oxide`
 - [x] Text chunking (recursive split, 512 tokens / 128 overlap)
-- [x] Parse → chunk → store pipeline (`ingest.rs`, wired into SQLite)
+- [x] Parse → chunk → store pipeline (`pipeline/ingest.rs`, wired into SQLite)
 - [x] Model auto-download via `hf-hub` (Q8_0 GGUFs + `tokenizer.json`, `models.rs`; lazy `ModelPool`)
-- [x] Embedding pipeline (`bge-small-en-v1.5` via `llama-cpp-2`, `embed.rs` + `embed_worksheet` command)
+- [x] Embedding pipeline (`bge-small-en-v1.5` via `llama-cpp-2`, `pipeline/embed.rs`)
 - [x] Embedding storage as SQLite BLOBs (`chunks.embedding`)
-- [x] RAG retrieval (cosine similarity in Rust over chunk BLOBs, `retrieve_chunks` command)
-- [x] HOTS generation (`SmolLM2-360M-Instruct` via `llama-cpp-2`, grammar-constrained JSON for all 5 artifact types, `generate_artifacts` command)
+- [x] HOTS generation (`SmolLM2-360M-Instruct` via `llama-cpp-2`, grammar-constrained JSON for all 5 artifact types, `pipeline/generate.rs`)
 - [x] Clustering / topic sampling for multi-artifact generation (HDBSCAN via `hdbscan-rs`; `process_files` persists clusters, `generate_artifacts` exhausts the material per cluster)
 - [x] Artifact persistence (MCQ items, summaries, mind-maps in SQLite `artifacts` table)
-- [x] React workspace view for generated artifacts (worksheet detail route: file processing, generate dialog, artifact cards)
-- [x] Generation progress indicators (`ingestion-progress` + `generation-progress` events surfaced as progress bars)
+- [x] React workspace view for generated artifacts (worksheet detail route: status banner + artifact cards)
+- [x] Automatic background pipeline (`pipeline/jobs.rs`: `create_worksheet` starts the job, `pipeline-progress` events + `get_pipeline_status`, `resume_stale` on startup)
 
 ## Phase 2 — Document Coverage
 

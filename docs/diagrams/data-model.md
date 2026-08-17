@@ -18,6 +18,8 @@ erDiagram
         text name
         timestamp created_at
         timestamp updated_at
+        text pipeline_status "idle | running | done | failed"
+        text pipeline_error "set when status = failed"
     }
 
     FILES {
@@ -27,7 +29,6 @@ erDiagram
         text name
         text extension
         integer size
-        text status "uploaded | parsing | parsed"
         timestamp created_at
     }
 
@@ -64,6 +65,9 @@ erDiagram
 
 - **Cascades** delete a worksheet's files, chunks, clusters, and artifacts when
   the worksheet is removed (`ON DELETE CASCADE` on `worksheet_id`/`file_id`).
+- **Pipeline status** lives on the worksheet (`pipeline_status` +
+  `pipeline_error`, added by `20260816000000_pipeline_status.sql`) and is
+  written by the background job runner (`pipeline/jobs.rs`).
 - **Indexes** (from migrations `20260419163341_schema.sql`,
   `20260630000001_pipeline.sql`, `20260811000000_clusters.sql`):
   - `idx_files_worksheet ON files(worksheet_id)`
@@ -76,6 +80,6 @@ erDiagram
   cluster label denormalized in `chunks.cluster_index`, which the generation
   path uses to group units.
 - **Embedding BLOBs** are decoded back to `Vec<f32>` by
-  `retrieval.rs::bytes_to_embedding` for cosine retrieval and clustering; encoded
-  by `embedding_to_bytes`. The cluster centroids are stored the same way and
-  are L2-normalized.
+  `pipeline/embed.rs::bytes_to_embedding` for clustering and context selection;
+  encoded by `embedding_to_bytes`. The cluster centroids are stored the same way
+  and are L2-normalized.

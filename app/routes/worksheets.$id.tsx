@@ -1,5 +1,4 @@
 import { ArtifactsPanel } from "@/components/workspace/artifacts-panel";
-import { FilesPanel } from "@/components/workspace/files-panel";
 import { useWorksheet } from "@/data/worksheets";
 import { createFileRoute, Link } from "@tanstack/react-router";
 
@@ -39,8 +38,7 @@ function WorksheetDetail() {
 				<h1 className="text-xl font-semibold">{worksheet.name}</h1>
 			</header>
 			<div className="flex-1 overflow-auto">
-				<div className="mx-auto flex max-w-6xl flex-col gap-6 p-6 lg:grid lg:grid-cols-[minmax(0,360px)_minmax(0,1fr)] lg:items-start">
-					<FilesPanel worksheetId={id} />
+				<div className="mx-auto flex max-w-6xl flex-col gap-6 p-6">
 					<ArtifactsPanel worksheetId={id} />
 				</div>
 			</div>

@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WorksheetsIdRouteImport } from './routes/worksheets.$id'
+import { Route as WorksheetsIdMcqRouteImport } from './routes/worksheets_.$id.mcq'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +23,40 @@ const WorksheetsIdRoute = WorksheetsIdRouteImport.update({
   path: '/worksheets/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
+const WorksheetsIdMcqRoute = WorksheetsIdMcqRouteImport.update({
+  id: '/worksheets_/$id/mcq',
+  path: '/worksheets/$id/mcq',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/worksheets/$id': typeof WorksheetsIdRoute
+  '/worksheets/$id/mcq': typeof WorksheetsIdMcqRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/worksheets/$id': typeof WorksheetsIdRoute
+  '/worksheets/$id/mcq': typeof WorksheetsIdMcqRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/worksheets/$id': typeof WorksheetsIdRoute
+  '/worksheets_/$id/mcq': typeof WorksheetsIdMcqRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/worksheets/$id'
+  fullPaths: '/' | '/worksheets/$id' | '/worksheets/$id/mcq'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/worksheets/$id'
-  id: '__root__' | '/' | '/worksheets/$id'
+  to: '/' | '/worksheets/$id' | '/worksheets/$id/mcq'
+  id: '__root__' | '/' | '/worksheets/$id' | '/worksheets_/$id/mcq'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   WorksheetsIdRoute: typeof WorksheetsIdRoute
+  WorksheetsIdMcqRoute: typeof WorksheetsIdMcqRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +75,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WorksheetsIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/worksheets_/$id/mcq': {
+      id: '/worksheets_/$id/mcq'
+      path: '/worksheets/$id/mcq'
+      fullPath: '/worksheets/$id/mcq'
+      preLoaderRoute: typeof WorksheetsIdMcqRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   WorksheetsIdRoute: WorksheetsIdRoute,
+  WorksheetsIdMcqRoute: WorksheetsIdMcqRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

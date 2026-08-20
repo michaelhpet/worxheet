@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
+import type { QuizArtifactType } from "@/lib/artifact-types";
 import type { Paginated } from "@/lib/types";
 
 export interface Worksheet {
@@ -7,6 +8,7 @@ export interface Worksheet {
 	name: string;
 	created_at: string;
 	updated_at: string;
+	artifact_counts?: Record<QuizArtifactType, number>;
 }
 
 export const WORKSHEETS_QUERY_KEY = "WORKSHEETS";

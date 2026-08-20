@@ -1,8 +1,4 @@
-import {
-	IconAlertTriangle,
-	IconFileSearch,
-	IconLoader,
-} from "@tabler/icons-react";
+import { IconAlertTriangle, IconFileSearch, IconLoader } from "@tabler/icons-react";
 import { useState } from "react";
 
 import { useArtifacts } from "@/data/artifacts";
@@ -17,13 +13,7 @@ import { ARTIFACT_TYPE_OPTIONS, type ArtifactType } from "@/lib/artifact-types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-	Empty,
-	EmptyDescription,
-	EmptyHeader,
-	EmptyMedia,
-	EmptyTitle,
-} from "@/components/ui/empty";
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArtifactCard } from "./artifact-card";
@@ -53,15 +43,10 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 	const failed = status?.status === "failed";
 	const done = status?.status === "done";
 	const visible =
-		filter === "all"
-			? allArtifacts
-			: allArtifacts.filter((artifact) => artifact.artifact_type === filter);
+		filter === "all" ? allArtifacts : allArtifacts.filter((artifact) => artifact.artifact_type === filter);
 
 	const countFor = (value: Filter) =>
-		value === "all"
-			? allArtifacts.length
-			: allArtifacts.filter((artifact) => artifact.artifact_type === value)
-					.length;
+		value === "all" ? allArtifacts.length : allArtifacts.filter((artifact) => artifact.artifact_type === value).length;
 
 	return (
 		<Card>
@@ -76,9 +61,7 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 				{failed && (
 					<div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
 						<IconAlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
-						<p className="text-sm text-destructive">
-							{status?.error ?? "Pipeline failed"}
-						</p>
+						<p className="text-sm text-destructive">{status?.error ?? "Pipeline failed"}</p>
 					</div>
 				)}
 
@@ -91,11 +74,7 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 							onClick={() => setFilter(option.value)}
 						>
 							{option.label}
-							<Badge
-								variant={filter === option.value ? "secondary" : "outline"}
-							>
-								{countFor(option.value)}
-							</Badge>
+							<Badge variant={filter === option.value ? "secondary" : "outline"}>{countFor(option.value)}</Badge>
 						</Button>
 					))}
 				</div>
@@ -141,13 +120,7 @@ export function ArtifactsPanel({ worksheetId }: ArtifactsPanelProps) {
 	);
 }
 
-function StatusBanner({
-	status,
-	download,
-}: {
-	status?: PipelineStatus;
-	download: ModelDownload | null;
-}) {
+function StatusBanner({ status, download }: { status?: PipelineStatus; download: ModelDownload | null }) {
 	if (!status || status.status !== "running") return null;
 
 	if (download?.active) {
@@ -155,17 +128,13 @@ function StatusBanner({
 			<div className="flex items-center gap-2 text-sm text-muted-foreground">
 				<IconLoader className="size-4 animate-spin" />
 				Downloading {modelDownloadLabel(download.kind)}
-				<span className="tabular-nums">
-					{formatDownloadProgress(download.done, download.total)}
-				</span>
+				<span className="tabular-nums">{formatDownloadProgress(download.done, download.total)}</span>
 			</div>
 		);
 	}
 
 	if (status.phase === "generating") {
-		const label = ARTIFACT_TYPE_OPTIONS.find(
-			(option) => option.value === status.artifact_type,
-		)?.label;
+		const label = ARTIFACT_TYPE_OPTIONS.find((option) => option.value === status.artifact_type)?.label;
 		return (
 			<div className="flex items-center gap-2 text-sm text-muted-foreground">
 				<IconLoader className="size-4 animate-spin" />
@@ -184,14 +153,12 @@ function StatusBanner({
 
 function ProgressBar({ status }: { status: PipelineStatus }) {
 	if (status.phase === "generating") {
-		const percent =
-			status.total > 0 ? Math.round((status.done / status.total) * 100) : 0;
+		const percent = status.total > 0 ? Math.round((status.done / status.total) * 100) : 0;
 		return (
 			<div className="flex flex-col gap-1">
 				<div className="flex items-center justify-between text-xs text-muted-foreground">
 					<span>
-						Type {Math.min(status.types_done + 1, status.types_total)}/
-						{status.types_total}
+						Type {Math.min(status.types_done + 1, status.types_total)}/{status.types_total}
 					</span>
 					<span className="tabular-nums">
 						{status.done}/{status.total}
@@ -202,8 +169,7 @@ function ProgressBar({ status }: { status: PipelineStatus }) {
 		);
 	}
 
-	const percent =
-		status.total > 0 ? Math.round((status.done / status.total) * 100) : 0;
+	const percent = status.total > 0 ? Math.round((status.done / status.total) * 100) : 0;
 	return (
 		<div className="flex flex-col gap-1">
 			<div className="flex items-center justify-between text-xs text-muted-foreground">

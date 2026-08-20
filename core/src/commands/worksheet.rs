@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::pipeline;
 use crate::schema::Paginated;
-use crate::worksheet::{self, Worksheet};
+use crate::worksheet::{self, Worksheet, WorksheetDetail};
 use crate::AppState;
 
 #[tauri::command]
@@ -18,7 +18,7 @@ pub async fn get_worksheets(
 pub async fn get_worksheet(
     state: State<'_, AppState>,
     id: &str,
-) -> Result<Worksheet, String> {
+) -> Result<WorksheetDetail, String> {
     worksheet::get_worksheet(&state.database, id).await
 }
 

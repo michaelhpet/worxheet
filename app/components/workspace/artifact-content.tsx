@@ -33,15 +33,9 @@ function McqView({ content }: { content: McqContent }) {
 								correct && "border-primary/50 bg-primary/10 text-primary",
 							)}
 						>
-							<span className="text-xs font-medium text-muted-foreground">
-								{OPTION_LETTERS[index]}
-							</span>
-							<span className="min-w-0 break-words">{option}</span>
-							{correct && (
-								<span className="ml-auto shrink-0 text-xs font-medium">
-									Correct
-								</span>
-							)}
+							<span className="text-xs font-medium text-muted-foreground">{OPTION_LETTERS[index]}</span>
+							<span className="min-w-0 wrap-break-word">{option}</span>
+							{correct && <span className="ml-auto shrink-0 text-xs font-medium">Correct</span>}
 						</li>
 					);
 				})}
@@ -54,13 +48,7 @@ function McqView({ content }: { content: McqContent }) {
 					{content.explanation ? ` — ${content.explanation}` : ""}
 				</p>
 			) : (
-				<Button
-					type="button"
-					variant="outline"
-					size="sm"
-					className="self-start"
-					onClick={() => setRevealed(true)}
-				>
+				<Button type="button" variant="outline" size="sm" className="self-start" onClick={() => setRevealed(true)}>
 					Show answer
 				</Button>
 			)}
@@ -74,24 +62,14 @@ function EssayView({ content }: { content: EssayContent }) {
 	return (
 		<div className="flex flex-col gap-3">
 			<p className="font-medium">{content.question}</p>
-			{content.instructions && (
-				<p className="text-sm text-muted-foreground">{content.instructions}</p>
-			)}
+			{content.instructions && <p className="text-sm text-muted-foreground">{content.instructions}</p>}
 			{revealed ? (
 				<div className="flex flex-col gap-1">
-					<p className="text-xs font-medium text-muted-foreground">
-						Model answer
-					</p>
+					<p className="text-xs font-medium text-muted-foreground">Model answer</p>
 					<p className="whitespace-pre-wrap text-sm">{content.model_answer}</p>
 				</div>
 			) : (
-				<Button
-					type="button"
-					variant="outline"
-					size="sm"
-					className="self-start"
-					onClick={() => setRevealed(true)}
-				>
+				<Button type="button" variant="outline" size="sm" className="self-start" onClick={() => setRevealed(true)}>
 					Show model answer
 				</Button>
 			)}
@@ -113,13 +91,7 @@ function CompletionView({ content }: { content: CompletionContent }) {
 					</p>
 				</div>
 			) : (
-				<Button
-					type="button"
-					variant="outline"
-					size="sm"
-					className="self-start"
-					onClick={() => setRevealed(true)}
-				>
+				<Button type="button" variant="outline" size="sm" className="self-start" onClick={() => setRevealed(true)}>
 					Show answer
 				</Button>
 			)}
@@ -168,22 +140,12 @@ function MindMapView({ content }: { content: MindMapContent }) {
 	);
 }
 
-export function ArtifactContentView({
-	artifactType,
-	content,
-}: {
-	artifactType: ArtifactType;
-	content: string;
-}) {
+export function ArtifactContentView({ artifactType, content }: { artifactType: ArtifactType; content: string }) {
 	let parsed: ArtifactContent;
 	try {
 		parsed = parseArtifactContent(artifactType, content);
 	} catch {
-		return (
-			<pre className="overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
-				{content}
-			</pre>
-		);
+		return <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">{content}</pre>;
 	}
 
 	switch (artifactType) {

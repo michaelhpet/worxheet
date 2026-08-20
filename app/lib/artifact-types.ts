@@ -1,20 +1,15 @@
-import {
-	IconAlignLeft,
-	IconBook2,
-	IconEdit,
-	IconListCheck,
-	IconNetwork,
-} from "@tabler/icons-react";
+import { IconAlignLeft, IconBook2, IconEdit, IconListCheck, IconNetwork } from "@tabler/icons-react";
 
-export const ARTIFACT_TYPES = [
-	"MultipleChoiceQuiz",
-	"EssayQuiz",
-	"CompletionQuiz",
-	"Summary",
-	"MindMap",
-] as const;
+export const ARTIFACT_TYPES = {
+	MultipleChoiceQuiz: "MultipleChoiceQuiz",
+	EssayQuiz: "EssayQuiz",
+	CompletionQuiz: "CompletionQuiz",
+	Summary: "Summary",
+	MindMap: "MindMap",
+} as const;
 
-export type ArtifactType = (typeof ARTIFACT_TYPES)[number];
+export type ArtifactType = keyof typeof ARTIFACT_TYPES;
+export type QuizArtifactType = keyof Pick<typeof ARTIFACT_TYPES, "MultipleChoiceQuiz" | "EssayQuiz" | "CompletionQuiz">;
 
 export interface ArtifactTypeOption {
 	value: ArtifactType;
@@ -27,31 +22,36 @@ export const ARTIFACT_TYPE_OPTIONS: ArtifactTypeOption[] = [
 	{
 		value: "MultipleChoiceQuiz",
 		label: "Multiple choice",
-		description: "4-option question with answer",
+		description:
+			"A question with four answer options, one correct, plus a detailed explanation of the right answer and why the others don't apply.",
 		icon: IconListCheck,
 	},
 	{
 		value: "EssayQuiz",
 		label: "Essay",
-		description: "Open-ended prompt with model answer",
+		description:
+			"An open-ended writing prompt that encourages critical thinking and deeper understanding, with a suggested answer you can compare against your own.",
 		icon: IconBook2,
 	},
 	{
 		value: "CompletionQuiz",
 		label: "Fill in the blank",
-		description: "Cloze sentence with hint",
+		description:
+			"A sentence with blanks to fill in, helping you reinforce key terms and concepts through context with a helpful hint along the way.",
 		icon: IconEdit,
 	},
 	{
 		value: "Summary",
 		label: "Summary",
-		description: "Condensed key ideas",
+		description:
+			"A clear title, a concise paragraph distilling the main ideas, and a bullet-point list of key takeaways you can skim at a glance.",
 		icon: IconAlignLeft,
 	},
 	{
 		value: "MindMap",
 		label: "Mind map",
-		description: "Topic, branches and concepts",
+		description:
+			"A visual overview of a central topic with branching subtopics and concepts, showing how different ideas relate to each other.",
 		icon: IconNetwork,
 	},
 ];
@@ -91,20 +91,12 @@ export interface MindMapContent {
 	branches: MindMapBranch[];
 }
 
-export type ArtifactContent =
-	| McqContent
-	| EssayContent
-	| CompletionContent
-	| SummaryContent
-	| MindMapContent;
+export type ArtifactContent = McqContent | EssayContent | CompletionContent | SummaryContent | MindMapContent;
 
-export function parseArtifactContent(
-	_artifactType: ArtifactType,
-	content: string,
-): ArtifactContent {
+export function parseArtifactContent(_artifactType: ArtifactType, content: string): ArtifactContent {
 	return JSON.parse(content) as ArtifactContent;
 }
 
 export function isArtifactType(value: string): value is ArtifactType {
-	return (ARTIFACT_TYPES as readonly string[]).includes(value);
+	return value in ARTIFACT_TYPES;
 }

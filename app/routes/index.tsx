@@ -16,34 +16,10 @@ import {
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-	Empty,
-	EmptyContent,
-	EmptyDescription,
-	EmptyHeader,
-	EmptyMedia,
-	EmptyTitle,
-} from "@/components/ui/empty";
-import {
-	Item,
-	ItemActions,
-	ItemContent,
-	ItemDescription,
-	ItemTitle,
-} from "@/components/ui/item";
-import {
-	Table,
-	TableBody,
-	TableCell,
-	TableHead,
-	TableHeader,
-	TableRow,
-} from "@/components/ui/table";
-import {
-	useDeleteWorksheet,
-	useWorksheets,
-	type Worksheet,
-} from "@/data/worksheets";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
 import {
 	IconChevronLeft,
 	IconChevronRight,
@@ -71,8 +47,7 @@ const VIEW_MODE_KEY = "worksheet-view-mode";
 
 function getStoredViewMode(): ViewMode {
 	const stored = localStorage.getItem(VIEW_MODE_KEY);
-	if (stored === "table" || stored === "grid" || stored === "list")
-		return stored;
+	if (stored === "table" || stored === "grid" || stored === "list") return stored;
 	return "table";
 }
 
@@ -119,24 +94,16 @@ function Home() {
 								<IconFile className="size-12" />
 							</EmptyMedia>
 							<EmptyTitle>No worksheets yet</EmptyTitle>
-							<EmptyDescription>
-								Create your first worksheet to get started.
-							</EmptyDescription>
+							<EmptyDescription>Create your first worksheet to get started.</EmptyDescription>
 						</EmptyHeader>
 						<EmptyContent>
-							<Button
-								variant="secondary"
-								onClick={() => setCreateDialogOpen(true)}
-							>
+							<Button variant="secondary" onClick={() => setCreateDialogOpen(true)}>
 								Create worksheet
 							</Button>
 						</EmptyContent>
 					</Empty>
 				</main>
-				<CreateWorksheetDialog
-					open={createDialogOpen}
-					onOpenChange={setCreateDialogOpen}
-				/>
+				<CreateWorksheetDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen} />
 			</>
 		);
 	}
@@ -169,9 +136,7 @@ function Home() {
 				</header>
 
 				<div className="flex-1 overflow-auto p-6">
-					{viewMode === "table" && (
-						<TableView worksheets={data.items} page={page} />
-					)}
+					{viewMode === "table" && <TableView worksheets={data.items} page={page} />}
 					{viewMode === "grid" && <GridView worksheets={data.items} />}
 					{viewMode === "list" && <ListView worksheets={data.items} />}
 				</div>
@@ -182,31 +147,18 @@ function Home() {
 						&ndash;{Math.min(page * PER_PAGE, data.total)} of {data.total}
 					</p>
 					<div className="flex items-center gap-2">
-						<Button
-							variant="outline"
-							size="sm"
-							disabled={page <= 1}
-							onClick={() => setPage(page - 1)}
-						>
+						<Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)}>
 							<IconChevronLeft />
 							Previous
 						</Button>
-						<Button
-							variant="outline"
-							size="sm"
-							disabled={page >= data.total_pages}
-							onClick={() => setPage(page + 1)}
-						>
+						<Button variant="outline" size="sm" disabled={page >= data.total_pages} onClick={() => setPage(page + 1)}>
 							Next
 							<IconChevronRight />
 						</Button>
 					</div>
 				</footer>
 			</main>
-			<CreateWorksheetDialog
-				open={createDialogOpen}
-				onOpenChange={setCreateDialogOpen}
-			/>
+			<CreateWorksheetDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen} />
 		</>
 	);
 }
@@ -228,13 +180,7 @@ function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 		<>
 			<DropdownMenu>
 				<DropdownMenuTrigger
-					render={
-						<Button
-							variant="ghost"
-							size="icon-xs"
-							onClick={(e: React.MouseEvent) => e.stopPropagation()}
-						/>
-					}
+					render={<Button variant="ghost" size="icon-xs" onClick={(e: React.MouseEvent) => e.stopPropagation()} />}
 				>
 					<IconDotsVertical />
 					<span className="sr-only">Actions</span>
@@ -256,10 +202,7 @@ function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 					</AlertDialogHeader>
 					<AlertDialogFooter>
 						<AlertDialogCancel>Cancel</AlertDialogCancel>
-						<AlertDialogAction
-							variant="destructive"
-							onClick={() => deleteWorksheet.mutate(worksheet.id)}
-						>
+						<AlertDialogAction variant="destructive" onClick={() => deleteWorksheet.mutate(worksheet.id)}>
 							Delete
 						</AlertDialogAction>
 					</AlertDialogFooter>
@@ -269,13 +212,7 @@ function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 	);
 }
 
-function TableView({
-	worksheets,
-	page,
-}: {
-	worksheets: Worksheet[];
-	page: number;
-}) {
+function TableView({ worksheets, page }: { worksheets: Worksheet[]; page: number }) {
 	const navigate = useNavigate();
 
 	return (
@@ -303,9 +240,7 @@ function TableView({
 							})
 						}
 					>
-						<TableCell className="text-muted-foreground">
-							{(page - 1) * PER_PAGE + index + 1}
-						</TableCell>
+						<TableCell className="text-muted-foreground">{(page - 1) * PER_PAGE + index + 1}</TableCell>
 						<TableCell className="font-medium">{worksheet.name}</TableCell>
 						<TableCell>{formatDate(worksheet.created_at)}</TableCell>
 						<TableCell>{formatDate(worksheet.updated_at)}</TableCell>
@@ -335,17 +270,12 @@ function GridView({ worksheets }: { worksheets: Worksheet[] }) {
 						})
 					}
 				>
-					<div
-						className="absolute top-2 right-2"
-						onClick={(e) => e.stopPropagation()}
-					>
+					<div className="absolute top-2 right-2" onClick={(e) => e.stopPropagation()}>
 						<WorksheetActions worksheet={worksheet} />
 					</div>
 					<IconFile className="size-8 text-muted-foreground" />
 					<span className="font-medium truncate">{worksheet.name}</span>
-					<span className="text-sm text-muted-foreground">
-						Created {formatDate(worksheet.created_at)}
-					</span>
+					<span className="text-sm text-muted-foreground">Created {formatDate(worksheet.created_at)}</span>
 				</div>
 			))}
 		</div>
@@ -370,14 +300,9 @@ function ListView({ worksheets }: { worksheets: Worksheet[] }) {
 				>
 					<ItemContent>
 						<ItemTitle>{worksheet.name}</ItemTitle>
-						<ItemDescription>
-							Created {formatDate(worksheet.created_at)}
-						</ItemDescription>
+						<ItemDescription>Created {formatDate(worksheet.created_at)}</ItemDescription>
 					</ItemContent>
-					<ItemActions
-						className="self-center"
-						onClick={(e: React.MouseEvent) => e.stopPropagation()}
-					>
+					<ItemActions className="self-center" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
 						<WorksheetActions worksheet={worksheet} />
 					</ItemActions>
 				</Item>

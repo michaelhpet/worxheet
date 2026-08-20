@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
@@ -13,6 +14,17 @@ pub struct Worksheet {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+pub struct WorksheetDetail {
+    pub id: String,
+    pub name: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    pub artifact_counts: HashMap<String, i64>,
 }
 
 impl Worksheet {
@@ -60,13 +72,30 @@ pub async fn get_worksheets(
     })
 }
 
-pub async fn get_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<Worksheet, String> {
-    sqlx::query_as::<_, Worksheet>("SELECT * FROM worksheets WHERE id = ?")
+pub async fn get_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<WorksheetDetail, String> {
+    let worksheet = sqlx::query_as::<_, Worksheet>("SELECT * FROM worksheets WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await
         .map_err(|_| String::from("Failed to fetch worksheet"))?
-        .ok_or_else(|| String::from("Worksheet not found"))
+        .ok_or_else(|| String::from("Worksheet not found"))?;
+
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT artifact_type, COUNT(*) FROM artifacts WHERE worksheet_id = ? GROUP BY artifact_type")
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .map_err(|_| String::from("Failed to fetch artifact counts"))?;
+
+    let artifact_counts = rows.into_iter().collect();
+
+    Ok(WorksheetDetail {
+        id: worksheet.id,
+        name: worksheet.name,
+        created_at: worksheet.created_at,
+        updated_at: worksheet.updated_at,
+        artifact_counts,
+    })
 }
 
 pub async fn delete_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<(), String> {

@@ -3,13 +3,7 @@ import { FILE_TYPES } from "@/lib/constants";
 import { cn, formatBytes } from "@/lib/utils";
 import { IconFile, IconTrash } from "@tabler/icons-react";
 import { Button } from "./ui/button";
-import {
-	Item,
-	ItemActions,
-	ItemContent,
-	ItemDescription,
-	ItemTitle,
-} from "./ui/item";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "./ui/item";
 
 interface FileCardProps {
 	path: string;
@@ -34,12 +28,7 @@ export function FileCard({ className, ...props }: FileCardProps) {
 	};
 
 	return (
-		<Item
-			className={cn(
-				"group border-b-border rounded-none last:border-b-0",
-				className,
-			)}
-		>
+		<Item className={cn("group border-b-border rounded-none last:border-b-0", className)}>
 			<ItemContent>
 				<ItemTitle className="break-all">{data.name}</ItemTitle>
 				<ItemDescription>

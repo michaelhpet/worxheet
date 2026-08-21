@@ -6,14 +6,7 @@ import { type DragEvent, useEffect, useEffectEvent, useState } from "react";
 
 import { SUPPORTED_EXTENSIONS } from "@/lib/constants";
 import { Button } from "./ui/button";
-import {
-	Empty,
-	EmptyContent,
-	EmptyDescription,
-	EmptyHeader,
-	EmptyMedia,
-	EmptyTitle,
-} from "./ui/empty";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "./ui/empty";
 
 function isSupportedExtension(path: string): boolean {
 	const extension = path.toLowerCase().split(".").pop() || "";
@@ -68,10 +61,7 @@ export function FilesUploader(props: FilesUploaderProps) {
 
 	return (
 		<Empty
-			className={clsx(
-				"relative w-full h-full border-0 border-dashed rounded-none",
-				dragging && "bg-card/80 border-2",
-			)}
+			className={clsx("relative w-full h-full border-0 border-dashed rounded-none", dragging && "bg-card/80 border-2")}
 			onDragOver={onDragOver}
 			onDragLeave={onDragLeave}
 		>
@@ -80,9 +70,7 @@ export function FilesUploader(props: FilesUploaderProps) {
 					<IconFiles className="size-12" />
 				</EmptyMedia>
 				<EmptyTitle className="text-2xl">Start a new worxheet</EmptyTitle>
-				<EmptyDescription>
-					Start a new worxheet by dragging files here or click to find files.
-				</EmptyDescription>
+				<EmptyDescription>Start a new worxheet by dragging files here or click to find files.</EmptyDescription>
 			</EmptyHeader>
 			<EmptyContent>
 				<Button variant="secondary" onClick={findFiles}>

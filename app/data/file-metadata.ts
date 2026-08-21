@@ -16,7 +16,6 @@ export const FILE_METADATA_QUERY_KEY = "FILE_METADATA";
 export function useFileMetadata(params: UseFileMetadataParams) {
 	return useQuery({
 		queryKey: [FILE_METADATA_QUERY_KEY, params],
-		queryFn: () =>
-			invoke<FileMetadata>("get_file_metadata", { path: params.path }),
+		queryFn: () => invoke<FileMetadata>("get_file_metadata", { path: params.path }),
 	});
 }

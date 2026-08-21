@@ -73,15 +73,25 @@ pub async fn process_files(
     Ok(chunks)
 }
 
-/// List the persisted artifacts of a worksheet.
-pub async fn get_artifacts(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<Artifact>, String> {
+/// List the persisted artifacts of a worksheet for one artifact type,
+/// optionally capped at `count` randomly-selected items.
+pub async fn get_artifacts(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+    artifact_type: &ArtifactType,
+    count: Option<i64>,
+) -> Result<Vec<Artifact>, String> {
+    let limit = count.map(|c| c.max(1)).unwrap_or(-1);
     let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
         "SELECT id, worksheet_id, artifact_type, source, content
          FROM artifacts
-         WHERE worksheet_id = ?
-         ORDER BY created_at",
+         WHERE worksheet_id = ? AND artifact_type = ?
+         ORDER BY RANDOM()
+         LIMIT ?",
     )
     .bind(worksheet_id)
+    .bind(artifact_type.to_db())
+    .bind(limit)
     .fetch_all(pool)
     .await
     .map_err(|_| String::from("Failed to fetch artifacts"))?;
@@ -168,6 +178,62 @@ mod tests {
         .unwrap();
 
         (worksheet_id, file_id)
+    }
+
+    async fn seed_artifact(pool: &SqlitePool, worksheet_id: &str, artifact_type: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(ulid::Ulid::new().to_string())
+        .bind(worksheet_id)
+        .bind(artifact_type)
+        .bind("test-source")
+        .bind("{}")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_artifacts_filters_by_type_and_count() {
+        let pool = setup_db().await;
+        let (worksheet_id, _file_id) = seed_worksheet_and_file(&pool).await;
+        for _ in 0..5 {
+            seed_artifact(&pool, &worksheet_id, "MultipleChoiceQuiz").await;
+        }
+        for _ in 0..3 {
+            seed_artifact(&pool, &worksheet_id, "EssayQuiz").await;
+        }
+
+        let mcqs = get_artifacts(&pool, &worksheet_id, &ArtifactType::MultipleChoiceQuiz, None)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(mcqs.len(), 5);
+        assert!(
+            mcqs.iter()
+                .all(|a| a.artifact_type == ArtifactType::MultipleChoiceQuiz)
+        );
+
+        let limited = get_artifacts(&pool, &worksheet_id, &ArtifactType::MultipleChoiceQuiz, Some(2))
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(limited.len(), 2);
+
+        let clamped = get_artifacts(&pool, &worksheet_id, &ArtifactType::EssayQuiz, Some(0))
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(clamped.len(), 1);
+
+        let essays = get_artifacts(&pool, &worksheet_id, &ArtifactType::EssayQuiz, None)
+            .await
+            .expect("fetch should succeed");
+        assert_eq!(essays.len(), 3);
+        assert!(
+            essays
+                .iter()
+                .all(|a| a.artifact_type == ArtifactType::EssayQuiz)
+        );
     }
 
     #[tokio::test]

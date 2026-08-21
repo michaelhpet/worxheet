@@ -1,5 +1,6 @@
 import type { Worksheet } from "@/data/worksheets";
-import { ARTIFACT_TYPES, type ArtifactTypeOption, type QuizArtifactType } from "@/lib/artifact-types";
+import { ARTIFACT_TYPES } from "@/lib/constants";
+import type { ArtifactTypeOption, QuizArtifactType } from "@/lib/types";
 import { useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { Button } from "./ui/button";

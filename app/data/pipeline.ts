@@ -23,8 +23,7 @@ const POLL_INTERVAL_MS = 1200;
 export function usePipelineStatus(worksheetId: string) {
 	return useQuery({
 		queryKey: [PIPELINE_QUERY_KEY, worksheetId],
-		queryFn: () =>
-			invoke<PipelineStatus>("get_pipeline_status", { worksheetId }),
+		queryFn: () => invoke<PipelineStatus>("get_pipeline_status", { worksheetId }),
 		refetchInterval: (query) => {
 			const status = query.state.data?.status;
 			return status === "running" ? POLL_INTERVAL_MS : false;

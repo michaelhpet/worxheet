@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import type { QuizArtifactType } from "@/lib/artifact-types";
+import type { QuizArtifactType } from "@/lib/types";
 import type { Paginated } from "@/lib/types";
 
 export interface Worksheet {
@@ -16,8 +16,7 @@ export const WORKSHEETS_QUERY_KEY = "WORKSHEETS";
 export function useWorksheets(page?: number, perPage?: number) {
 	return useQuery({
 		queryKey: [WORKSHEETS_QUERY_KEY, { page, perPage }],
-		queryFn: () =>
-			invoke<Paginated<Worksheet>>("get_worksheets", { page, perPage }),
+		queryFn: () => invoke<Paginated<Worksheet>>("get_worksheets", { page, perPage }),
 	});
 }
 

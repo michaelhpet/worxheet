@@ -1,13 +1,7 @@
 import { FileCard } from "@/components/file-card";
 import { FilesUploader } from "@/components/files-uploader";
 import { Button } from "@/components/ui/button";
-import {
-	Dialog,
-	DialogContent,
-	DialogFooter,
-	DialogHeader,
-	DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, FieldDescription } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import type { Worksheet } from "@/data/worksheets";
@@ -26,10 +20,7 @@ const worksheetSchema = z.object({
 	name: z.string().trim(),
 });
 
-export function CreateWorksheetDialog({
-	open,
-	onOpenChange,
-}: CreateWorksheetDialogProps) {
+export function CreateWorksheetDialog({ open, onOpenChange }: CreateWorksheetDialogProps) {
 	const navigate = useNavigate();
 	const [files, setFiles] = useState<string[]>([]);
 
@@ -49,10 +40,7 @@ export function CreateWorksheetDialog({
 
 	const onFiles = (newFiles: string[]) => {
 		if (!newFiles.length) return;
-		setFiles((previous) => [
-			...previous,
-			...newFiles.filter((file) => !previous.includes(file)),
-		]);
+		setFiles((previous) => [...previous, ...newFiles.filter((file) => !previous.includes(file))]);
 	};
 
 	const removeFile = (path: string) => {
@@ -91,18 +79,13 @@ export function CreateWorksheetDialog({
 										value={field.state.value}
 										onChange={(e) => field.handleChange(e.target.value)}
 										onBlur={field.handleBlur}
-										aria-invalid={
-											field.state.meta.isTouched && !field.state.meta.isValid
-										}
+										aria-invalid={field.state.meta.isTouched && !field.state.meta.isValid}
 									/>
-									{field.state.meta.isTouched &&
-										field.state.meta.errors.length > 0 && (
-											<FieldDescription>
-												{field.state.meta.errors
-													.map((error) => error?.message)
-													.join(", ")}
-											</FieldDescription>
-										)}
+									{field.state.meta.isTouched && field.state.meta.errors.length > 0 && (
+										<FieldDescription>
+											{field.state.meta.errors.map((error) => error?.message).join(", ")}
+										</FieldDescription>
+									)}
 								</Field>
 							)}
 						</form.Field>
@@ -113,12 +96,7 @@ export function CreateWorksheetDialog({
 					{files.length > 0 && (
 						<ul className="flex flex-col border rounded-lg mb-4 max-h-40 overflow-auto">
 							{files.map((file) => (
-								<FileCard
-									key={file}
-									path={file}
-									onRemove={removeFile}
-									className="border-0 border-b last:border-b-0"
-								/>
+								<FileCard key={file} path={file} onRemove={removeFile} className="border-0 border-b last:border-b-0" />
 							))}
 						</ul>
 					)}

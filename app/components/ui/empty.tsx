@@ -17,11 +17,7 @@ function Empty({ className, ...props }: React.ComponentProps<"div">) {
 
 function EmptyHeader({ className, ...props }: React.ComponentProps<"div">) {
 	return (
-		<div
-			data-slot="empty-header"
-			className={cn("flex max-w-sm flex-col items-center gap-2", className)}
-			{...props}
-		/>
+		<div data-slot="empty-header" className={cn("flex max-w-sm flex-col items-center gap-2", className)} {...props} />
 	);
 }
 
@@ -59,10 +55,7 @@ function EmptyTitle({ className, ...props }: React.ComponentProps<"div">) {
 	return (
 		<div
 			data-slot="empty-title"
-			className={cn(
-				"font-heading text-lg font-medium tracking-tight",
-				className,
-			)}
+			className={cn("font-heading text-lg font-medium tracking-tight", className)}
 			{...props}
 		/>
 	);
@@ -85,20 +78,10 @@ function EmptyContent({ className, ...props }: React.ComponentProps<"div">) {
 	return (
 		<div
 			data-slot="empty-content"
-			className={cn(
-				"flex w-full max-w-sm min-w-0 flex-col items-center gap-4 text-sm text-balance",
-				className,
-			)}
+			className={cn("flex w-full max-w-sm min-w-0 flex-col items-center gap-4 text-sm text-balance", className)}
 			{...props}
 		/>
 	);
 }
 
-export {
-	Empty,
-	EmptyHeader,
-	EmptyTitle,
-	EmptyDescription,
-	EmptyContent,
-	EmptyMedia,
-};
+export { Empty, EmptyHeader, EmptyTitle, EmptyDescription, EmptyContent, EmptyMedia };

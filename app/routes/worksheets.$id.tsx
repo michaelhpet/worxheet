@@ -2,7 +2,8 @@ import { QuizTabContent } from "@/components/quiz-tab-content";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useWorksheet } from "@/data/worksheets";
-import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES, type ArtifactType } from "@/lib/artifact-types";
+import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES } from "@/lib/constants";
+import type { ArtifactType } from "@/lib/types";
 import { IconArrowLeft } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
@@ -36,8 +37,8 @@ function WorksheetDetail() {
 	return (
 		<Tabs value={artifactType} onValueChange={setArtifactType}>
 			<main className="w-screen h-screen flex flex-col">
-				<header className="sticky top-0 w-full flex items-center justify-center gap-4 px-4 pb-4 bg-background">
-					<Button size="icon" variant="secondary" className="absolute left-4" onClick={() => navigate({ to: "/" })}>
+				<header className="sticky top-0 w-full flex items-center justify-center gap-2 px-4 pb-4 bg-background">
+					<Button size="icon" variant="secondary" onClick={() => navigate({ to: "/" })}>
 						<IconArrowLeft />
 					</Button>
 					<TabsList>
@@ -56,11 +57,6 @@ function WorksheetDetail() {
 
 					return <QuizTabContent key={type} worksheet={worksheet} artifactType={artifactType} />;
 				})}
-				{/* <div className="flex-1 overflow-auto">
-					<div className="mx-auto flex max-w-6xl flex-col gap-6 p-6">
-						<ArtifactsPanel worksheetId={id} />
-					</div>
-				</div> */}
 			</main>
 		</Tabs>
 	);

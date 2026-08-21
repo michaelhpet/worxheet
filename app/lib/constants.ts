@@ -1,29 +1,25 @@
 import {
+	IconAlignLeft,
+	IconBook2,
 	IconCsv,
+	IconEdit,
 	IconFileText,
 	IconFileWord,
 	IconHtml,
+	IconListCheck,
 	IconMarkdown,
 	IconMusic,
+	IconNetwork,
 	IconPdf,
 	IconPhoto,
 	IconPresentation,
 	IconVideo,
 } from "@tabler/icons-react";
+import type { ArtifactType, ArtifactTypeOption } from "@/lib/types";
 
 export const SUPPORTED_EXTENSIONS = ["pdf", "ppt", "pptx", "doc", "docx"];
 
-export const FILE_SIZES = [
-	"Bytes",
-	"KB",
-	"MB",
-	"GB",
-	"TB",
-	"PB",
-	"EB",
-	"ZB",
-	"YB",
-];
+export const FILE_SIZES = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
 
 interface FileType {
 	icon: React.ElementType;
@@ -55,3 +51,49 @@ export const FILE_TYPES: Record<string, FileType> = {
 	flac: { icon: IconMusic, class: "text-pink-500" },
 	m4a: { icon: IconMusic, class: "text-pink-500" },
 };
+
+export const ARTIFACT_TYPES = {
+	MultipleChoiceQuiz: "MultipleChoiceQuiz",
+	EssayQuiz: "EssayQuiz",
+	CompletionQuiz: "CompletionQuiz",
+	Summary: "Summary",
+	MindMap: "MindMap",
+} as const satisfies Record<ArtifactType, ArtifactType>;
+
+export const ARTIFACT_TYPE_OPTIONS: ArtifactTypeOption[] = [
+	{
+		value: "MultipleChoiceQuiz",
+		label: "Multiple choice",
+		description:
+			"A question with four answer options, one correct, plus a detailed explanation of the right answer and why the others don't apply.",
+		icon: IconListCheck,
+	},
+	{
+		value: "EssayQuiz",
+		label: "Essay",
+		description:
+			"An open-ended writing prompt that encourages critical thinking and deeper understanding, with a suggested answer you can compare against your own.",
+		icon: IconBook2,
+	},
+	{
+		value: "CompletionQuiz",
+		label: "Fill in the blank",
+		description:
+			"A sentence with blanks to fill in, helping you reinforce key terms and concepts through context with a helpful hint along the way.",
+		icon: IconEdit,
+	},
+	{
+		value: "Summary",
+		label: "Summary",
+		description:
+			"A clear title, a concise paragraph distilling the main ideas, and a bullet-point list of key takeaways you can skim at a glance.",
+		icon: IconAlignLeft,
+	},
+	{
+		value: "MindMap",
+		label: "Mind map",
+		description:
+			"A visual overview of a central topic with branching subtopics and concepts, showing how different ideas relate to each other.",
+		icon: IconNetwork,
+	},
+];

@@ -22,7 +22,7 @@ export interface ArtifactTypeOption {
 export interface McqContent {
 	question: string;
 	options: string[];
-	answer: number;
+	answer: string;
 	explanation: string;
 }
 

@@ -214,24 +214,49 @@ pub async fn generate_artifacts(
     Ok(artifacts)
 }
 
+/// Whether an MCQ item's `answer` is a string that exactly matches one of its
+/// own `options`.
+fn mcq_item_answer_valid(item: &serde_json::Value) -> bool {
+    let Some(answer) = item.get("answer").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    item.get("options")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|options| {
+            options
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|option| option == answer)
+        })
+}
+
 /// Whether a model output is valid JSON and, for question-style types, carries
-/// its item array. Used to decide whether a unit needs a wider-budget retry.
+/// its item array. MCQ outputs additionally require every item's answer to be
+/// one of its options. Used to decide whether a unit needs a wider-budget retry.
 fn output_parses(artifact_type: &ArtifactType, output: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
         return false;
     };
     match items_field_for(artifact_type) {
-        Some(field) => value
-            .get(field)
-            .and_then(serde_json::Value::as_array)
-            .is_some(),
+        Some(field) => {
+            let Some(items) = value.get(field).and_then(serde_json::Value::as_array) else {
+                return false;
+            };
+            match artifact_type {
+                ArtifactType::MultipleChoiceQuiz => {
+                    items.iter().all(mcq_item_answer_valid)
+                }
+                _ => true,
+            }
+        }
         None => true,
     }
 }
 
 /// Turn per-unit generation outputs into `(source, content)` artifact records.
 /// Question-style types split each unit's item array into one artifact per
-/// item; Summary and MindMap merge every unit into a single worksheet-wide
+/// item; MCQ items whose answer does not match any option are dropped.
+/// Summary and MindMap merge every unit into a single worksheet-wide
 /// artifact ordered by source position.
 fn assemble_artifacts(
     artifact_type: &ArtifactType,
@@ -261,6 +286,11 @@ fn assemble_artifacts(
                     )
                 })?;
             for item in items {
+                if matches!(artifact_type, ArtifactType::MultipleChoiceQuiz)
+                    && !mcq_item_answer_valid(item)
+                {
+                    continue;
+                }
                 pending.push((source.clone(), item.to_string()));
             }
         }
@@ -364,7 +394,7 @@ pub fn schema_for(artifact_type: &ArtifactType) -> &'static str {
                         "properties": {
                             "question": { "type": "string" },
                             "options": { "type": "array", "items": { "type": "string" }, "minItems": 4, "maxItems": 4 },
-                            "answer": { "type": "integer" },
+                            "answer": { "type": "string" },
                             "explanation": { "type": "string" }
                         },
                         "required": ["question", "options", "answer", "explanation"]
@@ -471,7 +501,8 @@ pub fn user_message_for(artifact_type: &ArtifactType, context: &str) -> String {
             "Generate between one and eight multiple-choice questions testing \
              higher-order thinking (analysis, application, or evaluation), drawn \
              from the passages. Every question must have exactly 4 plausible \
-             options and the index of the correct answer."
+             options and the correct answer given as a string that exactly \
+             matches one of those options."
         }
         ArtifactType::EssayQuiz => {
             "Generate between one and eight essay questions requiring students to \
@@ -529,5 +560,79 @@ mod tests {
         );
         assert_eq!(items_field_for(&ArtifactType::Summary), None);
         assert_eq!(items_field_for(&ArtifactType::MindMap), None);
+    }
+
+    #[test]
+    fn test_mcq_output_parses_requires_matching_answer() {
+        let matching = serde_json::json!({
+            "questions": [
+                { "question": "q", "options": ["a", "b"], "answer": "b", "explanation": "e" }
+            ]
+        });
+        assert!(output_parses(
+            &ArtifactType::MultipleChoiceQuiz,
+            &matching.to_string()
+        ));
+
+        let index_answer = serde_json::json!({
+            "questions": [
+                { "question": "q", "options": ["a", "b"], "answer": 1, "explanation": "e" }
+            ]
+        });
+        assert!(!output_parses(
+            &ArtifactType::MultipleChoiceQuiz,
+            &index_answer.to_string()
+        ));
+
+        let mismatched = serde_json::json!({
+            "questions": [
+                { "question": "q", "options": ["a", "b"], "answer": "c", "explanation": "e" }
+            ]
+        });
+        assert!(!output_parses(
+            &ArtifactType::MultipleChoiceQuiz,
+            &mismatched.to_string()
+        ));
+    }
+
+    #[test]
+    fn test_assemble_drops_mismatched_mcq_items() {
+        let good = serde_json::json!({
+            "question": "kept",
+            "options": ["a", "b", "c", "d"],
+            "answer": "a",
+            "explanation": "e"
+        });
+        let bad = serde_json::json!({
+            "question": "dropped",
+            "options": ["a", "b", "c", "d"],
+            "answer": "z",
+            "explanation": "e"
+        });
+        let output = serde_json::json!({ "questions": [good, bad] }).to_string();
+
+        let assembled =
+            assemble_artifacts(&ArtifactType::MultipleChoiceQuiz, vec![output], &["src".to_string()])
+                .expect("assembly should succeed");
+
+        assert_eq!(assembled.len(), 1);
+        let kept: serde_json::Value = serde_json::from_str(&assembled[0].1).unwrap();
+        assert_eq!(kept["question"], "kept");
+    }
+
+    #[test]
+    fn test_assemble_keeps_non_mcq_items_verbatim() {
+        let item = serde_json::json!({
+            "sentence": "The __ is the powerhouse.",
+            "answer": "mitochondrion",
+            "hint": "organelle"
+        });
+        let output = serde_json::json!({ "items": [item] }).to_string();
+
+        let assembled =
+            assemble_artifacts(&ArtifactType::CompletionQuiz, vec![output], &["src".to_string()])
+                .expect("assembly should succeed");
+
+        assert_eq!(assembled.len(), 1);
     }
 }

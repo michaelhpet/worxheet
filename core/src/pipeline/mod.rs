@@ -328,6 +328,20 @@ mod tests {
                 .expect("artifact content should be valid JSON");
             assert!(value.get("question").is_some());
             assert_eq!(value["options"].as_array().map(Vec::len), Some(4));
+            let answer = value["answer"]
+                .as_str()
+                .expect("answer should be a string, not an index");
+            let options: Vec<&str> = value["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert_eq!(options.len(), 4);
+            assert!(
+                options.contains(&answer),
+                "answer {answer:?} should exactly match one of the options {options:?}"
+            );
         }
     }
 

@@ -1,4 +1,14 @@
 import { Layout } from "@/components/layout";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { InputOTP, InputOTPGroup, InputOTPSeparator, InputOTPSlot } from "@/components/ui/input-otp";
 import {
 	Questionnaire,
@@ -20,7 +30,7 @@ import { ARTIFACT_TYPES } from "@/lib/constants";
 import type { McqContent } from "@/lib/types";
 import { useCountdown } from "@/lib/use-countdown";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { z } from "zod";
 
 const artifactTypeSearchSchema = z.object({
@@ -82,6 +92,9 @@ function ArtifactTypePage() {
 		navigate({ to: "/worksheets/$id", params: { id } });
 	};
 
+	const [confirmOpen, setConfirmOpen] = useState(false);
+	const [exitOpen, setExitOpen] = useState(false);
+
 	const submitQuizRef = useRef(submitQuiz);
 	submitQuizRef.current = submitQuiz;
 
@@ -91,6 +104,7 @@ function ArtifactTypePage() {
 			description: "Your quiz has been submitted automatically.",
 			type: "error",
 		});
+		setConfirmOpen(false);
 		const form = document.getElementById("quiz-form") as HTMLFormElement | null;
 		if (form) {
 			submitQuizRef.current({
@@ -159,7 +173,10 @@ function ArtifactTypePage() {
 					items={questions}
 					shortcuts="numbers"
 					className="max-w-xl mx-auto"
-					onSubmit={submitQuiz}
+					onSubmit={(event) => {
+						event.preventDefault();
+						setConfirmOpen(true);
+					}}
 				>
 					<QuestionnaireProgress />
 					{questions.map((question) => (
@@ -182,6 +199,50 @@ function ArtifactTypePage() {
 					</QuestionnaireActions>
 				</Questionnaire>
 			</div>
+			<AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>Submit quiz?</AlertDialogTitle>
+						<AlertDialogDescription>You won't be able to change your answers after submitting.</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel>Don't submit</AlertDialogCancel>
+						<AlertDialogAction
+							onClick={() => {
+								setConfirmOpen(false);
+								const form = document.getElementById("quiz-form");
+								if (form) {
+									submitQuiz({
+										preventDefault: () => {},
+										currentTarget: form,
+									} as unknown as React.SubmitEvent<HTMLFormElement>);
+								}
+							}}
+						>
+							Submit
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
+			<AlertDialog open={exitOpen} onOpenChange={setExitOpen}>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>Leave quiz?</AlertDialogTitle>
+						<AlertDialogDescription>Your progress in this quiz will be lost.</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel>Keep answering</AlertDialogCancel>
+						<AlertDialogAction
+							onClick={() => {
+								setExitOpen(false);
+								navigate({ to: "/worksheets/$id", params: { id } });
+							}}
+						>
+							Leave
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
 		</Layout>
 	);
 }

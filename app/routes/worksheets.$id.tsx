@@ -8,6 +8,7 @@ import { usePipelineStatus } from "@/data/pipeline";
 import { useWorksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES } from "@/lib/constants";
 import type { ArtifactType } from "@/lib/types";
+import { IconFaceIdError } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 
@@ -29,7 +30,10 @@ function WorksheetDetail() {
 	if (isLoading || isStatusLoading) {
 		return (
 			<Layout onBack={exitWorksheet}>
-				<p className="text-muted-foreground">Loading worksheet...</p>
+				<div className="grow flex flex-col items-center mt-40">
+					<Spinner />
+					<p className="text-muted-foreground">Loading worksheet...</p>
+				</div>
 			</Layout>
 		);
 	}
@@ -37,7 +41,10 @@ function WorksheetDetail() {
 	if (error || !worksheet) {
 		return (
 			<Layout onBack={exitWorksheet}>
-				<p className="text-destructive">Worksheet not found</p>
+				<div className="grow flex flex-col items-center mt-40">
+					<IconFaceIdError className="size-12 text-muted-foreground" />
+					<p className="text-muted-foreground">Worksheet not found</p>
+				</div>
 			</Layout>
 		);
 	}
@@ -46,7 +53,8 @@ function WorksheetDetail() {
 		const artifactType = ARTIFACT_TYPE_OPTIONS.find((o) => o.value === status.artifact_type);
 		return (
 			<Layout onBack={exitWorksheet}>
-				<div className="grow w-full flex flex-col items-center justify-center">
+				<div className="grow w-full flex flex-col items-center gap-3 mt-40">
+					{/* LOTTIE animation here */}
 					<Item variant="muted" className="max-w-100">
 						<ItemMedia>
 							<Spinner />

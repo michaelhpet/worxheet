@@ -1,4 +1,4 @@
-import { Button } from "@/components/ui/button";
+import { Layout } from "@/components/layout";
 import {
 	Questionnaire,
 	QuestionnaireActions,
@@ -16,7 +16,6 @@ import { useArtifacts } from "@/data/artifacts";
 import { useWorksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPES } from "@/lib/constants";
 import type { McqContent } from "@/lib/types";
-import { IconArrowLeft } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 import { z } from "zod";
@@ -67,42 +66,37 @@ function ArtifactTypePage() {
 		[questions],
 	);
 
+	const exitQuiz = () => {
+		navigate({ to: "/worksheets/$id", params: { id } });
+	};
+
 	if (loading) {
 		return (
-			<main className="w-screen h-screen flex items-center justify-center">
+			<Layout onBack={exitQuiz}>
 				<p className="text-muted-foreground">Loading...</p>
-			</main>
+			</Layout>
 		);
 	}
 
 	if (!worksheet) {
 		return (
-			<main className="w-screen h-screen flex items-center justify-center">
+			<Layout onBack={exitQuiz}>
 				<p className="text-destructive">Worksheet not found</p>
-			</main>
+			</Layout>
 		);
 	}
 
 	if (!questions?.length) {
 		return (
-			<main className="w-screen h-screen flex items-center justify-center">
+			<Layout onBack={exitQuiz}>
 				<p className="text-destructive">No questions not found</p>
-			</main>
+			</Layout>
 		);
 	}
 
-	const exitQuiz = () => {
-		navigate({ to: "/worksheets/$id", params: { id } });
-	};
-
 	return (
-		<main className="w-screen h-screen flex flex-col">
-			<header className="sticky top-0 w-full flex items-center justify-center gap-2 px-4 pb-4 bg-background">
-				<Button size="icon" variant="secondary" onClick={exitQuiz}>
-					<IconArrowLeft />
-				</Button>
-			</header>
-			<div className="grow flex flex-col items-center mt-20">
+		<Layout onBack={exitQuiz}>
+			<div className="flex flex-col items-center mt-40">
 				<Questionnaire items={questions} shortcuts="numbers" className="max-w-xl mx-auto" onSubmit={submitQuiz}>
 					<QuestionnaireProgress />
 					{questions.map((question) => (
@@ -125,6 +119,6 @@ function ArtifactTypePage() {
 					</QuestionnaireActions>
 				</Questionnaire>
 			</div>
-		</main>
+		</Layout>
 	);
 }

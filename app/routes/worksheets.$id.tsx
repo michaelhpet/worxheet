@@ -1,5 +1,5 @@
+import { Layout } from "@/components/layout";
 import { QuizTabContent } from "@/components/quiz-tab-content";
-import { Button } from "@/components/ui/button";
 import { Item, ItemContent, ItemMedia, ItemTitle } from "@/components/ui/item";
 import { Progress } from "@/components/ui/progress";
 import { Spinner } from "@/components/ui/spinner";
@@ -8,7 +8,6 @@ import { usePipelineStatus } from "@/data/pipeline";
 import { useWorksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES } from "@/lib/constants";
 import type { ArtifactType } from "@/lib/types";
-import { IconArrowLeft } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 
@@ -23,31 +22,30 @@ function WorksheetDetail() {
 	const { data: status, isLoading: isStatusLoading } = usePipelineStatus(id);
 	const [artifactType, setArtifactType] = useState<ArtifactType>("MultipleChoiceQuiz");
 
+	const exitWorksheet = () => {
+		navigate({ to: "/" });
+	};
+
 	if (isLoading || isStatusLoading) {
 		return (
-			<main className="w-screen h-screen flex items-center justify-center">
+			<Layout onBack={exitWorksheet}>
 				<p className="text-muted-foreground">Loading worksheet...</p>
-			</main>
+			</Layout>
 		);
 	}
 
 	if (error || !worksheet) {
 		return (
-			<main className="w-screen h-screen flex items-center justify-center">
+			<Layout onBack={exitWorksheet}>
 				<p className="text-destructive">Worksheet not found</p>
-			</main>
+			</Layout>
 		);
 	}
 
 	if (status && status.status === "running") {
 		const artifactType = ARTIFACT_TYPE_OPTIONS.find((o) => o.value === status.artifact_type);
 		return (
-			<main className="w-screen h-screen flex flex-col">
-				<header className="sticky top-0 w-full flex items-center justify-center gap-2 px-4 pb-4 bg-background">
-					<Button size="icon" variant="secondary" onClick={() => navigate({ to: "/" })}>
-						<IconArrowLeft />
-					</Button>
-				</header>
+			<Layout onBack={exitWorksheet}>
 				<div className="grow w-full flex flex-col items-center justify-center">
 					<Item variant="muted" className="max-w-100">
 						<ItemMedia>
@@ -66,17 +64,15 @@ function WorksheetDetail() {
 						</ItemContent>
 					</Item>
 				</div>
-			</main>
+			</Layout>
 		);
 	}
 
 	return (
 		<Tabs value={artifactType} onValueChange={setArtifactType}>
-			<main className="w-screen flex flex-col">
-				<header className="sticky top-0 w-full flex items-center justify-center gap-2 px-4 pb-4 bg-background">
-					<Button size="icon" variant="secondary" onClick={() => navigate({ to: "/" })}>
-						<IconArrowLeft />
-					</Button>
+			<Layout
+				onBack={exitWorksheet}
+				header={
 					<TabsList>
 						{ARTIFACT_TYPE_OPTIONS.map((type) => (
 							<TabsTrigger key={type.value} value={type.value}>
@@ -85,7 +81,8 @@ function WorksheetDetail() {
 							</TabsTrigger>
 						))}
 					</TabsList>
-				</header>
+				}
+			>
 				{[ARTIFACT_TYPES.MultipleChoiceQuiz, ARTIFACT_TYPES.EssayQuiz, ARTIFACT_TYPES.CompletionQuiz].map((type) => {
 					const artifactType = ARTIFACT_TYPE_OPTIONS.find((o) => o.value === type);
 
@@ -93,7 +90,7 @@ function WorksheetDetail() {
 
 					return <QuizTabContent key={type} worksheet={worksheet} artifactType={artifactType} />;
 				})}
-			</main>
+			</Layout>
 		</Tabs>
 	);
 }

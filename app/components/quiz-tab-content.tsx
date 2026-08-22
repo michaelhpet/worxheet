@@ -94,7 +94,7 @@ export function QuizTabContent({ worksheet, artifactType }: Props) {
 						navigate({
 							to: "/worksheets/$id/mcq",
 							params: { id: worksheet.id },
-							search: { count },
+							search: { count, time: timed ?? undefined },
 						})
 					}
 				>

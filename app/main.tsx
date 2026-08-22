@@ -1,6 +1,7 @@
 import { createRouter, RouterProvider } from "@tanstack/react-router";
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { Toaster } from "@/components/ui/toast";
 import { queryClient } from "./data/query-client.ts";
 import { routeTree } from "./route-tree.gen.ts";
 import "./index.css";
@@ -21,6 +22,7 @@ declare module "@tanstack/react-router" {
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
 	<React.StrictMode>
+		<Toaster />
 		<RouterProvider router={router} />
 	</React.StrictMode>,
 );

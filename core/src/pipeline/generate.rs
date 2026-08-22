@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use sqlx::SqlitePool;
 use ulid::Ulid;
@@ -12,6 +13,15 @@ pub use crate::models::GenerationParams;
 
 /// Progress callback invoked with `(units_done, units_total)` during generation.
 pub type ProgressFn = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
+/// How many generation units run concurrently, each on its own thread with a
+/// reusable llama.cpp context.
+const GENERATION_CONCURRENCY: usize = 4;
+
+/// Whole-worksheet types (Summary, MindMap) merge one section per generated
+/// unit; beyond this many topic clusters they sample units evenly instead of
+/// covering every cluster.
+const WORKSHEET_WIDE_SAMPLE: usize = 6;
 
 /// Generate artifacts for a worksheet. Chunks missing embeddings are embedded
 /// on the fly. Question-style types (MCQ, essay, completion) exhaust the
@@ -108,6 +118,22 @@ pub async fn generate_artifacts(
             unit_sources.push(chunk_ids.join(","));
         }
 
+        // Whole-worksheet types read the material through an even sample of
+        // clusters; question-style types keep every cluster.
+        if matches!(at_for_gen, ArtifactType::Summary | ArtifactType::MindMap)
+            && contexts.len() > WORKSHEET_WIDE_SAMPLE
+        {
+            let keep = cluster::pick_evenly(
+                &(0..contexts.len()).collect::<Vec<usize>>(),
+                WORKSHEET_WIDE_SAMPLE,
+            );
+            let kept_contexts: Vec<String> = keep.iter().map(|&i| contexts[i].clone()).collect();
+            let kept_sources: Vec<String> =
+                keep.iter().map(|&i| unit_sources[i].clone()).collect();
+            contexts = kept_contexts;
+            unit_sources = kept_sources;
+        }
+
         let total = contexts.len();
         if let Some(on_progress) = &on_progress {
             on_progress(0, total);
@@ -115,46 +141,111 @@ pub async fn generate_artifacts(
 
         let generator = models.generator()?;
         let system = system_prompt_for(&at_for_gen);
-        let schema = schema_for(&at_for_gen);
+        let grammar = llama_cpp_2::json_schema_to_grammar(schema_for(&at_for_gen))
+            .map_err(|e| format!("Failed to compile JSON schema into grammar: {e}"))?;
 
         // Generate per unit on a best-effort basis: a unit that truncates or
         // returns invalid output is retried once with a doubled token budget,
         // then skipped if it still fails, so one bad cluster never discards an
-        // otherwise healthy batch.
-        let mut failures: Vec<String> = Vec::new();
+        // otherwise healthy batch. Units are distributed round-robin over
+        // worker threads, each reusing a single context for its whole queue.
+        let done = AtomicUsize::new(0);
+        let slots: Vec<Option<Result<String, String>>> = (0..total).map(|_| None).collect();
+        let results = Mutex::new(slots);
+        let failures = Mutex::new(Vec::<String>::new());
+
+        std::thread::scope(|scope| {
+            let workers = total.min(GENERATION_CONCURRENCY).max(1);
+            let threads_per_worker = (crate::models::cpu_threads() / workers as i32).max(1);
+
+            let mut queues: Vec<Vec<(usize, String)>> = vec![Vec::new(); workers];
+            for (index, context) in contexts.into_iter().enumerate() {
+                queues[index % workers].push((index, context));
+            }
+
+            for queue in queues {
+                let generator = generator.clone();
+                let grammar = grammar.clone();
+                let on_progress = on_progress.clone();
+                let done = &done;
+                let results = &results;
+                let failures = &failures;
+                let at = &at_for_gen;
+                let params = &params;
+                scope.spawn(move || {
+                    let mut ctx = match generator.context_with_threads(threads_per_worker) {
+                        Ok(ctx) => ctx,
+                        Err(error) => {
+                            failures.lock().unwrap().push(error);
+                            return;
+                        }
+                    };
+                    for (index, context) in queue {
+                        let attempt = (|| -> Result<String, String> {
+                            let mut unit_params = params.clone();
+                            unit_params.seed = params.seed.wrapping_add(index as u32);
+                            let user = user_message_for(at, &context);
+                            let prompt = generator.apply_chat_template(&system, &user)?;
+
+                            let mut output = generator.generate_in_context(
+                                &mut ctx,
+                                &prompt,
+                                Some(&grammar),
+                                &unit_params,
+                            )?;
+                            if !output_parses(at, &output) {
+                                let mut retry_params = unit_params.clone();
+                                retry_params.max_tokens =
+                                    unit_params.max_tokens.max(256).saturating_mul(2).min(4096);
+                                output = generator.generate_in_context(
+                                    &mut ctx,
+                                    &prompt,
+                                    Some(&grammar),
+                                    &retry_params,
+                                )?;
+                            }
+                            if !output_parses(at, &output) {
+                                return Err(format!("Model returned invalid JSON: {output}"));
+                            }
+                            Ok(output)
+                        })();
+
+                        match attempt {
+                            Ok(output) => {
+                                results.lock().unwrap()[index] = Some(Ok(output));
+                            }
+                            Err(error) => failures
+                                .lock()
+                                .unwrap()
+                                .push(format!("unit {}: {error}", index + 1)),
+                        }
+
+                        let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
+                        if let Some(on_progress) = &on_progress {
+                            on_progress(finished, total);
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut failures = failures.into_inner().unwrap();
+        let results = results.into_inner().unwrap();
+
         let mut outputs: Vec<String> = Vec::with_capacity(total);
         let mut sources: Vec<String> = Vec::with_capacity(total);
-
-        for (index, context) in contexts.into_iter().enumerate() {
-            let attempt = (|| -> Result<String, String> {
-                let mut unit_params = params.clone();
-                unit_params.seed = params.seed.wrapping_add(index as u32);
-                let user = user_message_for(&at_for_gen, &context);
-                let prompt = generator.apply_chat_template(system, &user)?;
-
-                let mut output = generator.generate(&prompt, Some(schema), &unit_params)?;
-                if !output_parses(&at_for_gen, &output) {
-                    let mut retry_params = unit_params.clone();
-                    retry_params.max_tokens =
-                        unit_params.max_tokens.max(256).saturating_mul(2).min(4096);
-                    output = generator.generate(&prompt, Some(schema), &retry_params)?;
-                }
-                if !output_parses(&at_for_gen, &output) {
-                    return Err(format!("Model returned invalid JSON: {output}"));
-                }
-                Ok(output)
-            })();
-
-            match attempt {
-                Ok(output) => {
+        for (index, slot) in results.into_iter().enumerate() {
+            match slot {
+                Some(Ok(output)) => {
                     outputs.push(output);
                     sources.push(unit_sources[index].clone());
                 }
-                Err(error) => failures.push(format!("unit {}: {error}", index + 1)),
-            }
-
-            if let Some(on_progress) = &on_progress {
-                on_progress(index + 1, total);
+                other => {
+                    let error = other.and_then(|attempt| attempt.err()).unwrap_or_else(|| {
+                        String::from("worker failed without reporting an error")
+                    });
+                    failures.push(format!("unit {}: {error}", index + 1));
+                }
             }
         }
 
@@ -177,11 +268,16 @@ pub async fn generate_artifacts(
 
     let (pending, new_blobs) = prepared;
 
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| String::from("Failed to begin artifact transaction"))?;
+
     for (id, blob) in &new_blobs {
         sqlx::query("UPDATE chunks SET embedding = ? WHERE id = ?")
             .bind(blob.clone())
             .bind(id)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|_| String::from("Failed to store embedding"))?;
     }
@@ -204,12 +300,17 @@ pub async fn generate_artifacts(
         .bind(artifact_type.to_db())
         .bind(&artifact.source)
         .bind(&artifact.content)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| String::from("Failed to persist artifact"))?;
 
         artifacts.push(artifact);
     }
+
+    transaction
+        .commit()
+        .await
+        .map_err(|_| String::from("Failed to commit generated artifacts"))?;
 
     Ok(artifacts)
 }

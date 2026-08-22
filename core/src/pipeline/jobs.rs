@@ -233,15 +233,16 @@ async fn run_pipeline(
 
         let on_generate = progress_sink(app, jobs, worksheet_id);
 
-        super::generate_artifacts(
-            pool,
-            models,
-            worksheet_id,
-            &artifact_type,
-            None,
-            Some(on_generate),
-        )
-        .await?;
+        let started = std::time::Instant::now();
+        let artifacts =
+            super::generate_artifacts(pool, models, worksheet_id, &artifact_type, None, Some(on_generate))
+                .await?;
+        println!(
+            "[pipeline] generated {} {} artifact(s) in {:?}",
+            artifacts.len(),
+            artifact_type.to_db(),
+            started.elapsed()
+        );
 
         types_done += 1;
         set_phase(

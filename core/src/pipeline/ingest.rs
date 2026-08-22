@@ -1,4 +1,5 @@
 use tokenizers::Tokenizer;
+use tokio::sync::mpsc;
 
 use crate::schema::Chunk;
 
@@ -77,6 +78,9 @@ pub fn parse_file(path: &str, extension: &str) -> Result<String, String> {
 
 /// Parse, chunk, and store the given files of a worksheet. Reports progress as
 /// each file completes through `on_progress` if provided.
+///
+/// Files are parsed and chunked on parallel worker threads in bounded waves;
+/// every chunk is then inserted in source order inside a single transaction.
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
@@ -84,11 +88,14 @@ pub async fn process_files(
     tokenizer: &Tokenizer,
     mut on_progress: Option<&mut (dyn FnMut(usize, usize) + Send)>,
 ) -> Result<Vec<Chunk>, String> {
-    let mut all_chunks = Vec::new();
-    let mut position_counter = 0i32;
     let total = file_ids.len();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
 
-    for (index, file_id) in file_ids.iter().enumerate() {
+    // Load metadata up front so parsing never touches the database.
+    let mut metadata = Vec::with_capacity(total);
+    for file_id in file_ids {
         let row = sqlx::query_as::<_, (String, String)>(
             "SELECT path, extension FROM files WHERE id = ? AND worksheet_id = ?",
         )
@@ -98,14 +105,63 @@ pub async fn process_files(
         .await
         .map_err(|_| format!("Failed to query file {}", file_id))?
         .ok_or_else(|| format!("File not found: {}", file_id))?;
+        metadata.push((file_id.clone(), row.0, row.1));
+    }
 
-        let (path, extension) = row;
+    let max_parallel = total.min(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    );
 
-        let text = parse_file(&path, &extension)?;
+    let mut parsed: Vec<Option<Vec<String>>> = vec![None; total];
+    let (tx, mut rx) = mpsc::channel::<(usize, Result<Vec<String>, String>)>(total);
+    let mut done = 0usize;
 
-        let chunks = chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP, tokenizer)?;
+    let mut start = 0;
+    while start < total {
+        let end = (start + max_parallel).min(total);
+        for (offset, (_, path, extension)) in metadata[start..end].iter().enumerate() {
+            let index = start + offset;
+            let tokenizer = tokenizer.clone();
+            let tx = tx.clone();
+            let path = path.clone();
+            let extension = extension.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = (|| -> Result<Vec<String>, String> {
+                    let text = parse_file(&path, &extension)?;
+                    chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP, &tokenizer)
+                })();
+                let _ = tx.blocking_send((index, result));
+            });
+        }
 
-        for chunk_text in &chunks {
+        for _ in start..end {
+            let (index, result) = rx
+                .recv()
+                .await
+                .ok_or_else(|| String::from("Parse channel closed unexpectedly"))?;
+            parsed[index] = Some(result?);
+            done += 1;
+            if let Some(on_progress) = on_progress.as_deref_mut() {
+                on_progress(done, total);
+            }
+        }
+        start = end;
+    }
+
+    let mut all_chunks = Vec::new();
+    let mut position_counter = 0i32;
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| String::from("Failed to begin ingest transaction"))?;
+    for (file_index, file_id) in file_ids.iter().enumerate() {
+        let chunks = parsed[file_index]
+            .as_deref()
+            .ok_or_else(|| format!("File was not processed: {}", file_id))?;
+        for body in chunks {
             let chunk_id = ulid::Ulid::new().to_string();
             sqlx::query(
                 "INSERT INTO chunks (id, worksheet_id, file_id, position, text) VALUES (?, ?, ?, ?, ?)",
@@ -114,27 +170,27 @@ pub async fn process_files(
             .bind(worksheet_id)
             .bind(file_id)
             .bind(position_counter)
-            .bind(chunk_text)
-            .execute(pool)
+            .bind(body)
+            .execute(&mut *transaction)
             .await
             .map_err(|_| String::from("Failed to insert chunk"))?;
 
             all_chunks.push(Chunk {
                 id: chunk_id,
                 worksheet_id: worksheet_id.to_string(),
-                file_id: file_id.to_string(),
+                file_id: file_id.clone(),
                 position: position_counter,
-                text: chunk_text.clone(),
+                text: body.clone(),
                 embedding: None,
             });
 
             position_counter += 1;
         }
-
-        if let Some(on_progress) = on_progress.as_deref_mut() {
-            on_progress(index + 1, total);
-        }
     }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| String::from("Failed to commit ingested chunks"))?;
 
     sqlx::query("UPDATE worksheets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(worksheet_id)

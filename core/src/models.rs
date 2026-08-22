@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -11,7 +12,6 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::json_schema_to_grammar;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -26,6 +26,20 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
 const N_CTX: u32 = 8192;
 const MAX_PROMPT_TOKENS: i32 = 6144;
+
+/// Number of CPU threads llama.cpp should use for a single inference stream.
+pub fn cpu_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+}
+
+/// Model load parameters shared by every model: request full GPU offload.
+/// Platforms without a GPU backend (or without the feature compiled in) fall
+/// back to CPU transparently.
+fn model_params() -> LlamaModelParams {
+    LlamaModelParams::default().with_n_gpu_layers(99)
+}
 
 static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
 
@@ -262,7 +276,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn load(model_path: &Path) -> Result<Self, String> {
         let backend = backend()?;
-        let model = LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default())
+        let model = LlamaModel::load_from_file(backend, model_path, &model_params())
             .map_err(|e| format!("Failed to load embedding model: {e}"))?;
         Ok(Self { model })
     }
@@ -281,14 +295,17 @@ impl Embedder {
     /// supports a single sequence per batch, so multi-sequence batches are not
     /// used here (mirroring llama.cpp's own `embedding` example).
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_with_threads(texts, cpu_threads())
+    }
+
+    /// Like [`Embedder::embed`] with an explicit CPU thread budget, so several
+    /// embed streams can run concurrently without oversubscribing the cores.
+    pub fn embed_with_threads(&self, texts: &[&str], threads: i32) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
         let n_ctx_train = self.model.n_ctx_train();
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
         let ctx_params = LlamaContextParams::default()
             .with_embeddings(true)
             .with_n_ctx(NonZeroU32::new(n_ctx_train))
@@ -370,7 +387,7 @@ impl Default for GenerationParams {
 impl Generator {
     pub fn load(model_path: &Path) -> Result<Self, String> {
         let backend = backend()?;
-        let model = LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default())
+        let model = LlamaModel::load_from_file(backend, model_path, &model_params())
             .map_err(|e| format!("Failed to load generation model: {e}"))?;
         Ok(Self { model })
     }
@@ -395,23 +412,44 @@ impl Generator {
             .map_err(|e| format!("Failed to apply chat template: {e}"))
     }
 
-    /// Run a generation with an optional JSON-schema grammar constraining the
-    /// output to valid JSON matching the schema.
+    /// Run a generation constrained by a precompiled GBNF `grammar` on a fresh
+    /// context. Use [`Generator::generate_in_context`] to amortize context
+    /// creation across many generations.
+    #[allow(dead_code)] // used by tests and useful for consumers
     pub fn generate(
         &self,
         prompt: &str,
-        schema_json: Option<&str>,
+        grammar: Option<&str>,
         params: &GenerationParams,
     ) -> Result<String, String> {
+        let mut ctx = self.context_with_threads(cpu_threads())?;
+        self.generate_in_context(&mut ctx, prompt, grammar, params)
+    }
+
+    /// Create a fresh generation context with an explicit CPU thread budget.
+    /// Workers processing many units reuse one context per thread.
+    pub fn context_with_threads(&self, threads: i32) -> Result<LlamaContext<'_>, String> {
         let n_ctx = NonZeroU32::new(N_CTX).expect("non-zero context size");
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(n_ctx))
-            .with_n_batch(N_CTX);
-        let mut ctx = self
-            .model
+            .with_n_batch(N_CTX)
+            .with_n_threads_batch(threads);
+        self.model
             .new_context(backend()?, ctx_params)
-            .map_err(|e| format!("Failed to create generation context: {e}"))?;
+            .map_err(|e| format!("Failed to create generation context: {e}"))
+    }
 
+    /// Like [`Generator::generate`] but reusing the caller's context, so a
+    /// worker processing many units pays for KV-cache allocation only once.
+    /// The context's KV cache is cleared before every run.
+    pub fn generate_in_context(
+        &self,
+        ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+        prompt: &str,
+        grammar: Option<&str>,
+        params: &GenerationParams,
+    ) -> Result<String, String> {
+        ctx.clear_kv_cache();
         let tokens = self
             .model
             .str_to_token(prompt, AddBos::Always)
@@ -446,11 +484,9 @@ impl Generator {
             .map_err(|e| format!("Failed to decode prompt: {e}"))?;
 
         let mut samplers: Vec<LlamaSampler> = Vec::new();
-        if let Some(schema) = schema_json {
-            let grammar = json_schema_to_grammar(schema)
-                .map_err(|e| format!("Failed to compile JSON schema into grammar: {e}"))?;
+        if let Some(grammar) = grammar {
             samplers.push(
-                LlamaSampler::grammar(&self.model, &grammar, "root")
+                LlamaSampler::grammar(&self.model, grammar, "root")
                     .map_err(|e| format!("Failed to initialize grammar sampler: {e}"))?,
             );
         }
@@ -506,6 +542,7 @@ impl Generator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llama_cpp_2::json_schema_to_grammar;
     use std::path::PathBuf;
 
     fn models_dir() -> PathBuf {
@@ -636,6 +673,9 @@ mod tests {
             },
             "required": ["question", "options"]
         }"#;
+        let grammar = json_schema_to_grammar(schema)
+            .map_err(|e| format!("Failed to compile JSON schema into grammar: {e}"))
+            .expect("schema should compile");
 
         let params = GenerationParams {
             temperature: 0.3,
@@ -644,7 +684,7 @@ mod tests {
         };
 
         let output = generator
-            .generate(&prompt, Some(schema), &params)
+            .generate(&prompt, Some(&grammar), &params)
             .expect("should generate");
 
         let parsed: serde_json::Value = serde_json::from_str(&output)

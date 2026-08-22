@@ -239,9 +239,14 @@ pub async fn rebuild_clusters(pool: &SqlitePool, worksheet_id: &str) -> Result<(
         }
     }
 
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| String::from("Failed to begin cluster transaction"))?;
+
     sqlx::query("DELETE FROM clusters WHERE worksheet_id = ?")
         .bind(worksheet_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| String::from("Failed to clear old clusters"))?;
 
@@ -254,7 +259,7 @@ pub async fn rebuild_clusters(pool: &SqlitePool, worksheet_id: &str) -> Result<(
         .bind(cluster_index as i32)
         .bind(embedding_to_bytes(centroid))
         .bind(sizes[cluster_index] as i64)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| String::from("Failed to store cluster"))?;
     }
@@ -264,10 +269,15 @@ pub async fn rebuild_clusters(pool: &SqlitePool, worksheet_id: &str) -> Result<(
         sqlx::query("UPDATE chunks SET cluster_index = ? WHERE id = ?")
             .bind(index)
             .bind(id)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|_| String::from("Failed to update chunk cluster"))?;
     }
+
+    transaction
+        .commit()
+        .await
+        .map_err(|_| String::from("Failed to commit cluster assignments"))?;
 
     Ok(())
 }

@@ -36,6 +36,7 @@ pub async fn process_files(
         }
     };
 
+    let started = std::time::Instant::now();
     let mut chunks = ingest::process_files(
         pool,
         worksheet_id,
@@ -44,10 +45,20 @@ pub async fn process_files(
         Some(&mut progress),
     )
     .await?;
+    println!(
+        "[pipeline] ingested {total} files into {} chunks in {:?}",
+        chunks.len(),
+        started.elapsed()
+    );
 
     if !chunks.is_empty() {
-        embed::embed_missing_chunks(pool, models, worksheet_id).await?;
+        let embed_started = std::time::Instant::now();
+        let embedded = embed::embed_missing_chunks(pool, models, worksheet_id).await?;
+        println!("[pipeline] embedded {embedded} chunks in {:?}", embed_started.elapsed());
+
+        let cluster_started = std::time::Instant::now();
         cluster::rebuild_clusters(pool, worksheet_id).await?;
+        println!("[pipeline] clustered chunks in {:?}", cluster_started.elapsed());
 
         // Refresh the in-memory chunks with the vectors we just stored so the
         // returned contract matches the database.

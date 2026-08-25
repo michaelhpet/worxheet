@@ -30,8 +30,11 @@ database.
   and the background job runner. See [PIPELINE.md](PIPELINE.md) for a prose
   walkthrough of every stage.
 - **Frontend** (`app/`) — React UI that creates worksheets and renders live
-  pipeline progress (`usePipelineStatus`, polling `get_pipeline_status`) plus
-  the generated artifacts.
+  pipeline progress (`usePipelineStatus`, polling `get_pipeline_status`). The
+  generated question artifacts double as takeable quizzes: per-type setup tabs
+  on the worksheet page, dedicated quiz routes with countdown timer and
+  submit/leave dialogs (`QuizShell`), and an in-place graded results view
+  (`QuizGrade`).
 
 ## Related docs
 

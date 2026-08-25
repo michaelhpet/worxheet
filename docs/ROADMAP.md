@@ -22,6 +22,10 @@ Core RAG pipeline for text-based documents.
 - [x] Artifact persistence (MCQ items, summaries, mind-maps in SQLite `artifacts` table)
 - [x] React workspace view for generated artifacts (worksheet detail route: status banner + artifact cards)
 - [x] Automatic background pipeline (`pipeline/jobs.rs`: `create_worksheet` starts the job, `pipeline-progress` events + `get_pipeline_status`, `resume_stale` on startup)
+- [x] Parallel file parsing/chunking in `ingest.rs` (bounded worker waves sized to available parallelism)
+- [x] Quiz setup tabs on the worksheet detail page (question count bounded by generated artifacts, optional timer with per-type multipliers)
+- [x] Dedicated quiz routes (`/mcq`, `/essay`, `/completion`) sharing a custom quiz shell: step wizard, countdown timer with auto-submit, submit/leave confirmation dialogs
+- [x] Client-side grading and results view (percentage + raw score, per-question breakdown, essay self-review against model answers)
 
 ## Phase 2 — Document Coverage
 

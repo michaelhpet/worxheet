@@ -26,7 +26,9 @@ Create worksheet ─► Parse ─► Chunk ─► Store ─► Embed ─► Clus
 | PDF | `pdf_oxide` (page-by-page extraction) |
 | PPTX, DOCX, PPT, DOC | `office_oxide` |
 
-Output: raw text per file.
+Output: raw text per file. Files are parsed and chunked on bounded parallel
+worker threads (`ingest.rs` dispatches waves sized to
+`std::thread::available_parallelism`).
 
 ### 3. Chunk
 
@@ -155,7 +157,9 @@ Exposed Tauri commands (`lib.rs` invoke handler):
 
 - `get_file_metadata`
 - `get_worksheets`, `get_worksheet`, `create_worksheet`, `delete_worksheet`
-- `get_artifacts` — list a worksheet's generated artifacts
+- `get_artifacts` — list a worksheet's artifacts for one type, optionally
+  capped at `count` randomly-selected items (used by the quiz pages to sample
+  questions)
 - `get_pipeline_status` — read the worksheet's current pipeline status
 
 `create_worksheet` starts the background job when files are provided; `delete_worksheet` stops/removes any in-flight job.
@@ -165,7 +169,15 @@ Progress event (listened via `@tauri-apps/api/event`):
 - `pipeline-progress` — `{ worksheet_id, status, phase, artifact_type, done, total, types_done, types_total, error }` emitted throughout the run
 - `model-download` — `{ kind, done, total }` while the first run downloads GGUFs
 
-The React worksheet detail route (`app/routes/worksheets.$id.tsx`) renders a status banner (`usePipelineStatus` in `app/data/pipeline.ts`, polling `get_pipeline_status` every ~1.2s while running) and an artifacts panel (type-filtered artifact cards). There are no process/generate buttons — creating a worksheet is the entire interaction.
+The React worksheet detail route (`app/routes/worksheets.$id.tsx`) shows live
+progress while the pipeline runs (`usePipelineStatus` in `app/data/pipeline.ts`,
+polling `get_pipeline_status`). Once done it becomes a tabbed workspace: each
+quiz type opens a setup card (question count + optional timer) that launches a
+dedicated quiz route — `/worksheets/$id/mcq|essay|completion` — over artifacts
+sampled via `useArtifacts(id, type, count)`; see ARCHITECTURE.md's
+[Quiz Flow](ARCHITECTURE.md#quiz-flow) for the quiz architecture. There are no
+process/generate buttons — creating a worksheet is the entire generation
+interaction.
 
 ## Module Layout (core/src/)
 
@@ -182,7 +194,7 @@ core/src/
 ├── worksheet.rs        # worksheet CRUD + file metadata logic
 ├── pipeline/           # background pipeline (testable cores)
 │   ├── mod.rs          # orchestration (process_files) + integration tests
-│   ├── ingest.rs       # parse_file + chunk_text + ingest loop
+│   ├── ingest.rs       # parse_file + chunk_text + ingest loop (parallel parse waves)
 │   ├── embed.rs        # bge-small embeddings + BLOB encode/decode
 │   ├── cluster.rs      # HDBSCAN clustering + cluster_contexts + rebuild_clusters
 │   ├── generate.rs     # SmolLM2 grammar-constrained generation + assemble_artifacts

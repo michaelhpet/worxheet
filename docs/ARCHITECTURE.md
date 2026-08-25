@@ -48,10 +48,53 @@ and used directly for clustering and context selection.
 8. **Persist** *(done)*: Generated artifacts are validated, inserted into the `artifacts` table, and returned to the frontend via `get_artifacts`.
 
 The React worksheet detail route (`app/routes/worksheets.$id.tsx`) is the
-user-facing workspace: a status banner (`usePipelineStatus`, which polls
-`get_pipeline_status` while the job runs) and an artifacts panel (type-filtered
-cards). Creating a worksheet is the whole interaction — there are no
-process/generate buttons.
+user-facing workspace: while the pipeline runs it shows live progress
+(`usePipelineStatus`, polling `get_pipeline_status`); once done it becomes a
+tabbed view over the five artifact types. The three quiz types open a quiz
+setup card, and "Start quiz" navigates to that type's quiz route (see
+[Quiz Flow](#quiz-flow) below). Summary/MindMap tabs are placeholders pending
+visualization work. Creating a worksheet is still the whole generation
+interaction — there are no process/generate buttons.
+
+## Quiz Flow
+
+Generated quiz artifacts double as takeable quizzes. Each of the three quiz
+types has a dedicated route — `/worksheets/$id/mcq`,
+`/worksheets/$id/completion`, `/worksheets/$id/essay` — sharing one custom
+wizard component (`app/components/quiz-shell.tsx`). The questionnaire
+primitive from `@shadcn/react` was evaluated and rejected: it gates
+Next/Submit on optional items, which conflicts with the "no answer is
+required, blanks fail silently" rule.
+
+- **Setup**: each quiz tab on the worksheet detail page renders a setup card
+  (`quiz-tab-content.tsx`) — a number-of-questions slider bounded by the
+  available artifacts (`worksheet.artifact_counts`) and an optional timer
+  built from multiplier presets per quiz type. Starting navigates to the
+  route with `{count, time}` search params (zod-validated).
+- **Sampling**: quiz routes fetch their questions via
+  `useArtifacts(id, type, count)` → `get_artifacts`, which caps the pool at
+  `count` randomly-selected items of that artifact type.
+- **Wizard**: `QuizShell` shows one question at a time with
+  Previous/Next/Submit. All questions stay mounted inside the form
+  (non-active ones toggled with the `hidden` attribute), so uncontrolled
+  inputs survive step changes and FormData captures every answer. Nothing is
+  required — blanks simply grade as failed.
+- **Timer**: when `time` (minutes) is set, a HH:MM:SS countdown header
+  (`input-otp` slots) ticks down with urgency styling under 60s remaining;
+  expiry auto-submits via `useCountdown`.
+- **Dialogs**: submitting and leaving both require confirmation (AlertDialog).
+- **Grading**: on submit the FormData is compared against the answers stored
+  in the artifacts — exact match against the option string for MCQ, trimmed
+  case-insensitive match for completion sentences; essays carry no auto
+  grade (`correct: null`) and are excluded from the score.
+- **Results**: `QuizGrade` (`app/components/quiz-grade.tsx`) swaps in place:
+  tiered verdict (Excellent ≥80% / Good ≥50% / otherwise), percentage
+  headline plus raw correct count, and a per-question breakdown (✓ / ✗ /
+  "review", your answer vs the correct or model answer). "Back to worksheet"
+  returns to the detail page.
+- **MCQ choices** use the shadcn RadioGroup (`radio-group.tsx`): base-ui's
+  radio items render real hidden `<input type="radio">` elements, so the
+  FormData-based grading works without any bridging state.
 
 ## Inference
 
@@ -69,10 +112,11 @@ Both models run in the single llama.cpp backend created once per process.
 ```
 worxheet/
 ├── app/                          # React frontend
-│   ├── components/               # UI components (workspace/, create-worksheet-dialog, files-uploader, ui/…)
+│   ├── components/               # UI components (layout, create-worksheet-dialog, files-uploader,
+│   │                             #   file-card, quiz-shell, quiz-grade, quiz-tab-content, theme-provider, ui/…)
 │   ├── data/                     # TanStack Query hooks + IPC wrappers (worksheets, artifacts, pipeline, model-downloads)
-│   ├── lib/                      # Types, utils, constants
-│   ├── routes/                   # File-based TanStack Router routes
+│   ├── lib/                      # Types, utils, constants, use-countdown
+│   ├── routes/                   # File-based TanStack Router routes (index, worksheet detail, mcq/completion/essay quiz pages)
 │   ├── index.css                 # Tailwind v4 entry
 │   └── main.tsx                  # App entry
 ├── core/                         # Rust backend

@@ -44,8 +44,10 @@ Models are stored under the app data directory (`models/`). `models.rs` lazily d
 | `@tauri-apps/plugin-opener` | Frontend binding for opening external files |
 | `react` / `react-dom` 19 | UI runtime |
 | `tailwindcss` 4 | Utility-first CSS framework |
-| `@base-ui/react` | Headless UI primitives (button, dialog, field, progress, etc.) |
+| `@base-ui/react` | Headless UI primitives (button, dialog, field, progress, radio-group, etc.) |
+| `input-otp` | OTP-style slotted input, repurposed as the quiz countdown timer display (HH:MM:SS) |
 | `shadcn` | Component CLI/registry used for the `ui/` components |
+| `@shadcn/react` | shadcn React primitives package; its questionnaire component was evaluated for the quiz UI but rejected (gates Next on optional items). Still installed; currently unused by shipped UI |
 | `zod` | Runtime schema validation for forms and IPC payloads |
 | `class-variance-authority` | Component variant API (used by shadcn components) |
 | `clsx` + `tailwind-merge` | Conditional class merging |

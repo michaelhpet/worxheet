@@ -9,6 +9,12 @@ export interface PipelineStatus {
 	total: number;
 	types_done: number;
 	types_total: number;
+	/** Provider requests issued so far in this run. */
+	requests_done?: number;
+	/** Approximate prompt tokens observed (chars/4 heuristic). */
+	tokens_in?: number;
+	/** Approximate completion tokens observed. */
+	tokens_out?: number;
 	error: string | null;
 }
 

@@ -4,7 +4,9 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, FieldDescription } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { isProviderReady, useProviderStatus } from "@/data/provider";
 import type { Worksheet } from "@/data/worksheets";
+import { openSettings } from "@/lib/settings-bus";
 import { useForm } from "@tanstack/react-form";
 import { useNavigate } from "@tanstack/react-router";
 import { invoke } from "@tauri-apps/api/core";
@@ -23,11 +25,17 @@ const worksheetSchema = z.object({
 export function CreateWorksheetDialog({ open, onOpenChange }: CreateWorksheetDialogProps) {
 	const navigate = useNavigate();
 	const [files, setFiles] = useState<string[]>([]);
+	const [providerBlocked, setProviderBlocked] = useState(false);
+	const providerStatus = useProviderStatus();
 
 	const form = useForm({
 		defaultValues: { name: "" },
 		validators: { onChange: worksheetSchema },
 		onSubmit: async ({ value }) => {
+			if (files.length > 0 && !isProviderReady(providerStatus.data)) {
+				setProviderBlocked(true);
+				return;
+			}
 			const name = value.name.trim() || "Untitled Worksheet";
 			const worksheet = await invoke<Worksheet>("create_worksheet", {
 				name,
@@ -101,6 +109,23 @@ export function CreateWorksheetDialog({ open, onOpenChange }: CreateWorksheetDia
 						</ul>
 					)}
 
+					{providerBlocked && files.length > 0 && (
+						<div className="mx-6 mb-4 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+							Generating artifacts needs an LLM provider.{" "}
+							<button
+								type="button"
+								className="underline font-medium"
+								onClick={() => {
+									onOpenChange(false);
+									openSettings("provider");
+								}}
+							>
+								Set one up in Settings
+							</button>{" "}
+							to continue.
+						</div>
+					)}
+
 					<DialogFooter>
 						<Button
 							type="button"
@@ -108,6 +133,7 @@ export function CreateWorksheetDialog({ open, onOpenChange }: CreateWorksheetDia
 							onClick={() => {
 								form.reset();
 								setFiles([]);
+								setProviderBlocked(false);
 								onOpenChange(false);
 							}}
 						>

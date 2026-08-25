@@ -2,21 +2,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One contiguous, ordered generation unit carved out of a worksheet file by
+/// the segmenter. Stored in the `chunks` table (historical name).
 #[derive(Clone, Debug, Serialize)]
-pub struct Chunk {
+pub struct Segment {
     pub id: String,
     pub worksheet_id: String,
     pub file_id: String,
+    /// Global position within the worksheet (document order).
     pub position: i32,
+    /// Nearest enclosing heading breadcrumb, if the source had structure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
-}
-
-#[derive(Clone)]
-pub struct Cluster {
-    pub centroid: Vec<f32>,
-    pub chunk_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -57,9 +57,26 @@ pub struct PipelineStatus {
     pub types_done: usize,
     /// Total artifact types to generate.
     pub types_total: usize,
+    /// Provider requests issued during this run so far.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub requests_done: usize,
+    /// Approximate prompt tokens observed so far (chars/4 heuristic).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub tokens_in: u64,
+    /// Approximate completion tokens observed so far.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub tokens_out: u64,
     /// Error message when `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -94,4 +111,12 @@ impl ArtifactType {
             other => Err(format!("Unknown artifact type: {other}")),
         }
     }
+
+    pub const ALL: [ArtifactType; 5] = [
+        ArtifactType::MultipleChoiceQuiz,
+        ArtifactType::EssayQuiz,
+        ArtifactType::CompletionQuiz,
+        ArtifactType::Summary,
+        ArtifactType::MindMap,
+    ];
 }

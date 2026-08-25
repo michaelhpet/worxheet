@@ -43,7 +43,9 @@ pub async fn create_worksheet(
         pipeline::start_job(
             app,
             state.database.clone(),
-            state.models.clone(),
+            state.embedder.clone(),
+            state.models_dir.clone(),
+            state.providers.clone(),
             state.jobs.clone(),
             worksheet.id.clone(),
         );

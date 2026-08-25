@@ -1,87 +1,105 @@
-use std::sync::Arc;
+//! Pipeline orchestration: parse → segment → embed → store → generate →
+//! persist. Generation is cloud-hosted through an [`ArtifactBackend`]; every
+//! other stage is fully local.
 
 use sqlx::SqlitePool;
+use std::sync::Arc;
 
-use crate::models::ModelPool;
-use crate::schema::{Artifact, ArtifactType, Chunk};
+use crate::embedder::Embedder;
+use crate::schema::{Artifact, ArtifactType, Segment};
 
-pub mod cluster;
-pub mod embed;
 pub mod generate;
 pub mod ingest;
 pub mod jobs;
+pub mod segment;
+pub mod validate;
 
-pub use embed::bytes_to_embedding;
-pub use generate::{ProgressFn, generate_artifacts};
-pub use jobs::{PipelineJobs, get_status, remove_job, resume_stale, start_job};
+pub use generate::{generate_all, PendingArtifact};
+pub use jobs::{
+    get_status, remove_job, resolve_backend, resume_stale, start_job, PipelineJobs,
+};
 
-/// Parse, chunk, embed, and cluster every file of a worksheet. Reports progress
-/// as each file completes through `on_progress` if provided.
+/// Parse, segment, embed, and persist every file of a worksheet. Reports
+/// progress as each file completes through `on_progress`.
 pub async fn process_files(
     pool: &SqlitePool,
-    models: &Arc<ModelPool>,
     worksheet_id: &str,
     file_ids: &[String],
-    on_progress: Option<ProgressFn>,
-) -> Result<Vec<Chunk>, String> {
-    let tokenizer_models = models.clone();
-    let tokenizer = tauri::async_runtime::spawn_blocking(move || tokenizer_models.tokenizer())
-        .await
-        .map_err(|e| format!("Tokenizer task failed: {e}"))??;
+    tokenizer: tokenizers::Tokenizer,
+    embedder: Arc<Embedder>,
+    on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
+) -> Result<Vec<Segment>, String> {
+    ingest::process_files(pool, worksheet_id, file_ids, tokenizer, embedder, on_progress).await
+}
 
-    let total = file_ids.len();
-    let mut progress = |done: usize, _total: usize| {
-        if let Some(on_progress) = &on_progress {
-            on_progress(done, total);
-        }
-    };
-
-    let started = std::time::Instant::now();
-    let mut chunks = ingest::process_files(
-        pool,
-        worksheet_id,
-        file_ids,
-        &tokenizer,
-        Some(&mut progress),
+/// Load a worksheet's stored segments in document order.
+pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<Segment>, String> {
+    let rows = sqlx::query_as::<_, (String, String, i32, Option<String>, String, Option<Vec<u8>>)>(
+        "SELECT id, file_id, position, heading, text, embedding
+         FROM chunks
+         WHERE worksheet_id = ?
+         ORDER BY position",
     )
-    .await?;
-    println!(
-        "[pipeline] ingested {total} files into {} chunks in {:?}",
-        chunks.len(),
-        started.elapsed()
-    );
+    .bind(worksheet_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| String::from("Failed to query segments"))?;
 
-    if !chunks.is_empty() {
-        let embed_started = std::time::Instant::now();
-        let embedded = embed::embed_missing_chunks(pool, models, worksheet_id).await?;
-        println!("[pipeline] embedded {embedded} chunks in {:?}", embed_started.elapsed());
+    Ok(rows
+        .into_iter()
+        .map(|(id, file_id, position, heading, text, embedding)| Segment {
+            id,
+            worksheet_id: worksheet_id.to_string(),
+            file_id,
+            position,
+            heading,
+            text,
+            embedding: embedding.map(|_| Vec::new()),
+        })
+        .collect())
+}
 
-        let cluster_started = std::time::Instant::now();
-        cluster::rebuild_clusters(pool, worksheet_id).await?;
-        println!("[pipeline] clustered chunks in {:?}", cluster_started.elapsed());
-
-        // Refresh the in-memory chunks with the vectors we just stored so the
-        // returned contract matches the database.
-        let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
-            "SELECT id, embedding
-             FROM chunks
-             WHERE worksheet_id = ? AND embedding IS NOT NULL",
-        )
-        .bind(worksheet_id)
-        .fetch_all(pool)
+/// Persist pending artifacts in one transaction.
+pub async fn persist_artifacts(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+    pending: &[PendingArtifact],
+) -> Result<Vec<Artifact>, String> {
+    let mut transaction = pool
+        .begin()
         .await
-        .map_err(|_| String::from("Failed to fetch stored embeddings"))?;
+        .map_err(|_| String::from("Failed to begin artifact transaction"))?;
 
-        let mut by_id = std::collections::HashMap::new();
-        for (chunk_id, blob) in rows {
-            by_id.insert(chunk_id, bytes_to_embedding(&blob)?);
-        }
-        for chunk in &mut chunks {
-            chunk.embedding = by_id.get(&chunk.id).cloned();
-        }
+    let mut artifacts = Vec::with_capacity(pending.len());
+    for item in pending {
+        let artifact = Artifact {
+            id: ulid::Ulid::new().to_string(),
+            worksheet_id: worksheet_id.to_string(),
+            artifact_type: item.artifact_type.clone(),
+            source: item.source.clone(),
+            content: item.content.clone(),
+        };
+        sqlx::query(
+            "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&artifact.id)
+        .bind(worksheet_id)
+        .bind(artifact.artifact_type.to_db())
+        .bind(&artifact.source)
+        .bind(&artifact.content)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| String::from("Failed to persist artifact"))?;
+        artifacts.push(artifact);
     }
 
-    Ok(chunks)
+    transaction
+        .commit()
+        .await
+        .map_err(|_| String::from("Failed to commit generated artifacts"))?;
+
+    Ok(artifacts)
 }
 
 /// List the persisted artifacts of a worksheet for one artifact type,
@@ -123,72 +141,35 @@ pub async fn get_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::mock::MockBackend;
+    use crate::provider::{ArtifactBackend, ProviderError};
+    use crate::pipeline::generate::GenerationParams;
+
+    #[allow(unused_imports)]
+    use generate as _generate_alias;
+    use serde_json::json;
     use sqlx::SqlitePool;
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
-
-    const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-
-    fn models_dir() -> PathBuf {
-        std::env::var("WORXHEET_MODELS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/models")))
-    }
-
-    fn shared_models() -> Option<Arc<ModelPool>> {
-        static MODELS: OnceLock<Option<Arc<ModelPool>>> = OnceLock::new();
-        MODELS
-            .get_or_init(|| {
-                let dir = models_dir();
-                if !dir.join("bge-small-en-v1.5-q8_0.gguf").exists()
-                    || !dir.join("smollm2-360m-instruct-q8_0.gguf").exists()
-                    || !dir.join("tokenizer.json").exists()
-                {
-                    eprintln!("skipping: models not found in {}", dir.display());
-                    return None;
-                }
-                Some(Arc::new(ModelPool::new(dir)))
-            })
-            .clone()
-    }
 
     async fn setup_db() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:")
             .await
-            .expect("Failed to create in-memory pool");
+            .expect("in-memory pool");
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
-            .expect("Failed to run migrations");
+            .expect("migrations");
         pool
     }
 
-    async fn seed_worksheet_and_file(pool: &SqlitePool) -> (String, String) {
-        let worksheet_id = ulid::Ulid::new().to_string();
+    async fn seed_worksheet(pool: &SqlitePool) -> String {
+        let id = ulid::Ulid::new().to_string();
         sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
-            .bind(&worksheet_id)
+            .bind(&id)
             .bind("test")
             .execute(pool)
             .await
             .unwrap();
-
-        let file_id = ulid::Ulid::new().to_string();
-        let pdf = format!("{}/test.pdf", FIXTURE_DIR);
-        sqlx::query(
-            "INSERT INTO files (id, worksheet_id, path, name, extension, size)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&file_id)
-        .bind(&worksheet_id)
-        .bind(&pdf)
-        .bind("test.pdf")
-        .bind("pdf")
-        .bind(618i64)
-        .execute(pool)
-        .await
-        .unwrap();
-
-        (worksheet_id, file_id)
+        id
     }
 
     async fn seed_artifact(pool: &SqlitePool, worksheet_id: &str, artifact_type: &str) {
@@ -199,17 +180,54 @@ mod tests {
         .bind(ulid::Ulid::new().to_string())
         .bind(worksheet_id)
         .bind(artifact_type)
-        .bind("test-source")
+        .bind("src")
         .bind("{}")
         .execute(pool)
         .await
         .unwrap();
     }
 
+    #[allow(dead_code)] // exercised through the routed mock
+    fn mcq_output(question: &str, answer: &str, distractor: &str) -> String {
+        json!({
+            "questions": [{
+                "question": question,
+                "options": [answer, distractor, "Ribosomes", "Nucleus"],
+                "answer": answer,
+                "explanation": "The source states this directly."
+            }]
+        })
+        .to_string()
+    }
+
+    fn test_segments(count: usize) -> Vec<Segment> {
+        (0..count)
+            .map(|index| Segment {
+                id: format!("seg-{index}"),
+                worksheet_id: String::from("ws"),
+                file_id: String::from("file"),
+                position: index as i32,
+                heading: None,
+                text: if index % 2 == 0 {
+                    String::from(
+                        "The mitochondrion is the powerhouse of the cell where respiration \
+                         produces ATP through glycolysis and the citric acid cycle.",
+                    )
+                } else {
+                    String::from(
+                        "Volcanic eruptions occur when magma pressure builds beneath the crust, \
+                         releasing ash and lava onto the surrounding landscape.",
+                    )
+                },
+                embedding: None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_get_artifacts_filters_by_type_and_count() {
         let pool = setup_db().await;
-        let (worksheet_id, _file_id) = seed_worksheet_and_file(&pool).await;
+        let worksheet_id = seed_worksheet(&pool).await;
         for _ in 0..5 {
             seed_artifact(&pool, &worksheet_id, "MultipleChoiceQuiz").await;
         }
@@ -219,260 +237,187 @@ mod tests {
 
         let mcqs = get_artifacts(&pool, &worksheet_id, &ArtifactType::MultipleChoiceQuiz, None)
             .await
-            .expect("fetch should succeed");
+            .unwrap();
         assert_eq!(mcqs.len(), 5);
-        assert!(
-            mcqs.iter()
-                .all(|a| a.artifact_type == ArtifactType::MultipleChoiceQuiz)
-        );
 
         let limited = get_artifacts(&pool, &worksheet_id, &ArtifactType::MultipleChoiceQuiz, Some(2))
             .await
-            .expect("fetch should succeed");
+            .unwrap();
         assert_eq!(limited.len(), 2);
 
         let clamped = get_artifacts(&pool, &worksheet_id, &ArtifactType::EssayQuiz, Some(0))
             .await
-            .expect("fetch should succeed");
+            .unwrap();
         assert_eq!(clamped.len(), 1);
-
-        let essays = get_artifacts(&pool, &worksheet_id, &ArtifactType::EssayQuiz, None)
-            .await
-            .expect("fetch should succeed");
-        assert_eq!(essays.len(), 3);
-        assert!(
-            essays
-                .iter()
-                .all(|a| a.artifact_type == ArtifactType::EssayQuiz)
-        );
     }
 
     #[tokio::test]
-    async fn test_process_files_embeds_and_clusters() {
-        let Some(models) = shared_models() else {
-            return;
-        };
-        let pool = setup_db().await;
-        let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
+    async fn test_generate_all_produces_and_validates_with_mock_backend() {
+        // Two segments x five types = ten units. Every quiz request answers
+        // with a figure-referencing hallucination; the corrective retry
+        // returns a valid, segment-specific item. Routing keys off request
+        // content so scheduling order cannot change the outcome.
+        let hallucinated_mcq = json!({
+            "questions": [{
+                "question": "As shown in Figure 9, what is depicted?",
+                "options": ["A diagram", "Another diagram", "A chart", "An image"],
+                "answer": "A diagram",
+                "explanation": "The figure shows it."
+            }]
+        })
+        .to_string();
 
-        let chunks = process_files(&pool, &models, &worksheet_id, &[file_id], None)
-            .await
-            .expect("process_files should succeed");
-        assert!(!chunks.is_empty());
+        let backend = Arc::new(MockBackend::with_responder(move |request| {
+            if request.user.contains("previous reply was rejected") {
+                let content = if request.user.contains("mitochondrion") {
+                    json!({
+                        "questions": [{
+                            "question": "Where does respiration produce ATP?",
+                            "options": ["The mitochondrion", "The nucleus", "Ribosomes", "Vacuoles"],
+                            "answer": "The mitochondrion",
+                            "explanation": "Respiration happens there."
+                        }]
+                    })
+                } else {
+                    json!({
+                        "questions": [{
+                            "question": "What builds beneath the crust before an eruption?",
+                            "options": ["Magma pressure", "Ocean tides", "Wind shear", "Sediment"],
+                            "answer": "Magma pressure",
+                            "explanation": "Pressure accumulates underground."
+                        }]
+                    })
+                };
+                return Ok(content.to_string());
+            }
 
-        // Processing now embeds and clusters, so every chunk has a vector and
-        // the worksheet has persisted clusters before any generation happens.
-        let unembedded: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE worksheet_id = ? AND embedding IS NULL")
-                .bind(&worksheet_id)
-                .fetch_one(&pool)
+            let source_has_mitochondria = request.user.contains("mitochondrion");
+            match request.schema_name.as_str() {
+                "MultipleChoiceQuiz" => Ok(hallucinated_mcq.clone()),
+                "EssayQuiz" => Ok(json!({
+                    "questions": [{
+                        "question": if source_has_mitochondria {
+                            "Explain how the citric acid cycle supports ATP production."
+                        } else {
+                            "Describe how magma pressure leads to volcanic eruptions."
+                        },
+                        "instructions": "Ground every claim in the material.",
+                        "model_answer": "Summarize the causal chain stated in the material."
+                    }]
+                })
+                .to_string()),
+                "CompletionQuiz" => Ok(json!({
+                    "items": [{
+                        "sentence": if source_has_mitochondria {
+                            "The ____________ is the powerhouse of the cell."
+                        } else {
+                            "Eruptions release ash and ____________ onto the landscape."
+                        },
+                        "answer": if source_has_mitochondria { "mitochondrion" } else { "lava" },
+                        "hint": "from the material"
+                    }]
+                })
+                .to_string()),
+                "Summary" => Ok(json!({
+                    "title": if source_has_mitochondria { "Cell Biology" } else { "Geology" },
+                    "summary": if source_has_mitochondria {
+                        "Respiration happens in mitochondria and produces ATP."
+                    } else {
+                        "Magma pressure builds until eruptions release ash and lava."
+                    },
+                    "key_points": ["Grounded key point"]
+                })
+                .to_string()),
+                "MindMap" => Ok(json!({
+                    "topic": if source_has_mitochondria { "Cell respiration" } else { "Volcanoes" },
+                    "branches": [{ "label": "Stages", "children": ["One", "Two"] }]
+                })
+                .to_string()),
+                other => Err(ProviderError::Rejected(format!("unknown schema {other}"))),
+            }
+        })) as Arc<dyn ArtifactBackend>;
+
+        let segments = test_segments(2);
+        let (pending, telemetry) =
+            generate_all(backend.clone(), 4, &segments, Some(GenerationParams::default()), None)
                 .await
-                .unwrap();
-        assert_eq!(unembedded, 0);
+                .expect("generation should succeed");
 
-        let cluster_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM clusters WHERE worksheet_id = ?")
-            .bind(&worksheet_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(cluster_count >= 1, "processing should persist clusters");
-    }
+        // Ten units; each quiz unit burns one hallucinated attempt plus one
+        // corrective retry (2 x 2), everything else succeeds first try (6).
+        assert_eq!(telemetry.requests, 12);
 
-    #[tokio::test]
-    async fn test_generate_requires_chunks() {
-        let Some(models) = shared_models() else {
-            return;
-        };
-        let pool = setup_db().await;
-        let worksheet_id = ulid::Ulid::new().to_string();
-        sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
-            .bind(&worksheet_id)
-            .bind("test")
-            .execute(&pool)
-            .await
-            .unwrap();
+        for artifact in &pending {
+            if matches!(artifact.artifact_type, ArtifactType::MultipleChoiceQuiz) {
+                let value: serde_json::Value = serde_json::from_str(&artifact.content).unwrap();
+                let options: Vec<&str> = value["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect();
+                assert!(options.contains(&value["answer"].as_str().unwrap()));
+            }
+        }
 
-        let err = generate_artifacts(
-            &pool,
-            &models,
-            &worksheet_id,
-            &ArtifactType::Summary,
-            None,
-            None,
-        )
-        .await
-        .expect_err("should error without chunks");
-        assert!(err.contains("No chunks"));
-    }
-
-    #[tokio::test]
-    async fn test_generate_mcq_artifact() {
-        let Some(models) = shared_models() else {
-            return;
-        };
-        let pool = setup_db().await;
-        let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
-        process_files(&pool, &models, &worksheet_id, &[file_id], None)
-            .await
-            .expect("process_files should succeed");
-
-        let params = crate::models::GenerationParams {
-            temperature: 0.3,
-            max_tokens: 1024,
-            ..Default::default()
-        };
-        let artifacts = generate_artifacts(
-            &pool,
-            &models,
-            &worksheet_id,
-            &ArtifactType::MultipleChoiceQuiz,
-            Some(params),
-            None,
-        )
-        .await
-        .expect("generate should succeed");
-
-        assert!(!artifacts.is_empty(), "exhaustive generation must yield artifacts");
-        for artifact in &artifacts {
-            assert_eq!(artifact.artifact_type, ArtifactType::MultipleChoiceQuiz);
-            let value: serde_json::Value = serde_json::from_str(&artifact.content)
-                .expect("artifact content should be valid JSON");
-            assert!(value.get("question").is_some());
-            assert_eq!(value["options"].as_array().map(Vec::len), Some(4));
-            let answer = value["answer"]
-                .as_str()
-                .expect("answer should be a string, not an index");
-            let options: Vec<&str> = value["options"]
-                .as_array()
-                .unwrap()
+        let count_of = |kind: &str| {
+            pending
                 .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect();
-            assert_eq!(options.len(), 4);
-            assert!(
-                options.contains(&answer),
-                "answer {answer:?} should exactly match one of the options {options:?}"
-            );
-        }
+                .filter(|a| a.artifact_type.to_db() == kind)
+                .count()
+        };
+        // One artifact per generated item for quiz types.
+        assert_eq!(count_of("MultipleChoiceQuiz"), 2);
+        assert_eq!(count_of("EssayQuiz"), 2);
+        assert_eq!(count_of("CompletionQuiz"), 2);
+        // Single merged worksheet-wide artifacts covering both segments.
+        assert_eq!(count_of("Summary"), 1);
+        assert_eq!(count_of("MindMap"), 1);
+
+        let summary: serde_json::Value = serde_json::from_str(
+            &pending
+                .iter()
+                .find(|a| a.artifact_type.to_db() == "Summary")
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        assert!(summary["summary"].as_str().unwrap().contains("mitochondria"));
     }
 
-    async fn seed_chunks(
-        pool: &SqlitePool,
-        worksheet_id: &str,
-        file_id: &str,
-        count: usize,
-    ) {
-        let passage = concat!(
-            "The mitochondrion is the powerhouse of the cell, where respiration ",
-            "proceeds through glycolysis and the citric acid cycle. ",
+    #[tokio::test]
+    async fn test_generate_all_persists_via_helper() {
+        let backend = Arc::new(MockBackend::with_responder(|request| {
+            Ok(match request.schema_name.as_str() {
+                "Summary" => json!({
+                    "title": "T",
+                    "summary": "Mitochondria produce ATP through respiration.",
+                    "key_points": ["Mitochondria produce ATP"]
+                }),
+                _ => json!({ "placeholder": true }),
+            }
+            .to_string())
+        })) as Arc<dyn ArtifactBackend>;
+        let segments = test_segments(1);
+        let (pending, _) = generate_all(backend, 2, &segments, None, None).await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|a| matches!(a.artifact_type, ArtifactType::Summary))
+                .count(),
+            1
         );
-        let text = passage.repeat(16);
-        for index in 0..count {
-            let chunk_id = ulid::Ulid::new().to_string();
-            let vector: Vec<f32> = (0..384)
-                .map(|dimension| ((index + dimension) as f32 % 17.0) / 17.0)
-                .collect();
-            let blob = embed::embedding_to_bytes(&vector);
-            sqlx::query(
-                "INSERT INTO chunks (id, worksheet_id, file_id, position, text, embedding, cluster_index)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&chunk_id)
-            .bind(worksheet_id)
-            .bind(file_id)
-            .bind(index as i32)
-            .bind(&text)
-            .bind(blob)
-            .bind((index % 3) as i32)
-            .execute(pool)
+
+        let pool = setup_db().await;
+        let worksheet_id = seed_worksheet(&pool).await;
+        let artifacts = persist_artifacts(&pool, &worksheet_id, &pending)
             .await
             .unwrap();
-        }
-    }
+        assert_eq!(artifacts.len(), pending.len());
 
-    #[tokio::test]
-    async fn test_generate_exhausts_clusters() {
-        let Some(models) = shared_models() else {
-            return;
-        };
-        let pool = setup_db().await;
-        let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
-        seed_chunks(&pool, &worksheet_id, &file_id, 20).await;
-
-        let params = crate::models::GenerationParams {
-            temperature: 0.3,
-            max_tokens: 1024,
-            ..Default::default()
-        };
-        let artifacts = generate_artifacts(
-            &pool,
-            &models,
-            &worksheet_id,
-            &ArtifactType::CompletionQuiz,
-            Some(params),
-            None,
-        )
-        .await
-        .expect("exhaustive generation should succeed");
-
-        assert!(
-            artifacts.len() >= 3,
-            "each of the 3 seeded clusters must yield at least one artifact, got {}",
-            artifacts.len()
-        );
-        for artifact in &artifacts {
-            let value: serde_json::Value = serde_json::from_str(&artifact.content)
-                .expect("artifact content should be valid JSON");
-            assert!(value.get("sentence").is_some());
-            assert!(value.get("answer").is_some());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_generate_summary_and_mindmap_single_artifact() {
-        let Some(models) = shared_models() else {
-            return;
-        };
-        let pool = setup_db().await;
-        let (worksheet_id, file_id) = seed_worksheet_and_file(&pool).await;
-        seed_chunks(&pool, &worksheet_id, &file_id, 20).await;
-
-        let params = crate::models::GenerationParams {
-            temperature: 0.3,
-            max_tokens: 1024,
-            ..Default::default()
-        };
-
-        let summaries = generate_artifacts(
-            &pool,
-            &models,
-            &worksheet_id,
-            &ArtifactType::Summary,
-            Some(params.clone()),
-            None,
-        )
-        .await
-        .expect("summary generation should succeed");
-        assert_eq!(summaries.len(), 1, "summary is one worksheet-wide artifact");
-        let summary_value: serde_json::Value = serde_json::from_str(&summaries[0].content)
-            .expect("summary content should be valid JSON");
-        assert!(summary_value.get("summary").is_some());
-        assert!(summary_value.get("key_points").is_some());
-
-        let mind_maps = generate_artifacts(
-            &pool,
-            &models,
-            &worksheet_id,
-            &ArtifactType::MindMap,
-            Some(params),
-            None,
-        )
-        .await
-        .expect("mind map generation should succeed");
-        assert_eq!(mind_maps.len(), 1, "mind map is one worksheet-wide artifact");
-        let mind_map_value: serde_json::Value = serde_json::from_str(&mind_maps[0].content)
-            .expect("mind map content should be valid JSON");
-        assert!(mind_map_value.get("topic").is_some());
-        assert!(mind_map_value.get("branches").is_some());
+        let stored = get_artifacts(&pool, &worksheet_id, &ArtifactType::Summary, None)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
     }
 }

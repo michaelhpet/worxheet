@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
-export type ModelDownloadKind = "embedding" | "generation" | "tokenizer";
+export type ModelDownloadKind = "embedding";
 
 export interface ModelDownload {
 	kind: ModelDownloadKind;
@@ -18,8 +18,6 @@ interface ModelDownloadPayload {
 
 const KIND_LABELS: Record<ModelDownloadKind, string> = {
 	embedding: "Embedding model",
-	generation: "Generation model",
-	tokenizer: "Tokenizer",
 };
 
 export function modelDownloadLabel(kind: ModelDownloadKind): string {

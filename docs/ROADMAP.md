@@ -27,6 +27,17 @@ Core RAG pipeline for text-based documents.
 - [x] Dedicated quiz routes (`/mcq`, `/essay`, `/completion`) sharing a custom quiz shell: step wizard, countdown timer with auto-submit, submit/leave confirmation dialogs
 - [x] Client-side grading and results view (percentage + raw score, per-question breakdown, essay self-review against model answers)
 
+## Phase 1.5 — Cloud Generation Pivot (done)
+
+- [x] Drop local llama.cpp inference; generation via OpenAI-compatible providers (`provider/`: OpenAI, Gemini compat, Ollama, LM Studio, custom base URL)
+- [x] BYO API key stored in the OS keychain; Settings screen with presets, model listing, and connection test
+- [x] Embedder swap: `nomic-embed-text-v1.5` int8 ONNX via `ort`, vendored tokenizer, one-time ~137MB download
+- [x] Structure-aware parsing (PDF font-stat headings, Office markdown headings) feeding a hybrid segmenter (structure → embedding-drift → windows)
+- [x] Remove HDBSCAN clustering stack (`hdbscan-rs`, `linfa`, `ndarray`); exhaustive contiguous segments replace cluster sampling
+- [x] Parallel bulk generation: semaphore fan-out across all artifact types with request/token telemetry
+- [x] Deterministic validation layer: option normalization/uniqueness, answer-in-options, grounding ratio, figure-reference rejection, cross-unit dedup
+- [x] Hardened prompts: fixed item counts, media/meta-reference bans, formatting contract, MCQ exemplar
+
 ## Phase 2 — Document Coverage
 
 - [ ] Video → audio transcription (ffmpeg sidecar + Whisper GGUF)

@@ -20,6 +20,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
+import { openSettings } from "@/lib/settings-bus";
 import {
 	IconChevronLeft,
 	IconChevronRight,
@@ -29,6 +30,7 @@ import {
 	IconList,
 	IconPlus,
 	IconSelector,
+	IconSettings,
 	IconTable,
 	IconTrash,
 } from "@tabler/icons-react";
@@ -114,6 +116,14 @@ function Home() {
 				<header className="flex items-center justify-between px-6 py-4 border-b">
 					<h1 className="text-xl font-semibold">Worksheets</h1>
 					<div className="flex items-center gap-3">
+						<Button
+							variant="ghost"
+							size="icon-sm"
+							aria-label="Preferences"
+							onClick={() => openSettings()}
+						>
+							<IconSettings />
+						</Button>
 						<div className="flex items-center gap-1 rounded-lg border p-0.5">
 							{viewModes.map(({ mode, icon: Icon, label }) => (
 								<Button

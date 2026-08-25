@@ -2,110 +2,90 @@
 
 ## Overview
 
-This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, chunk, store, embed, cluster, generate, persist — runs automatically in the background after a worksheet is created: creating a worksheet with files starts a job that exhausts the material end-to-end, and the frontend just waits for it to finish and then shows the artifacts. Generation runs one unit per HDBSCAN topic cluster (question types produce one or more items each; `Summary`/`MindMap` yield a single worksheet-wide artifact).
+This document describes the artifact-generation pipeline as implemented. The full path — upload, parse, segment, store, embed, generate, persist — runs automatically in the background after a worksheet is created: creating a worksheet with files starts a job that exhausts the material end-to-end, and the frontend just waits for it to finish and then shows the artifacts.
+
+Generation is **cloud-hosted**: every worksheet sends one request per `(artifact_type, segment)` pair to an OpenAI-compatible LLM provider (OpenAI, Google Gemini's compatibility endpoint, Ollama, LM Studio, or any custom base URL), fanned out under a configurable concurrency limit. Everything before generation — parsing, segmentation, embedding — stays fully local; only segment texts leave the device at generation time. Deterministic local validation gates every model output before it can be persisted.
 
 ## Pipeline Steps
 
 ```
-Create worksheet ─► Parse ─► Chunk ─► Store ─► Embed ─► Cluster ─► Generate ─► Persist
-   [automatic — pipeline/jobs.rs background job + SQLite]
+Create worksheet ─► Parse ─► Segment ─► Store+Embed ─► Generate (cloud) ─► Validate ─► Persist
+                     [local]   [local]     [local ONNX]    [provider API]      [local]
 ```
-
-## Step-by-Step
 
 ### 1. Upload (automatic kick-off)
 
-`create_worksheet` inserts the worksheet and registers each selected file in the `files` table (path, name, extension, size). When the worksheet is created with at least one file, the command also calls `pipeline::jobs::start_job`, which spawns the background pipeline for that worksheet. The frontend wiring lives in `create-worksheet-dialog.tsx`.
+`create_worksheet` inserts the worksheet, registers each selected file in the `files` table, and calls `pipeline::jobs::start_job`, which spawns the background pipeline. The frontend wiring lives in `create-worksheet-dialog.tsx`; creation is blocked with a pointer to Settings until a provider is configured.
 
-### 2. Parse
+### 2. Parse (`pipeline/ingest.rs`)
 
-`pipeline/ingest.rs::parse_file` extracts text from each uploaded file:
+Parsers emit typed **blocks** (`Heading(level)` / `Body`) instead of flat text so structure survives downstream:
 
-| Format | Parser |
+| Format | Parser | Structure source |
+|---|---|---|
+| PDF | `pdf_oxide` | span-level extraction + font-size histogram heading detection; plain page text fallback |
+| PPTX, DOCX, PPT, DOC | `office_oxide` | markdown export split on `#` headings |
+
+Files are parsed on bounded parallel worker threads (`std::thread::available_parallelism` waves).
+
+### 3. Segment (`pipeline/segment.rs`)
+
+The segmenter turns blocks into contiguous, ordered units — coverage of the material is exhaustive by construction:
+
+1. **Structure-first**: every heading starts a new candidate section; body runs pack up to `TARGET_SEGMENT_TOKENS` (1100). Oversized single paragraphs are pre-split into sentences.
+2. **Drift fallback**: any section above `DRIFT_TRIGGER_TOKENS` (450) is checked for internal topic shifts — sentence embeddings are compared across consecutive sentences, smoothed, and cut at confident valleys (`mean − 0.75σ` local minima).
+3. **Hard windows**: unbreakable text is token-windowed at `MAX_SEGMENT_TOKENS` (1800).
+
+Undersized neighbors sharing a breadcrumb merge; every input token lands in exactly one segment. There is no chunk overlap and no noise class — both failure modes of the previous HDBSCAN scheme are structurally impossible.
+
+### 4. Store + Embed (`pipeline/ingest.rs`)
+
+Segments insert into the `chunks` table (id, position, heading breadcrumb, text) inside one transaction. Each segment is embedded locally by `embedder.rs` — `nomic-embed-text-v1.5`, int8-quantized ONNX (~137MB, downloaded once), mean-pooled + L2-normalized via ORT — and stored as a float32 BLOB.
+
+### 5. Provider resolution (`pipeline/jobs.rs::resolve_backend`)
+
+Per run, the active `ProviderConfig` (Tauri state) joins its API key from the OS keychain and builds an `OpenAiClient`. Unconfigured or missing-key worksheets fail fast with an actionable message.
+
+### 6. Generate (`pipeline/generate.rs::generate_all`)
+
+Units = `{5 artifact types} × {segments}` (evenly sampled past `MAX_UNITS_PER_TYPE` = 48). All units fan out onto a `tokio::Semaphore` sized by the user's concurrency setting (default 8).
+
+- **Structured outputs**: each request carries `response_format: json_schema` (strict mode); servers that reject it fall back to prompt-only JSON once.
+- **Prompt contract** (`system_prompt`): grounding-only facts, no figure/table/media references, no "the passage" meta-references, source-language matching, JSON-only output.
+- **Fixed item counts** per type (MCQ 4, essay 3, completion 4 per unit) make yield predictable; MCQ prompts embed one exemplar.
+- **Validation loop**: output is parsed and every item passes `pipeline/validate.rs`; failures trigger exactly one retry with fresh seed + corrective feedback listing rejection reasons; still-failing items drop individually.
+- **Cross-unit dedup**: near-duplicate questions (word-overlap Jaccard ≥ 0.75) are suppressed across segments.
+- **Summary/MindMap**: per-segment section objects merge deterministically into one worksheet-wide artifact (no extra call) — full material coverage, unlike the old sampled-cluster cap.
+- Telemetry (request count, approx tokens in/out) streams through the existing progress events.
+
+### 7. Persist (`pipeline/mod.rs::persist_artifacts`)
+
+Validated artifacts insert into the `artifacts` table in one transaction and surface through `get_artifacts`.
+
+## Validation layer (`pipeline/validate.rs`)
+
+Pure functions, no LLM — the deterministic quality floor:
+
+| Check | Defect it kills |
 |---|---|
-| PDF | `pdf_oxide` (page-by-page extraction) |
-| PPTX, DOCX, PPT, DOC | `office_oxide` |
+| Option normalization (`A)`/`1.`/`-`/`•` stripping) | inconsistent choice formatting |
+| Case-insensitive option uniqueness | duplicated answer choices |
+| `answer ∈ options` exact match post-normalization | answer/index mismatches |
+| Completion answer must appear in source segment | invented answers |
+| Figure/media reference regexes | hallucinated references to invisible figures |
+| Lexical grounding ratio vs source segment | off-topic/hallucinated questions |
+| Cross-unit question similarity | duplicate questions from overlapping content |
 
-Output: raw text per file. Files are parsed and chunked on bounded parallel
-worker threads (`ingest.rs` dispatches waves sized to
-`std::thread::available_parallelism`).
+Every check has unit tests built from real observed defects.
 
-### 3. Chunk
+## Job runner (`pipeline/jobs.rs`)
 
-`pipeline/ingest.rs::chunk_text` splits extracted text into overlapping chunks sized by the HF `tokenizers` tokenizer.
+`PipelineJobs` (kept in Tauri state as `Arc<PipelineJobs>`) serializes pipelines behind a `tokio::sync::Mutex` gate:
 
-```
-Config:
-  chunk_size: 512 tokens
-  overlap: 128 tokens
-
-Example:
-  "CHAPTER 1: The Cell\nThe cell is the basic unit of life..."
-  → Chunk 0: tokens [0-512)
-  → Chunk 1: tokens [384-896)
-  → Chunk 2: tokens [768-1280)
-  ...
-```
-
-### 4. Store
-
-`pipeline/mod.rs::process_files` inserts each chunk into the `chunks` table with its worksheet/file reference and document position, then bumps `worksheets.updated_at`.
-
-```rust
-// pipeline/mod.rs — public entry point
-pub async fn process_files(
-    pool: &SqlitePool,
-    worksheet_id: &str,
-    file_ids: &[String],
-    models: &Arc<ModelPool>,
-    on_progress: Option<ProgressFn>,
-) -> Result<Vec<Chunk>, String>
-```
-
-The `embedding` BLOB column starts `NULL` and is populated by the embed step.
-
-### 5. Embed
-
-`pipeline/embed.rs::embed_missing_chunks` lazily loads the embedding model from `ModelPool` and runs `Embedder` (wraps `bge-small-en-v1.5`, Q8_0 GGUF, 384-dim). Un-embedded chunks are read from the DB, embedded (L2-normalized, so cosine similarity is a plain dot product), and written back to `chunks.embedding` as a float32 BLOB.
-
-```rust
-// pipeline/embed.rs — public entry points
-pub fn embedding_to_bytes(vec: &[f32]) -> Vec<u8>   // little-endian float32 BLOB
-pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> // reverse
-```
-
-### 6. Cluster
-
-`pipeline/cluster.rs::rebuild_clusters` runs HDBSCAN over all embedded chunks, persists one centroid per topic cluster into the `clusters` table, and writes each chunk's `cluster_index` (or NULL for noise). `min_cluster_size` scales as `n/200` clamped to `[3,16]`; tiny worksheets fall back to a single cluster.
-
-### 7. Generate
-
-`pipeline/generate.rs::generate_artifacts` wraps `Generator` (`SmolLM2-360M-Instruct`, Q8_0 GGUF, 8K context). It (1) splits the material into one context unit per topic cluster (HDBSCAN noise skipped, clusters ordered by source position), (2) builds a per-unit prompt, and (3) generates schema-constrained JSON. Question-style types persist one artifact per item (1-8 per cluster); `Summary` and `MindMap` merge every unit's section into one worksheet-wide artifact. Each unit derives its seed from the base (`seed + unit_index`) so an exhaustive batch never repeats.
-
-Best-effort: a unit whose output truncates or fails to parse is retried once with a doubled (capped 4096) token budget, then skipped so one bad cluster cannot discard the rest of the batch.
-
-Generation characteristics:
-
-- **Chat template**: prompts are built with the model's built-in chat template (system + user messages, `add_generation_prompt`).
-- **Grammar-constrained output**: the artifact JSON schema is compiled to a GBNF grammar (`json_schema_to_grammar`) and sampling runs under `LlamaSampler::grammar`. The model can only emit JSON matching the schema.
-- **Sampling chain**: `[grammar?, temp?, top_p, dist(seed)]` applied to the logits via `LlamaTokenDataArray::apply_sampler`. This manual array path is used deliberately to avoid the `llama-cpp-2` grammar-sampler crash on `sampler.sample(ctx, idx)` (utilityai/llama-cpp-rs#1007).
-- **Termination**: generation stops on the model's EOG token. When the grammar completes, the grammar sampler masks everything but EOG, so the loop ends cleanly.
-- **Parameters**: `temperature` (default 0.7), `top_p` (default 0.9), `max_tokens` (default 1024), `seed` (default 1234). Context window `N_CTX = 8192`, max prompt `6144` tokens.
-- **Artifact schemas**: `pipeline/generate.rs` provides one schema per artifact type — `MultipleChoiceQuiz`, `EssayQuiz`, `CompletionQuiz`, `Summary`, `MindMap` — with matching system + task prompt builders. Question-style schemas wrap 1-8 items in an array so one cluster yields multiple artifacts; `Summary`/`MindMap` keep single-object schemas whose per-cluster outputs the pipeline concatenates.
-
-### 8. Persist
-
-Validated artifacts are inserted into the `artifacts` table (with `artifact_type` and `source`) and listed back to the frontend by the `get_artifacts` command.
-
-## Job runner (pipeline/jobs.rs)
-
-`PipelineJobs` (kept in Tauri state as `Arc<PipelineJobs>`) runs one pipeline at a time:
-
-- A `tokio::sync::Mutex` gate serializes pipelines — only one llama.cpp inference job runs at once, regardless of how many worksheets are created quickly.
-- `start_job` marks the worksheet `running` in the DB and spawns the job on the Tauri async runtime.
-- `run_pipeline` → `process_files` (ingest + embed + cluster), clears the worksheet's existing `artifacts` rows, then generates each of the five artifact types in order.
-- Progress is persisted and streamed as a single `pipeline-progress` event; on completion the worksheet's `pipeline_status` is set to `done` (or `failed` with an error message in `pipeline_error`).
-- `resume_stale` runs at app startup and re-kicks any worksheet stuck in `running` (e.g. after a crash), so a job is never lost silently.
+- `start_job` marks the worksheet `running` and spawns the job.
+- `run_pipeline`: resolve backend → parse/segment/embed/store → clear stale artifacts → `generate_all` → persist.
+- Progress persists and streams as a single `pipeline-progress` event (`phase`, per-type completion counts, request/token counters).
+- `resume_stale` re-kicks any worksheet stuck in `running` at startup — including worksheets migrated from the old clustering pipeline.
 
 ## Data Model (SQLite)
 
@@ -129,13 +109,15 @@ CREATE TABLE files (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Segments live here (historical table name).
 CREATE TABLE chunks (
     id TEXT PRIMARY KEY,
     worksheet_id TEXT NOT NULL REFERENCES worksheets(id) ON DELETE CASCADE,
     file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
+    heading TEXT,                              -- nearest enclosing heading breadcrumb
     text TEXT NOT NULL,
-    embedding BLOB,                            -- 1536 bytes (384 × f32), NULL until embed step runs
+    embedding BLOB,                            -- 768 × f32 little-endian
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -149,55 +131,51 @@ CREATE TABLE artifacts (
 );
 ```
 
-Pipeline status columns were added by `migrations/20260816000000_pipeline_status.sql`.
+Migration `20260825000000_segments.sql` drops the `clusters` table, clears derived rows, adds `heading`, removes `cluster_index`, and re-kicks completed worksheets through the new pipeline.
 
 ## Connection to Frontend
 
-Exposed Tauri commands (`lib.rs` invoke handler):
+Exposed Tauri commands:
 
 - `get_file_metadata`
 - `get_worksheets`, `get_worksheet`, `create_worksheet`, `delete_worksheet`
-- `get_artifacts` — list a worksheet's artifacts for one type, optionally
-  capped at `count` randomly-selected items (used by the quiz pages to sample
-  questions)
-- `get_pipeline_status` — read the worksheet's current pipeline status
+- `get_artifacts` — list a worksheet's artifacts for one type, optionally capped at `count` randomly-selected items
+- `get_pipeline_status` — current pipeline status
+- `get_provider_status`, `set_provider_config`, `validate_provider`, `list_provider_models` — provider settings (keys stored in OS keychain via `keyring`, never returned to the frontend)
 
-`create_worksheet` starts the background job when files are provided; `delete_worksheet` stops/removes any in-flight job.
+Events:
 
-Progress event (listened via `@tauri-apps/api/event`):
+- `pipeline-progress` — `{ worksheet_id, status, phase, artifact_type, done, total, types_done, types_total, requests_done?, tokens_in?, tokens_out?, error }`
+- `model-download` — `{ kind: "embedding", done, total }` during the first-run ONNX fetch
 
-- `pipeline-progress` — `{ worksheet_id, status, phase, artifact_type, done, total, types_done, types_total, error }` emitted throughout the run
-- `model-download` — `{ kind, done, total }` while the first run downloads GGUFs
-
-The React worksheet detail route (`app/routes/worksheets.$id.tsx`) shows live
-progress while the pipeline runs (`usePipelineStatus` in `app/data/pipeline.ts`,
-polling `get_pipeline_status`). Once done it becomes a tabbed workspace: each
-quiz type opens a setup card (question count + optional timer) that launches a
-dedicated quiz route — `/worksheets/$id/mcq|essay|completion` — over artifacts
-sampled via `useArtifacts(id, type, count)`; see ARCHITECTURE.md's
-[Quiz Flow](ARCHITECTURE.md#quiz-flow) for the quiz architecture. There are no
-process/generate buttons — creating a worksheet is the entire generation
-interaction.
+Routes: `/settings` (provider setup), `/worksheets/$id` (live progress → tabbed workspace), `/worksheets/$id/mcq|essay|completion` (quizzes over sampled artifacts).
 
 ## Module Layout (core/src/)
 
 ```
 core/src/
-├── lib.rs              # register commands, manage AppState (database + models + jobs), resume_stale
+├── lib.rs              # register commands, AppState (database + embedder + providers + jobs)
 ├── main.rs             # Tauri entry
 ├── database.rs         # SQLite connection + migration runner
-├── models.rs           # GGUF/tokenizer paths + hf-hub download + lazy ModelPool + Embedder + Generator
-├── commands/           # thin #[tauri::command] wrappers (State → domain logic)
-│   ├── file.rs         # get_file_metadata command
-│   ├── worksheet.rs    # worksheet CRUD commands (create_worksheet starts a job)
-│   └── pipeline.rs     # get_artifacts, get_pipeline_status commands
+├── embedder.rs         # nomic-int8 ONNX embedder + model downloader + EmbedderPool
+├── assets/tokenizer.json  # vendored nomic tokenizer (embedded via include_str!)
+├── provider/
+│   ├── mod.rs          # ArtifactBackend trait, GenerateRequest, ProviderError
+│   ├── config.rs       # ProviderConfig presets, keychain storage, ProviderState
+│   ├── client.rs       # OpenAI-compatible client (retries, backoff, schema fallback)
+│   └── mock.rs         # scripted/routed mock backend for tests
+├── commands/           # thin #[tauri::command] wrappers
+│   ├── file.rs         # get_file_metadata
+│   ├── worksheet.rs    # worksheet CRUD (create_worksheet starts a job)
+│   ├── pipeline.rs     # get_artifacts, get_pipeline_status
+│   └── provider.rs     # provider settings commands
 ├── worksheet.rs        # worksheet CRUD + file metadata logic
-├── pipeline/           # background pipeline (testable cores)
-│   ├── mod.rs          # orchestration (process_files) + integration tests
-│   ├── ingest.rs       # parse_file + chunk_text + ingest loop (parallel parse waves)
-│   ├── embed.rs        # bge-small embeddings + BLOB encode/decode
-│   ├── cluster.rs      # HDBSCAN clustering + cluster_contexts + rebuild_clusters
-│   ├── generate.rs     # SmolLM2 grammar-constrained generation + assemble_artifacts
+├── pipeline/
+│   ├── mod.rs          # orchestration (process_files, load_segments, persist_artifacts)
+│   ├── ingest.rs       # block-aware parsers + parallel parse waves + segment persistence
+│   ├── segment.rs      # structure-first + drift-fallback segmenter
+│   ├── validate.rs     # deterministic output quality gates
+│   ├── generate.rs     # semaphore fan-out generation + assembly + telemetry
 │   └── jobs.rs         # PipelineJobs runner (start_job, resume_stale, get_status)
-└── schema.rs           # shared structs (Chunk, Artifact, ArtifactType, PipelineStatus, …)
+└── schema.rs           # shared structs (Segment, Artifact, ArtifactType, PipelineStatus, …)
 ```

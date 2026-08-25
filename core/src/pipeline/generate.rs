@@ -1,472 +1,335 @@
+//! Cloud-hosted artifact generation.
+//!
+//! Every segment feeds one request per artifact type; requests run under a
+//! semaphore so bulk generation stays inside provider rate limits. Model
+//! output is validated locally (`validate`): malformed or hallucinated items
+//! trigger one retry with fresh seed and corrective feedback, then failing
+//! items are dropped individually. Summary and MindMap are assembled
+//! deterministically from per-segment sections, so coverage is exhaustive.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sqlx::SqlitePool;
-use ulid::Ulid;
+use serde::{Deserialize, Serialize};
 
-use super::cluster::{self, MAX_CONTEXT_CHUNKS};
-use super::embed::embedding_to_bytes;
-use crate::models::ModelPool;
-use crate::schema::{Artifact, ArtifactType};
+use crate::provider::{ArtifactBackend, GenerateRequest};
+use crate::schema::{ArtifactType, Segment};
 
-pub use crate::models::GenerationParams;
+use super::validate::{self, ItemVerdict, references_missing_media, similarity};
 
-/// Progress callback invoked with `(units_done, units_total)` during generation.
-pub type ProgressFn = Arc<dyn Fn(usize, usize) + Send + Sync>;
+/// Sampling parameters applied to every generation request unless overridden.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GenerationParams {
+    pub temperature: f32,
+    pub max_tokens: i32,
+    pub seed: u64,
+}
 
-/// How many generation units run concurrently, each on its own thread with a
-/// reusable llama.cpp context.
-const GENERATION_CONCURRENCY: usize = 4;
+impl Default for GenerationParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            max_tokens: 2048,
+            seed: 1234,
+        }
+    }
+}
 
-/// Whole-worksheet types (Summary, MindMap) merge one section per generated
-/// unit; beyond this many topic clusters they sample units evenly instead of
-/// covering every cluster.
-const WORKSHEET_WIDE_SAMPLE: usize = 6;
+/// Items requested per unit, per artifact type.
+fn items_per_unit(artifact_type: &ArtifactType) -> usize {
+    match artifact_type {
+        ArtifactType::MultipleChoiceQuiz => 4,
+        ArtifactType::EssayQuiz => 3,
+        ArtifactType::CompletionQuiz => 4,
+        _ => 1,
+    }
+}
 
-/// Generate artifacts for a worksheet. Chunks missing embeddings are embedded
-/// on the fly. Question-style types (MCQ, essay, completion) exhaust the
-/// material one unit per topic cluster, each yielding one or more items that
-/// are persisted individually. Summary and MindMap produce one worksheet-wide
-/// artifact assembled from per-cluster sections in source order. HDBSCAN noise
-/// chunks are skipped. Every unit generates with a derived seed so a batch
-/// never repeats itself. Reports per-unit progress through `on_progress`.
-pub async fn generate_artifacts(
-    pool: &SqlitePool,
-    models: &Arc<ModelPool>,
-    worksheet_id: &str,
-    artifact_type: &ArtifactType,
-    params: Option<GenerationParams>,
-    on_progress: Option<ProgressFn>,
-) -> Result<Vec<Artifact>, String> {
-    let params = params.unwrap_or_default();
+/// Quiz types stay at their configured temperature; summarization benefits
+/// from cooler sampling regardless of global settings.
+fn temperature_for(artifact_type: &ArtifactType, params: &GenerationParams) -> f32 {
+    let _ = params;
+    match artifact_type {
+        ArtifactType::Summary => 0.3,
+        ArtifactType::MindMap => 0.4,
+        _ => params.temperature,
+    }
+}
 
-    let rows = sqlx::query_as::<_, (String, i32, String, Option<i32>, Option<Vec<u8>>)>(
-        "SELECT id, position, text, cluster_index, embedding
-         FROM chunks
-         WHERE worksheet_id = ?
-         ORDER BY position",
-    )
-    .bind(worksheet_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|_| String::from("Failed to query chunks"))?;
+fn max_tokens_for(artifact_type: &ArtifactType, params: &GenerationParams) -> i32 {
+    match artifact_type {
+        ArtifactType::Summary => params.max_tokens.min(700),
+        ArtifactType::MindMap => params.max_tokens.min(900),
+        _ => params.max_tokens,
+    }
+}
 
-    if rows.is_empty() {
+/// Safety valve: beyond this many segments per type, sample evenly instead of
+/// fanning out unbounded request counts.
+const MAX_UNITS_PER_TYPE: usize = 48;
+
+/// Progress tick emitted as units complete.
+#[derive(Clone, Copy, Debug)]
+pub struct GenerationTick {
+    pub done: usize,
+    pub total: usize,
+    pub types_done: usize,
+}
+
+/// Progress callback fired after every unit attempt.
+pub type ProgressFn = Arc<dyn Fn(GenerationTick) + Send + Sync>;
+
+/// An artifact ready to be persisted.
+pub struct PendingArtifact {
+    pub artifact_type: ArtifactType,
+    pub source: String,
+    pub content: String,
+}
+
+/// Aggregate telemetry for one generation run.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunTelemetry {
+    pub requests: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+struct Unit {
+    /// Position within [`ArtifactType::ALL`].
+    type_index: usize,
+    artifact_type: ArtifactType,
+    segment_id: String,
+    context: String,
+    /// Deterministic per-unit seed derivation input (document position).
+    seed_offset: u64,
+}
+
+fn build_units(segments: &[Segment]) -> Result<Vec<Unit>, String> {
+    if segments.is_empty() {
         return Err(String::from(
-            "No chunks found for this worksheet. Run process_files first.",
+            "No segments found for this worksheet. Run ingestion first.",
         ));
     }
 
-    let at_for_gen = artifact_type.clone();
-    let models = models.clone();
-    let on_progress = on_progress.clone();
-
-    let prepared = tauri::async_runtime::spawn_blocking(move || {
-        let embedder = models.embedder()?;
-
-        let mut ids: Vec<String> = Vec::with_capacity(rows.len());
-        let mut positions: Vec<i32> = Vec::with_capacity(rows.len());
-        let mut texts: Vec<String> = Vec::with_capacity(rows.len());
-        let mut labels: Vec<i32> = Vec::with_capacity(rows.len());
-        let mut missing: Vec<(String, String)> = Vec::new();
-
-        for (id, position, text, cluster_index, embedding) in rows {
-            ids.push(id.clone());
-            positions.push(position);
-            texts.push(text.clone());
-            labels.push(cluster_index.unwrap_or(-1));
-            if embedding.is_none() {
-                missing.push((id, text));
-            }
-        }
-
-        let mut new_blobs: Vec<(String, Vec<u8>)> = Vec::new();
-        if !missing.is_empty() {
-            let refs: Vec<&str> = missing.iter().map(|(_, text)| text.as_str()).collect();
-            let vectors = embedder.embed(&refs)?;
-            for ((id, _), vector) in missing.iter().zip(&vectors) {
-                new_blobs.push((id.clone(), embedding_to_bytes(vector)));
-            }
-        }
-
-        // One generation unit per topic cluster, ordered by source position.
-        // Legacy worksheets without any cluster fall back to a single unit that
-        // spreads its context evenly across the whole material.
-        let units = if labels.iter().any(|label| *label >= 0) {
-            cluster::cluster_contexts(&labels, &positions, MAX_CONTEXT_CHUNKS)
-        } else {
-            let all: Vec<usize> = (0..labels.len()).collect();
-            vec![cluster::pick_evenly(&all, MAX_CONTEXT_CHUNKS)]
-        };
-
-        if units.is_empty() {
-            return Err(String::from("No topic clusters found for this worksheet."));
-        }
-
-        let mut contexts: Vec<String> = Vec::with_capacity(units.len());
-        let mut unit_sources: Vec<String> = Vec::with_capacity(units.len());
-        for mut picked in units {
-            picked.sort_by(|a, b| positions[*a].cmp(&positions[*b]));
-            let mut context = String::new();
-            let mut chunk_ids: Vec<String> = Vec::with_capacity(picked.len());
-            for &index in &picked {
-                chunk_ids.push(ids[index].clone());
-                context.push_str(&texts[index]);
-                context.push('\n');
-            }
-            contexts.push(context);
-            unit_sources.push(chunk_ids.join(","));
-        }
-
-        // Whole-worksheet types read the material through an even sample of
-        // clusters; question-style types keep every cluster.
-        if matches!(at_for_gen, ArtifactType::Summary | ArtifactType::MindMap)
-            && contexts.len() > WORKSHEET_WIDE_SAMPLE
-        {
-            let keep = cluster::pick_evenly(
-                &(0..contexts.len()).collect::<Vec<usize>>(),
-                WORKSHEET_WIDE_SAMPLE,
-            );
-            let kept_contexts: Vec<String> = keep.iter().map(|&i| contexts[i].clone()).collect();
-            let kept_sources: Vec<String> =
-                keep.iter().map(|&i| unit_sources[i].clone()).collect();
-            contexts = kept_contexts;
-            unit_sources = kept_sources;
-        }
-
-        let total = contexts.len();
-        if let Some(on_progress) = &on_progress {
-            on_progress(0, total);
-        }
-
-        let generator = models.generator()?;
-        let system = system_prompt_for(&at_for_gen);
-        let grammar = llama_cpp_2::json_schema_to_grammar(schema_for(&at_for_gen))
-            .map_err(|e| format!("Failed to compile JSON schema into grammar: {e}"))?;
-
-        // Generate per unit on a best-effort basis: a unit that truncates or
-        // returns invalid output is retried once with a doubled token budget,
-        // then skipped if it still fails, so one bad cluster never discards an
-        // otherwise healthy batch. Units are distributed round-robin over
-        // worker threads, each reusing a single context for its whole queue.
-        let done = AtomicUsize::new(0);
-        let slots: Vec<Option<Result<String, String>>> = (0..total).map(|_| None).collect();
-        let results = Mutex::new(slots);
-        let failures = Mutex::new(Vec::<String>::new());
-
-        std::thread::scope(|scope| {
-            let workers = total.min(GENERATION_CONCURRENCY).max(1);
-            let threads_per_worker = (crate::models::cpu_threads() / workers as i32).max(1);
-
-            let mut queues: Vec<Vec<(usize, String)>> = vec![Vec::new(); workers];
-            for (index, context) in contexts.into_iter().enumerate() {
-                queues[index % workers].push((index, context));
-            }
-
-            for queue in queues {
-                let generator = generator.clone();
-                let grammar = grammar.clone();
-                let on_progress = on_progress.clone();
-                let done = &done;
-                let results = &results;
-                let failures = &failures;
-                let at = &at_for_gen;
-                let params = &params;
-                scope.spawn(move || {
-                    let mut ctx = match generator.context_with_threads(threads_per_worker) {
-                        Ok(ctx) => ctx,
-                        Err(error) => {
-                            failures.lock().unwrap().push(error);
-                            return;
-                        }
-                    };
-                    for (index, context) in queue {
-                        let attempt = (|| -> Result<String, String> {
-                            let mut unit_params = params.clone();
-                            unit_params.seed = params.seed.wrapping_add(index as u32);
-                            let user = user_message_for(at, &context);
-                            let prompt = generator.apply_chat_template(&system, &user)?;
-
-                            let mut output = generator.generate_in_context(
-                                &mut ctx,
-                                &prompt,
-                                Some(&grammar),
-                                &unit_params,
-                            )?;
-                            if !output_parses(at, &output) {
-                                let mut retry_params = unit_params.clone();
-                                retry_params.max_tokens =
-                                    unit_params.max_tokens.max(256).saturating_mul(2).min(4096);
-                                output = generator.generate_in_context(
-                                    &mut ctx,
-                                    &prompt,
-                                    Some(&grammar),
-                                    &retry_params,
-                                )?;
-                            }
-                            if !output_parses(at, &output) {
-                                return Err(format!("Model returned invalid JSON: {output}"));
-                            }
-                            Ok(output)
-                        })();
-
-                        match attempt {
-                            Ok(output) => {
-                                results.lock().unwrap()[index] = Some(Ok(output));
-                            }
-                            Err(error) => failures
-                                .lock()
-                                .unwrap()
-                                .push(format!("unit {}: {error}", index + 1)),
-                        }
-
-                        let finished = done.fetch_add(1, Ordering::SeqCst) + 1;
-                        if let Some(on_progress) = &on_progress {
-                            on_progress(finished, total);
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut failures = failures.into_inner().unwrap();
-        let results = results.into_inner().unwrap();
-
-        let mut outputs: Vec<String> = Vec::with_capacity(total);
-        let mut sources: Vec<String> = Vec::with_capacity(total);
-        for (index, slot) in results.into_iter().enumerate() {
-            match slot {
-                Some(Ok(output)) => {
-                    outputs.push(output);
-                    sources.push(unit_sources[index].clone());
-                }
-                other => {
-                    let error = other.and_then(|attempt| attempt.err()).unwrap_or_else(|| {
-                        String::from("worker failed without reporting an error")
-                    });
-                    failures.push(format!("unit {}: {error}", index + 1));
-                }
-            }
-        }
-
-        if outputs.is_empty() {
-            let detail = failures
-                .first()
-                .cloned()
-                .unwrap_or_else(|| String::from("no units produced output"));
-            return Err(format!(
-                "All {total} generation units failed; first error: {detail}"
-            ));
-        }
-
-        let pending = assemble_artifacts(&at_for_gen, outputs, &sources)?;
-
-        Ok::<_, String>((pending, new_blobs))
-    })
-    .await
-    .map_err(|e| format!("Generation task failed: {e}"))??;
-
-    let (pending, new_blobs) = prepared;
-
-    let mut transaction = pool
-        .begin()
-        .await
-        .map_err(|_| String::from("Failed to begin artifact transaction"))?;
-
-    for (id, blob) in &new_blobs {
-        sqlx::query("UPDATE chunks SET embedding = ? WHERE id = ?")
-            .bind(blob.clone())
-            .bind(id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| String::from("Failed to store embedding"))?;
-    }
-
-    let mut artifacts = Vec::with_capacity(pending.len());
-    for (source, content) in pending {
-        let artifact = Artifact {
-            id: Ulid::new().to_string(),
-            worksheet_id: worksheet_id.to_string(),
-            artifact_type: artifact_type.clone(),
-            source,
-            content,
-        };
-        sqlx::query(
-            "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&artifact.id)
-        .bind(worksheet_id)
-        .bind(artifact_type.to_db())
-        .bind(&artifact.source)
-        .bind(&artifact.content)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| String::from("Failed to persist artifact"))?;
-
-        artifacts.push(artifact);
-    }
-
-    transaction
-        .commit()
-        .await
-        .map_err(|_| String::from("Failed to commit generated artifacts"))?;
-
-    Ok(artifacts)
-}
-
-/// Whether an MCQ item's `answer` is a string that exactly matches one of its
-/// own `options`.
-fn mcq_item_answer_valid(item: &serde_json::Value) -> bool {
-    let Some(answer) = item.get("answer").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    item.get("options")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|options| {
-            options
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .any(|option| option == answer)
-        })
-}
-
-/// Whether a model output is valid JSON and, for question-style types, carries
-/// its item array. MCQ outputs additionally require every item's answer to be
-/// one of its options. Used to decide whether a unit needs a wider-budget retry.
-fn output_parses(artifact_type: &ArtifactType, output: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
-        return false;
-    };
-    match items_field_for(artifact_type) {
-        Some(field) => {
-            let Some(items) = value.get(field).and_then(serde_json::Value::as_array) else {
-                return false;
+    let mut units = Vec::new();
+    for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
+        let indices = pick_indices(segments.len(), MAX_UNITS_PER_TYPE);
+        for segment_index in indices {
+            let segment = &segments[segment_index];
+            let context = match &segment.heading {
+                Some(heading) => format!("[Section: {heading}]\n{}", segment.text),
+                None => segment.text.clone(),
             };
-            match artifact_type {
-                ArtifactType::MultipleChoiceQuiz => {
-                    items.iter().all(mcq_item_answer_valid)
-                }
-                _ => true,
-            }
+            units.push(Unit {
+                type_index,
+                artifact_type: artifact_type.clone(),
+                segment_id: segment.id.clone(),
+                context,
+                seed_offset: segment.position as u64 + 17,
+            });
         }
-        None => true,
     }
+    Ok(units)
 }
 
-/// Turn per-unit generation outputs into `(source, content)` artifact records.
-/// Question-style types split each unit's item array into one artifact per
-/// item; MCQ items whose answer does not match any option are dropped.
-/// Summary and MindMap merge every unit into a single worksheet-wide
-/// artifact ordered by source position.
-fn assemble_artifacts(
-    artifact_type: &ArtifactType,
-    outputs: Vec<String>,
-    unit_sources: &[String],
-) -> Result<Vec<(String, String)>, String> {
-    let parse_unit = |output: &str| -> Result<serde_json::Value, String> {
-        serde_json::from_str(output).map_err(|error| {
-            format!(
-                "Model returned invalid JSON for {}: {error}; got: {output}",
-                artifact_type.to_db()
-            )
-        })
+/// Evenly sample `cap` indices when there are more than `cap`, else all.
+fn pick_indices(total: usize, cap: usize) -> Vec<usize> {
+    if total <= cap {
+        return (0..total).collect();
+    }
+    let stride = total as f64 / cap as f64;
+    (0..cap)
+        .map(|index| (index as f64 * stride).floor() as usize)
+        .collect()
+}
+
+/// System contract shared by every request.
+fn system_prompt() -> &'static str {
+    "You create study materials strictly grounded in supplied source material.\n\
+     Non-negotiable rules:\n\
+     1. Use only facts stated in the source material. Never invent details.\n\
+     2. Never reference figures, tables, diagrams, charts, images, page numbers,\n\
+        slides, or any media that is not literally included in the source text.\n\
+     3. Never write self-referential wording such as \"the passage\", \"the document\",\n\
+        \"the source\", or \"this section\" inside question text.\n\
+     4. Write in the same language as the source material.\n\
+     5. Reply with exactly one JSON object matching the required schema and nothing else."
+}
+
+const MCQ_EXAMPLE: &str = r#"Example question object:
+{"question":"During aerobic respiration, where does the citric acid cycle occur?",
+ "options":["Mitochondrial matrix","Cell nucleus","Ribosome","Golgi apparatus"],
+ "answer":"Mitochondrial matrix",
+ "explanation":"The cycle runs in the matrix, producing NADH for oxidative phosphorylation."}"#;
+
+fn user_prompt(artifact_type: &ArtifactType, count: usize, context: &str) -> String {
+    let task = match artifact_type {
+        ArtifactType::MultipleChoiceQuiz => format!(
+            "Write exactly {count} multiple-choice questions testing analysis, application, or \
+             evaluation of the material below. For every question:\n\
+             - Exactly 4 answer options in plain text: no lettering, numbering, or bullet marks.\n\
+             - Options must be mutually exclusive, comparable in length, plausible but clearly\n\
+             wrong to someone who knows the material. Never offer options like \"all of the above\".\n\
+             - Exactly one correct answer, written verbatim as one of the options.\n\
+             - Vary the position of the correct answer across questions.\n\
+             - One-sentence explanation citing the supporting fact.\n\
+             - Do not repeat near-identical questions.\n{MCQ_EXAMPLE}"
+        ),
+        ArtifactType::EssayQuiz => format!(
+            "Write exactly {count} essay questions requiring students to explain, compare, or \
+             evaluate ideas from the material below. Each needs clear instructions and a concise \
+             model answer grounded in the material."
+        ),
+        ArtifactType::CompletionQuiz => format!(
+            "Write exactly {count} fill-in-the-blank statements drawn from the material below. \
+             Mark each blank with ____________ . The expected answer must appear word-for-word in \
+             the material. Add a short hint per statement."
+        ),
+        ArtifactType::Summary => String::from(
+            "Summarize this slice of the material: a short title, a focused paragraph capturing \
+             its main ideas, and three to five key points.",
+        ),
+        ArtifactType::MindMap => String::from(
+            "Extract the topic of this slice of the material and its major branches. Up to six \
+             branches, each with up to six short child concepts drawn from the material.",
+        ),
     };
+    format!("{task}\n\nSource material:\n\"\"\"\n{context}\n\"\"\"")
+}
 
-    if let Some(field) = items_field_for(artifact_type) {
-        let mut pending = Vec::new();
-        for (output, source) in outputs.iter().zip(unit_sources) {
-            let value = parse_unit(output)?;
-            let items = value
-                .get(field)
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    format!(
-                        "Model output for {} is missing the \"{field}\" array; got: {output}",
-                        artifact_type.to_db()
-                    )
-                })?;
-            for item in items {
-                if matches!(artifact_type, ArtifactType::MultipleChoiceQuiz)
-                    && !mcq_item_answer_valid(item)
-                {
-                    continue;
-                }
-                pending.push((source.clone(), item.to_string()));
-            }
-        }
-        return Ok(pending);
+fn retry_feedback(reasons: &[String]) -> String {
+    let mut feedback =
+        String::from("\n\nYour previous reply was rejected for these reasons; fix them and return the full corrected JSON object:\n");
+    for reason in reasons.iter().take(5) {
+        feedback.push_str(&format!("- {reason}\n"));
     }
+    feedback
+}
 
-    let mut title = String::new();
-    let mut topic = String::new();
-    let mut summaries: Vec<String> = Vec::new();
-    let mut key_points: Vec<String> = Vec::new();
-    let mut branches: Vec<serde_json::Value> = Vec::new();
+// --- Schemas (strict-mode friendly: every property listed in `required`,
+// `additionalProperties: false` everywhere) ---
 
-    for output in &outputs {
-        let value = parse_unit(output)?;
-        match artifact_type {
-            ArtifactType::Summary => {
-                if title.is_empty() {
-                    title = value
-                        .get("title")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Worksheet summary")
-                        .to_string();
-                }
-                if let Some(summary) = value.get("summary").and_then(serde_json::Value::as_str) {
-                    summaries.push(summary.trim().to_string());
-                }
-                if let Some(points) = value
-                    .get("key_points")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    key_points.extend(
-                        points
-                            .iter()
-                            .filter_map(|point| point.as_str().map(ToString::to_string)),
-                    );
-                }
-            }
-            ArtifactType::MindMap => {
-                if topic.is_empty() {
-                    topic = value
-                        .get("topic")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Overview")
-                        .to_string();
-                }
-                if let Some(unit_branches) =
-                    value.get("branches").and_then(serde_json::Value::as_array)
-                {
-                    branches.extend(unit_branches.iter().cloned());
-                }
-            }
-            _ => unreachable!("items_field_for covers every question-style type"),
-        }
-    }
+fn string_array(min_items: usize, max_items: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "minItems": min_items,
+        "maxItems": max_items,
+    })
+}
 
-    let content = match artifact_type {
+pub fn schema_for(artifact_type: &ArtifactType, items: usize) -> serde_json::Value {
+    match artifact_type {
+        ArtifactType::MultipleChoiceQuiz => serde_json::json!({
+            "type": "object",
+            "properties": { "questions": mcq_questions_schema(items) },
+            "required": ["questions"],
+            "additionalProperties": false,
+        }),
+        ArtifactType::EssayQuiz => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": items,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string" },
+                            "instructions": { "type": "string" },
+                            "model_answer": { "type": "string" },
+                        },
+                        "required": ["question", "instructions", "model_answer"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["questions"],
+            "additionalProperties": false,
+        }),
+        ArtifactType::CompletionQuiz => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": items,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sentence": { "type": "string" },
+                            "answer": { "type": "string" },
+                            "hint": { "type": "string" },
+                        },
+                        "required": ["sentence", "answer", "hint"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["items"],
+            "additionalProperties": false,
+        }),
         ArtifactType::Summary => serde_json::json!({
-            "title": title,
-            "summary": summaries.join("\n\n"),
-            "key_points": key_points,
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "summary": { "type": "string" },
+                "key_points": string_array(3, 5),
+            },
+            "required": ["title", "summary", "key_points"],
+            "additionalProperties": false,
         }),
         ArtifactType::MindMap => serde_json::json!({
-            "topic": topic,
-            "branches": branches,
+            "type": "object",
+            "properties": {
+                "topic": { "type": "string" },
+                "branches": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "children": string_array(1, 6),
+                        },
+                        "required": ["label", "children"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["topic", "branches"],
+            "additionalProperties": false,
         }),
-        _ => unreachable!("items_field_for covers every question-style type"),
     }
-    .to_string();
-
-    Ok(vec![(unit_sources.join(","), content)])
 }
 
-/// The JSON array field holding per-cluster items for a question-style artifact
-/// type. Whole-worksheet types (Summary, MindMap) return `None`.
-pub fn items_field_for(artifact_type: &ArtifactType) -> Option<&'static str> {
+fn mcq_questions_schema(items: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": items,
+        "items": {
+            "type": "object",
+            "properties": {
+                "question": { "type": "string" },
+                "options": {
+                    "type": "array",
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "items": { "type": "string" },
+                },
+                "answer": { "type": "string" },
+                "explanation": { "type": "string" },
+            },
+            "required": ["question", "options", "answer", "explanation"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+fn items_field(artifact_type: &ArtifactType) -> Option<&'static str> {
     match artifact_type {
         ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz => Some("questions"),
         ArtifactType::CompletionQuiz => Some("items"),
@@ -474,266 +337,426 @@ pub fn items_field_for(artifact_type: &ArtifactType) -> Option<&'static str> {
     }
 }
 
-/// JSON schema constraining the generated artifact for a given type.
-///
-/// Question-style types wrap their items in an array so a single cluster can
-/// yield one or more questions; every item is persisted as its own artifact.
-/// Summary and MindMap use a single object per cluster, which the pipeline
-/// concatenates into one worksheet-wide artifact.
-pub fn schema_for(artifact_type: &ArtifactType) -> &'static str {
-    match artifact_type {
-        ArtifactType::MultipleChoiceQuiz => {
-            r#"{
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": { "type": "string" },
-                            "options": { "type": "array", "items": { "type": "string" }, "minItems": 4, "maxItems": 4 },
-                            "answer": { "type": "string" },
-                            "explanation": { "type": "string" }
-                        },
-                        "required": ["question", "options", "answer", "explanation"]
+const MIN_MCQ_GROUNDING: f32 = 0.15;
+const MIN_COMPLETION_GROUNDING: f32 = 0.5;
+const DUPLICATE_QUESTION_SIMILARITY: f32 = 0.75;
+
+struct ValidatedOutput {
+    /// Serialized item objects (or whole section objects).
+    items: Vec<String>,
+    rejection_reasons: Vec<String>,
+}
+
+fn validate_unit_output(
+    artifact_type: &ArtifactType,
+    raw: &str,
+    source_segment: &str,
+    seen_questions: &[String],
+) -> ValidatedOutput {
+    fn rejected(reasons: &mut Vec<String>, message: String) -> ValidatedOutput {
+        reasons.push(message);
+        ValidatedOutput {
+            items: Vec::new(),
+            rejection_reasons: reasons.clone(),
+        }
+    }
+
+    let mut rejection_reasons = Vec::new();
+    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(value) => value,
+        Err(error) => return rejected(&mut rejection_reasons, format!("output is not valid JSON: {error}")),
+    };
+
+    if references_missing_media(raw) {
+        rejection_reasons.push(String::from("output references figures/media absent from the source"));
+    }
+
+    match items_field(artifact_type) {
+        Some(field) => {
+            let Some(entries) = value.get(field).and_then(serde_json::Value::as_array) else {
+                return rejected(&mut rejection_reasons, format!("missing \"{field}\" array"));
+            };
+
+            let mut items = Vec::new();
+            for entry in entries {
+                let verdict = match artifact_type {
+                    ArtifactType::MultipleChoiceQuiz => {
+                        validate::validate_mcq_item(entry, source_segment, MIN_MCQ_GROUNDING)
                     }
-                }
-            },
-            "required": ["questions"]
-        }"#
-        }
-        ArtifactType::EssayQuiz => {
-            r#"{
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": { "type": "string" },
-                            "instructions": { "type": "string" },
-                            "model_answer": { "type": "string" }
-                        },
-                        "required": ["question", "instructions", "model_answer"]
+                    ArtifactType::EssayQuiz => validate::validate_essay_item(entry),
+                    _ => {
+                        validate::validate_completion_item(entry, source_segment, MIN_COMPLETION_GROUNDING)
                     }
-                }
-            },
-            "required": ["questions"]
-        }"#
-        }
-        ArtifactType::CompletionQuiz => {
-            r#"{
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "sentence": { "type": "string" },
-                            "answer": { "type": "string" },
-                            "hint": { "type": "string" }
-                        },
-                        "required": ["sentence", "answer", "hint"]
-                    }
-                }
-            },
-            "required": ["items"]
-        }"#
-        }
-        ArtifactType::Summary => {
-            r#"{
-            "type": "object",
-            "properties": {
-                "title": { "type": "string" },
-                "summary": { "type": "string" },
-                "key_points": { "type": "array", "items": { "type": "string" }, "minItems": 3, "maxItems": 6 }
-            },
-            "required": ["title", "summary", "key_points"]
-        }"#
-        }
-        ArtifactType::MindMap => {
-            r#"{
-            "type": "object",
-            "properties": {
-                "topic": { "type": "string" },
-                "branches": {
-                    "type": "array",
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": { "type": "string" },
-                            "children": {
-                                "type": "array",
-                                "maxItems": 12,
-                                "items": { "type": "string" }
+                };
+
+                match verdict {
+                    ItemVerdict::Accepted(mut accepted) => {
+                        // Cross-unit near-duplicate suppression.
+                        if matches!(artifact_type, ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz) {
+                            let question = accepted["question"].as_str().unwrap_or_default().to_string();
+                            let duplicate = seen_questions.iter().any(|seen| {
+                                similarity(seen, &question) >= DUPLICATE_QUESTION_SIMILARITY
+                            });
+                            if duplicate {
+                                continue;
                             }
-                        },
-                        "required": ["label", "children"]
+                            accepted["question"] = serde_json::Value::String(question);
+                        }
+                        items.push(accepted.to_string());
                     }
+                    ItemVerdict::Rejected(reason) => rejection_reasons.push(reason),
                 }
-            },
-            "required": ["topic", "branches"]
-        }"#
+            }
+            ValidatedOutput { items, rejection_reasons }
+        }
+        None => {
+            // Whole-worksheet section objects get structural checks only;
+            // deterministic merging downstream guarantees coverage.
+            let shape_ok = match artifact_type {
+                ArtifactType::Summary => {
+                    value.get("summary").is_some_and(serde_json::Value::is_string)
+                        && value.get("key_points").is_some_and(serde_json::Value::is_array)
+                }
+                _ => {
+                    value.get("topic").is_some_and(serde_json::Value::is_string)
+                        && value.get("branches").is_some_and(serde_json::Value::is_array)
+                }
+            };
+            if shape_ok {
+                ValidatedOutput {
+                    items: vec![value.to_string()],
+                    rejection_reasons,
+                }
+            } else {
+                rejected(
+                    &mut rejection_reasons,
+                    format!("expected a {} object with the documented fields", artifact_type.to_db()),
+                )
+            }
         }
     }
 }
 
-/// System prompt used when building the chat template for a generation call.
-pub fn system_prompt_for(_artifact_type: &ArtifactType) -> &'static str {
-    "You are an educational assessment generator. Base every answer strictly \
-     on the provided source passages. Reply only with valid JSON matching the schema."
+fn approximate_tokens(text: &str) -> u64 {
+    (text.len() as u64 / 4).max(1)
 }
 
-/// User-facing instructions for the requested artifact type. `context` holds the
-/// retrieved source chunks.
-pub fn user_message_for(artifact_type: &ArtifactType, context: &str) -> String {
-    let task = match artifact_type {
-        ArtifactType::MultipleChoiceQuiz => {
-            "Generate between one and eight multiple-choice questions testing \
-             higher-order thinking (analysis, application, or evaluation), drawn \
-             from the passages. Every question must have exactly 4 plausible \
-             options and the correct answer given as a string that exactly \
-             matches one of those options."
+/// What one unit produced.
+struct UnitOutcome {
+    /// `(item_json, …)` serialized outputs ready for assembly.
+    items: Vec<String>,
+    requests_made: usize,
+    tokens_in: u64,
+    tokens_out: u64,
+}
+
+async fn run_unit(
+    backend: &Arc<dyn ArtifactBackend>,
+    unit: &Unit,
+    params: &GenerationParams,
+    seen_questions: &Mutex<Vec<String>>,
+) -> UnitOutcome {
+    let mut requests_made = 0usize;
+    let mut tokens_in = 0u64;
+    let mut tokens_out = 0u64;
+
+    let count = items_per_unit(&unit.artifact_type);
+    let system = system_prompt().to_string();
+    let schema_name = unit.artifact_type.to_db().to_string();
+    let schema = schema_for(&unit.artifact_type, count);
+    let base_seed = params.seed.wrapping_add(unit.seed_offset);
+    let base_user = user_prompt(&unit.artifact_type, count, &unit.context);
+
+    let make_request = |seed: u64, user: String| GenerateRequest {
+        system: system.clone(),
+        user,
+        schema_name: schema_name.clone(),
+        schema: schema.clone(),
+        temperature: temperature_for(&unit.artifact_type, params),
+        max_tokens: max_tokens_for(&unit.artifact_type, params),
+        seed,
+    };
+
+    let mut user = base_user.clone();
+    let mut validated;
+
+    let raw = match backend.generate_json(&make_request(base_seed, user.clone())).await {
+        Ok(raw) => {
+            requests_made += 1;
+            tokens_in += approximate_tokens(&system) + approximate_tokens(&user);
+            tokens_out += approximate_tokens(&raw);
+            raw
         }
-        ArtifactType::EssayQuiz => {
-            "Generate between one and eight essay questions requiring students to \
-             explain, compare, or evaluate concepts from the passages, each with \
-             clear instructions and a model answer."
-        }
-        ArtifactType::CompletionQuiz => {
-            "Generate between one and eight fill-in-the-blank sentences drawn from \
-             the passages, each with the expected answer and a hint."
-        }
-        ArtifactType::Summary => {
-            "Write a focused summary section for this slice of the source, \
-             capturing its main ideas and key points."
-        }
-        ArtifactType::MindMap => {
-            "Extract the topic covered by this slice of the source and its major \
-             branches, each branch with a short list of child concepts."
+        Err(error) => {
+            eprintln!("[pipeline] unit failed ({schema_name}): {error}");
+            return UnitOutcome { items: Vec::new(), requests_made, tokens_in, tokens_out };
         }
     };
-    format!("{task}\n\nPassages:\n{context}")
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use llama_cpp_2::json_schema_to_grammar;
+    validated = validate_unit_output(&unit.artifact_type, &raw, &unit.context, &seen_questions.lock().unwrap());
 
-    #[test]
-    fn test_all_schemas_compile_to_grammar() {
-        for artifact_type in [
-            ArtifactType::MultipleChoiceQuiz,
-            ArtifactType::EssayQuiz,
-            ArtifactType::CompletionQuiz,
-            ArtifactType::Summary,
-            ArtifactType::MindMap,
-        ] {
-            let schema = schema_for(&artifact_type);
-            let grammar = json_schema_to_grammar(schema).unwrap_or_else(|error| {
-                panic!("{artifact_type:?} schema should compile into grammar: {error}")
-            });
-            assert!(!grammar.is_empty());
+    if validated.items.is_empty() && !validated.rejection_reasons.is_empty() {
+        user.push_str(&retry_feedback(&validated.rejection_reasons));
+        match backend.generate_json(&make_request(base_seed.wrapping_add(7_919), user)).await {
+            Ok(retry_raw) => {
+                requests_made += 1;
+                tokens_out += approximate_tokens(&retry_raw);
+                validated = validate_unit_output(
+                    &unit.artifact_type,
+                    &retry_raw,
+                    &unit.context,
+                    &seen_questions.lock().unwrap(),
+                );
+            }
+            Err(error) => {
+                eprintln!("[pipeline] unit retry failed ({schema_name}): {error}");
+            }
         }
     }
 
-    #[test]
-    fn test_items_field_for() {
-        assert_eq!(
-            items_field_for(&ArtifactType::MultipleChoiceQuiz),
-            Some("questions")
+    // Register surviving questions for cross-unit duplicate detection.
+    if !validated.items.is_empty()
+        && matches!(unit.artifact_type, ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz)
+    {
+        let mut seen = seen_questions.lock().unwrap();
+        for item in &validated.items {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(item) {
+                if let Some(question) = value.get("question").and_then(serde_json::Value::as_str) {
+                    seen.push(question.to_string());
+                }
+            }
+        }
+    }
+
+    if validated.items.is_empty() {
+        eprintln!(
+            "[pipeline] dropping unit ({schema_name}): {}",
+            validated.rejection_reasons.first().cloned().unwrap_or_default()
         );
-        assert_eq!(items_field_for(&ArtifactType::EssayQuiz), Some("questions"));
-        assert_eq!(
-            items_field_for(&ArtifactType::CompletionQuiz),
-            Some("items")
-        );
-        assert_eq!(items_field_for(&ArtifactType::Summary), None);
-        assert_eq!(items_field_for(&ArtifactType::MindMap), None);
     }
 
-    #[test]
-    fn test_mcq_output_parses_requires_matching_answer() {
-        let matching = serde_json::json!({
-            "questions": [
-                { "question": "q", "options": ["a", "b"], "answer": "b", "explanation": "e" }
-            ]
-        });
-        assert!(output_parses(
-            &ArtifactType::MultipleChoiceQuiz,
-            &matching.to_string()
-        ));
+    UnitOutcome {
+        items: validated.items,
+        requests_made,
+        tokens_in,
+        tokens_out,
+    }
+}
 
-        let index_answer = serde_json::json!({
-            "questions": [
-                { "question": "q", "options": ["a", "b"], "answer": 1, "explanation": "e" }
-            ]
-        });
-        assert!(!output_parses(
-            &ArtifactType::MultipleChoiceQuiz,
-            &index_answer.to_string()
-        ));
+/// Output recorded per finished unit.
+struct UnitRecord {
+    type_index: usize,
+    segment_id: String,
+    items: Vec<String>,
+}
 
-        let mismatched = serde_json::json!({
-            "questions": [
-                { "question": "q", "options": ["a", "b"], "answer": "c", "explanation": "e" }
-            ]
-        });
-        assert!(!output_parses(
-            &ArtifactType::MultipleChoiceQuiz,
-            &mismatched.to_string()
-        ));
+/// Generate artifacts for every type across all segments under a concurrency
+/// limit. Returns pending artifacts plus aggregate telemetry.
+pub async fn generate_all(
+    backend: Arc<dyn ArtifactBackend>,
+    concurrency: usize,
+    segments: &[Segment],
+    params: Option<GenerationParams>,
+    on_progress: Option<ProgressFn>,
+) -> Result<(Vec<PendingArtifact>, RunTelemetry), String> {
+    let params = params.unwrap_or_default();
+    let units = build_units(segments)?;
+    let total_units = units.len();
+
+    let mut totals_per_type = [0usize; ArtifactType::ALL.len()];
+    for unit in &units {
+        totals_per_type[unit.type_index] += 1;
+    }
+    let completed_per_type: Arc<Vec<AtomicUsize>> = Arc::new(
+        (0..ArtifactType::ALL.len()).map(|_| AtomicUsize::new(0)).collect(),
+    );
+    let completed_types = Arc::new(AtomicUsize::new(0));
+
+    if let Some(on_progress) = &on_progress {
+        on_progress(GenerationTick { done: 0, total: total_units, types_done: 0 });
     }
 
-    #[test]
-    fn test_assemble_drops_mismatched_mcq_items() {
-        let good = serde_json::json!({
-            "question": "kept",
-            "options": ["a", "b", "c", "d"],
-            "answer": "a",
-            "explanation": "e"
-        });
-        let bad = serde_json::json!({
-            "question": "dropped",
-            "options": ["a", "b", "c", "d"],
-            "answer": "z",
-            "explanation": "e"
-        });
-        let output = serde_json::json!({ "questions": [good, bad] }).to_string();
+    let records: Arc<Mutex<Vec<Option<UnitRecord>>>> =
+        Arc::new(Mutex::new((0..total_units).map(|_| None).collect()));
+    let seen_questions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32)));
+    let telemetry = Arc::new(Mutex::new(RunTelemetry::default()));
+    let done_counter = Arc::new(AtomicUsize::new(0));
 
-        let assembled =
-            assemble_artifacts(&ArtifactType::MultipleChoiceQuiz, vec![output], &["src".to_string()])
-                .expect("assembly should succeed");
+    let mut handles = Vec::with_capacity(total_units);
+    for (unit_index, unit) in units.into_iter().enumerate() {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
+        let backend = backend.clone();
+        let params = params.clone();
+        let records = records.clone();
+        let seen_questions = seen_questions.clone();
+        let telemetry = telemetry.clone();
+        let done_counter = done_counter.clone();
+        let completed_per_type = completed_per_type.clone();
+        let _ = &completed_per_type;
+        let completed_types = completed_types.clone();
+        let on_progress = on_progress.clone();
 
-        assert_eq!(assembled.len(), 1);
-        let kept: serde_json::Value = serde_json::from_str(&assembled[0].1).unwrap();
-        assert_eq!(kept["question"], "kept");
+        handles.push(tokio::spawn(async move {
+            let outcome = run_unit(&backend, &unit, &params, &seen_questions).await;
+
+            {
+                let mut stats = telemetry.lock().unwrap();
+                stats.requests += outcome.requests_made;
+                stats.tokens_in += outcome.tokens_in;
+                stats.tokens_out += outcome.tokens_out;
+            }
+
+            records.lock().unwrap()[unit_index] = Some(UnitRecord {
+                type_index: unit.type_index,
+                segment_id: unit.segment_id.clone(),
+                items: outcome.items,
+            });
+
+            let finished = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let completed = completed_per_type[unit.type_index].fetch_add(1, Ordering::Relaxed) + 1;
+            let mut types_done = 0usize;
+            if completed == totals_per_type[unit.type_index] {
+                types_done = completed_types.fetch_add(1, Ordering::Relaxed) + 1;
+            }
+
+            if let Some(on_progress) = &on_progress {
+                on_progress(GenerationTick { done: finished, total: total_units, types_done });
+            }
+
+            drop(permit);
+        }));
     }
 
-    #[test]
-    fn test_assemble_keeps_non_mcq_items_verbatim() {
-        let item = serde_json::json!({
-            "sentence": "The __ is the powerhouse.",
-            "answer": "mitochondrion",
-            "hint": "organelle"
-        });
-        let output = serde_json::json!({ "items": [item] }).to_string();
+    for handle in handles {
+        handle.await.map_err(|e| format!("Generation task failed: {e}"))?;
+    }
 
-        let assembled =
-            assemble_artifacts(&ArtifactType::CompletionQuiz, vec![output], &["src".to_string()])
-                .expect("assembly should succeed");
+    let telemetry = *telemetry.lock().unwrap();
+    let records: Vec<Option<UnitRecord>> =
+        records.lock().unwrap().drain(..).collect();
 
-        assert_eq!(assembled.len(), 1);
+    let pending = assemble_pending(&records);
+    Ok((pending, telemetry))
+}
+
+fn assemble_pending(records: &[Option<UnitRecord>]) -> Vec<PendingArtifact> {
+    let mut pending = Vec::new();
+
+    for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
+        let sections: Vec<(String, serde_json::Value)> = records
+            .iter()
+            .flatten()
+            .filter(|record| record.type_index == type_index && !record.items.is_empty())
+            .flat_map(|record| {
+                record
+                    .items
+                    .iter()
+                    .filter_map(|item| serde_json::from_str::<serde_json::Value>(item).ok())
+                    .map(|value| (record.segment_id.clone(), value))
+            })
+            .collect();
+
+        if sections.is_empty() {
+            continue;
+        }
+
+        if items_field(artifact_type).is_some() {
+            // One artifact per generated item.
+            for (source, value) in sections {
+                pending.push(PendingArtifact {
+                    artifact_type: artifact_type.clone(),
+                    source,
+                    content: value.to_string(),
+                });
+            }
+        } else if let Some(content) = merge_sections(artifact_type, &sections) {
+            // One worksheet-wide artifact merged deterministically.
+            pending.push(PendingArtifact {
+                artifact_type: artifact_type.clone(),
+                source: sections
+                    .iter()
+                    .map(|(source, _)| source.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                content,
+            });
+        }
+    }
+
+    pending
+}
+
+/// Deterministically merge per-segment section objects into a single
+/// worksheet-wide artifact. No extra LLM call: concatenation preserves order
+/// and guarantees nothing sampled away.
+fn merge_sections(
+    artifact_type: &ArtifactType,
+    sections: &[(String, serde_json::Value)],
+) -> Option<String> {
+    match artifact_type {
+        ArtifactType::Summary => {
+            let title = sections
+                .iter()
+                .find_map(|(_, value)| value.get("title").and_then(serde_json::Value::as_str))
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("Worksheet summary");
+
+            let mut paragraphs = Vec::new();
+            let mut key_points: Vec<String> = Vec::new();
+            for (_, value) in sections {
+                if let Some(summary) = value.get("summary").and_then(serde_json::Value::as_str) {
+                    let trimmed = summary.trim();
+                    if !trimmed.is_empty() {
+                        paragraphs.push(trimmed.to_string());
+                    }
+                }
+                if let Some(points) = value.get("key_points").and_then(serde_json::Value::as_array) {
+                    for point in points.iter().filter_map(serde_json::Value::as_str) {
+                        if !key_points.contains(&point.to_string()) {
+                            key_points.push(point.to_string());
+                        }
+                    }
+                }
+            }
+            key_points.truncate(12);
+
+            Some(
+                serde_json::json!({
+                    "title": title,
+                    "summary": paragraphs.join("\n\n"),
+                    "key_points": key_points,
+                })
+                .to_string(),
+            )
+        }
+        ArtifactType::MindMap => {
+            let topic = sections
+                .iter()
+                .find_map(|(_, value)| value.get("topic").and_then(serde_json::Value::as_str))
+                .filter(|topic| !topic.trim().is_empty())
+                .unwrap_or("Overview");
+
+            let mut branches: Vec<serde_json::Value> = Vec::new();
+            for (_, value) in sections {
+                if let Some(section_branches) = value.get("branches").and_then(serde_json::Value::as_array) {
+                    branches.extend(section_branches.iter().cloned());
+                }
+            }
+            branches.truncate(24);
+
+            Some(
+                serde_json::json!({
+                    "topic": topic,
+                    "branches": branches,
+                })
+                .to_string(),
+            )
+        }
+        _ => None,
     }
 }

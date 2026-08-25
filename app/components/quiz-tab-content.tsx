@@ -29,6 +29,15 @@ const QUIZ_TYPE_MULTIPLIER: Partial<Record<ArtifactType, number>> = {
 	EssayQuiz: 10,
 };
 
+const QUIZ_ROUTES: Record<
+	QuizArtifactType,
+	"/worksheets/$id/mcq" | "/worksheets/$id/essay" | "/worksheets/$id/completion"
+> = {
+	[ARTIFACT_TYPES.MultipleChoiceQuiz]: "/worksheets/$id/mcq",
+	[ARTIFACT_TYPES.EssayQuiz]: "/worksheets/$id/essay",
+	[ARTIFACT_TYPES.CompletionQuiz]: "/worksheets/$id/completion",
+};
+
 export function QuizTabContent({ worksheet, artifactType }: Props) {
 	const navigate = useNavigate();
 	const quizType = artifactType.value as QuizArtifactType;
@@ -92,7 +101,7 @@ export function QuizTabContent({ worksheet, artifactType }: Props) {
 				<Button
 					onClick={() =>
 						navigate({
-							to: "/worksheets/$id/mcq",
+							to: QUIZ_ROUTES[quizType],
 							params: { id: worksheet.id },
 							search: { count, time: timed ?? undefined },
 						})

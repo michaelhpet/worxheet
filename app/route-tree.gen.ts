@@ -12,6 +12,8 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WorksheetsIdRouteImport } from './routes/worksheets.$id'
 import { Route as WorksheetsIdMcqRouteImport } from './routes/worksheets_.$id.mcq'
+import { Route as WorksheetsIdEssayRouteImport } from './routes/worksheets_.$id.essay'
+import { Route as WorksheetsIdCompletionRouteImport } from './routes/worksheets_.$id.completion'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -28,34 +30,68 @@ const WorksheetsIdMcqRoute = WorksheetsIdMcqRouteImport.update({
   path: '/worksheets/$id/mcq',
   getParentRoute: () => rootRouteImport,
 } as any)
+const WorksheetsIdEssayRoute = WorksheetsIdEssayRouteImport.update({
+  id: '/worksheets_/$id/essay',
+  path: '/worksheets/$id/essay',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const WorksheetsIdCompletionRoute = WorksheetsIdCompletionRouteImport.update({
+  id: '/worksheets_/$id/completion',
+  path: '/worksheets/$id/completion',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/worksheets/$id': typeof WorksheetsIdRoute
+  '/worksheets/$id/completion': typeof WorksheetsIdCompletionRoute
+  '/worksheets/$id/essay': typeof WorksheetsIdEssayRoute
   '/worksheets/$id/mcq': typeof WorksheetsIdMcqRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/worksheets/$id': typeof WorksheetsIdRoute
+  '/worksheets/$id/completion': typeof WorksheetsIdCompletionRoute
+  '/worksheets/$id/essay': typeof WorksheetsIdEssayRoute
   '/worksheets/$id/mcq': typeof WorksheetsIdMcqRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/worksheets/$id': typeof WorksheetsIdRoute
+  '/worksheets_/$id/completion': typeof WorksheetsIdCompletionRoute
+  '/worksheets_/$id/essay': typeof WorksheetsIdEssayRoute
   '/worksheets_/$id/mcq': typeof WorksheetsIdMcqRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/worksheets/$id' | '/worksheets/$id/mcq'
+  fullPaths:
+    | '/'
+    | '/worksheets/$id'
+    | '/worksheets/$id/completion'
+    | '/worksheets/$id/essay'
+    | '/worksheets/$id/mcq'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/worksheets/$id' | '/worksheets/$id/mcq'
-  id: '__root__' | '/' | '/worksheets/$id' | '/worksheets_/$id/mcq'
+  to:
+    | '/'
+    | '/worksheets/$id'
+    | '/worksheets/$id/completion'
+    | '/worksheets/$id/essay'
+    | '/worksheets/$id/mcq'
+  id:
+    | '__root__'
+    | '/'
+    | '/worksheets/$id'
+    | '/worksheets_/$id/completion'
+    | '/worksheets_/$id/essay'
+    | '/worksheets_/$id/mcq'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   WorksheetsIdRoute: typeof WorksheetsIdRoute
+  WorksheetsIdCompletionRoute: typeof WorksheetsIdCompletionRoute
+  WorksheetsIdEssayRoute: typeof WorksheetsIdEssayRoute
   WorksheetsIdMcqRoute: typeof WorksheetsIdMcqRoute
 }
 
@@ -82,12 +118,28 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WorksheetsIdMcqRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/worksheets_/$id/essay': {
+      id: '/worksheets_/$id/essay'
+      path: '/worksheets/$id/essay'
+      fullPath: '/worksheets/$id/essay'
+      preLoaderRoute: typeof WorksheetsIdEssayRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/worksheets_/$id/completion': {
+      id: '/worksheets_/$id/completion'
+      path: '/worksheets/$id/completion'
+      fullPath: '/worksheets/$id/completion'
+      preLoaderRoute: typeof WorksheetsIdCompletionRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   WorksheetsIdRoute: WorksheetsIdRoute,
+  WorksheetsIdCompletionRoute: WorksheetsIdCompletionRoute,
+  WorksheetsIdEssayRoute: WorksheetsIdEssayRoute,
   WorksheetsIdMcqRoute: WorksheetsIdMcqRoute,
 }
 export const routeTree = rootRouteImport

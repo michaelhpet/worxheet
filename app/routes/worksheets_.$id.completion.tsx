@@ -1,8 +1,7 @@
-import { QuizChoice, QuizShell, type QuizItem } from "@/components/quiz-shell";
+import { quizInputClasses, QuizShell, type QuizItem } from "@/components/quiz-shell";
 import { useArtifacts } from "@/data/artifacts";
 import { ARTIFACT_TYPES } from "@/lib/constants";
-import type { McqContent } from "@/lib/types";
-import { RadioGroup } from "@/components/ui/radio-group";
+import type { CompletionContent } from "@/lib/types";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo } from "react";
 import { z } from "zod";
@@ -12,24 +11,24 @@ const searchSchema = z.object({
 	time: z.number().optional(),
 });
 
-export const Route = createFileRoute("/worksheets_/$id/mcq")({
+export const Route = createFileRoute("/worksheets_/$id/completion")({
 	validateSearch: (search) => searchSchema.parse(search),
-	component: McqQuizPage,
+	component: CompletionQuizPage,
 });
 
-function McqQuizPage() {
+function CompletionQuizPage() {
 	const { id } = Route.useParams();
 	const { count, time } = Route.useSearch();
-	const { data: artifacts, isLoading } = useArtifacts(id, ARTIFACT_TYPES.MultipleChoiceQuiz, count);
+	const { data: artifacts, isLoading } = useArtifacts(id, ARTIFACT_TYPES.CompletionQuiz, count);
 
 	const questions: QuizItem[] = useMemo(() => {
 		if (!artifacts) return [];
 		return artifacts.map((artifact) => {
-			const content = JSON.parse(artifact.content) as McqContent;
+			const content = JSON.parse(artifact.content) as CompletionContent;
 			return {
 				name: artifact.id,
-				title: content.question,
-				choices: content.options.map((option) => ({ value: option, label: option })),
+				title: content.sentence,
+				description: `Hint: ${content.hint}`,
 				expected: content.answer,
 			};
 		});
@@ -42,11 +41,13 @@ function McqQuizPage() {
 			items={questions}
 			time={time}
 			renderAnswer={(item) => (
-				<RadioGroup name={item.name}>
-					{(item.choices ?? []).map((choice) => (
-						<QuizChoice key={choice.value} option={choice} />
-					))}
-				</RadioGroup>
+				<input
+					type="text"
+					name={item.name}
+					autoComplete="off"
+					placeholder="Type your answer..."
+					className={quizInputClasses}
+				/>
 			)}
 		/>
 	);

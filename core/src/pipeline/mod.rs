@@ -1,11 +1,9 @@
-//! Pipeline orchestration: parse → segment → embed → store → generate →
-//! persist. Generation is cloud-hosted through an [`ArtifactBackend`]; every
-//! other stage is fully local.
+//! Pipeline orchestration: parse → segment → store → generate → persist.
+//! Generation is cloud-hosted through an [`ArtifactBackend`]; every other
+//! stage is fully local.
 
 use sqlx::SqlitePool;
-use std::sync::Arc;
 
-use crate::embedder::Embedder;
 use crate::schema::{Artifact, ArtifactType, Segment};
 
 pub mod generate;
@@ -19,23 +17,22 @@ pub use jobs::{
     get_status, remove_job, resolve_backend, resume_stale, start_job, PipelineJobs,
 };
 
-/// Parse, segment, embed, and persist every file of a worksheet. Reports
-/// progress as each file completes through `on_progress`.
+/// Parse, segment, and persist every file of a worksheet. Reports progress as
+/// each file completes through `on_progress`.
 pub async fn process_files(
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     tokenizer: tokenizers::Tokenizer,
-    embedder: Arc<Embedder>,
     on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
 ) -> Result<Vec<Segment>, String> {
-    ingest::process_files(pool, worksheet_id, file_ids, tokenizer, embedder, on_progress).await
+    ingest::process_files(pool, worksheet_id, file_ids, tokenizer, on_progress).await
 }
 
 /// Load a worksheet's stored segments in document order.
 pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<Segment>, String> {
-    let rows = sqlx::query_as::<_, (String, String, i32, Option<String>, String, Option<Vec<u8>>)>(
-        "SELECT id, file_id, position, heading, text, embedding
+    let rows = sqlx::query_as::<_, (String, String, i32, Option<String>, String)>(
+        "SELECT id, file_id, position, heading, text
          FROM chunks
          WHERE worksheet_id = ?
          ORDER BY position",
@@ -47,14 +44,13 @@ pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<
 
     Ok(rows
         .into_iter()
-        .map(|(id, file_id, position, heading, text, embedding)| Segment {
+        .map(|(id, file_id, position, heading, text)| Segment {
             id,
             worksheet_id: worksheet_id.to_string(),
             file_id,
             position,
             heading,
             text,
-            embedding: embedding.map(|_| Vec::new()),
         })
         .collect())
 }
@@ -141,6 +137,7 @@ pub async fn get_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::provider::mock::MockBackend;
     use crate::provider::{ArtifactBackend, ProviderError};
     use crate::pipeline::generate::GenerationParams;
@@ -219,7 +216,6 @@ mod tests {
                          releasing ash and lava onto the surrounding landscape.",
                     )
                 },
-                embedding: None,
             })
             .collect()
     }

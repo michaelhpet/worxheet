@@ -5,17 +5,17 @@
 //! resolution happens per run so settings changes apply immediately.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sqlx::{Pool, Sqlite};
 use tauri::{AppHandle, Emitter};
 
-use crate::embedder::{self, EmbedderPool};
 use crate::provider::{
     self, config::ProviderState, client::OpenAiClient, ArtifactBackend,
 };
 use crate::schema::{ArtifactType, PipelineStatus};
+
+use super::segment;
 
 /// Live in-memory state of a running pipeline. The authoritative
 /// `running`/`done`/`failed` marker lives on the worksheet row so it survives
@@ -52,8 +52,6 @@ impl Default for PipelineJobs {
 pub fn start_job(
     app: AppHandle,
     pool: Pool<Sqlite>,
-    embedder_pool: Arc<EmbedderPool>,
-    models_dir: PathBuf,
     providers: Arc<ProviderState>,
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
@@ -78,16 +76,7 @@ pub fn start_job(
 
     tauri::async_runtime::spawn(async move {
         let _guard = jobs.gate.lock().await;
-        run_job(
-            &app,
-            &pool,
-            &embedder_pool,
-            &models_dir,
-            &providers,
-            &jobs,
-            &worksheet_id,
-        )
-        .await;
+        run_job(&app, &pool, &providers, &jobs, &worksheet_id).await;
     });
 }
 
@@ -96,8 +85,6 @@ pub fn start_job(
 pub async fn resume_stale(
     app: AppHandle,
     pool: Pool<Sqlite>,
-    embedder_pool: Arc<EmbedderPool>,
-    models_dir: PathBuf,
     providers: Arc<ProviderState>,
     jobs: Arc<PipelineJobs>,
 ) {
@@ -112,8 +99,6 @@ pub async fn resume_stale(
         start_job(
             app.clone(),
             pool.clone(),
-            embedder_pool.clone(),
-            models_dir.clone(),
             providers.clone(),
             jobs.clone(),
             worksheet_id,
@@ -182,13 +167,11 @@ pub async fn get_status(
 async fn run_job(
     app: &AppHandle,
     pool: &Pool<Sqlite>,
-    embedder_pool: &Arc<EmbedderPool>,
-    models_dir: &Path,
     providers: &Arc<ProviderState>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
 ) {
-    let result = run_pipeline(app, pool, embedder_pool, models_dir, providers, jobs, worksheet_id).await;
+    let result = run_pipeline(app, pool, providers, jobs, worksheet_id).await;
 
     let (status, error) = match result {
         Ok(()) => (String::from("done"), None),
@@ -243,8 +226,6 @@ pub fn resolve_backend(
 async fn run_pipeline(
     app: &AppHandle,
     pool: &Pool<Sqlite>,
-    embedder_pool: &Arc<EmbedderPool>,
-    models_dir: &Path,
     providers: &Arc<ProviderState>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
@@ -269,11 +250,10 @@ async fn run_pipeline(
     // Resolve the cloud backend before doing any local work so a missing
     // configuration fails fast with an actionable message.
     let (backend, concurrency) = resolve_backend(providers)?;
-    let embedder = embedder_pool.get(models_dir).await?;
-    let tokenizer = embedder::bundled_tokenizer()?;
+    let tokenizer = segment::bundled_tokenizer()?;
 
     let on_ingest = progress_sink(app, jobs, worksheet_id);
-    super::process_files(pool, worksheet_id, &file_ids, tokenizer, embedder, Some(on_ingest)).await?;
+    super::process_files(pool, worksheet_id, &file_ids, tokenizer, Some(on_ingest)).await?;
 
     // Clear stale artifacts before regenerating so a re-run never duplicates.
     sqlx::query("DELETE FROM artifacts WHERE worksheet_id = ?")

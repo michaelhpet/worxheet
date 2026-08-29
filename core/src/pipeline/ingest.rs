@@ -1,14 +1,12 @@
 //! File parsing + segmentation + persistence.
 //!
 //! Parsers emit typed [`Block`]s (headings vs body) so the segmenter can
-//! exploit document structure before falling back to embedding-drift
-//! boundaries. Files are parsed on parallel worker threads; resulting
-//! segments are stored in one transaction.
+//! exploit document structure. Files are parsed on parallel worker threads;
+//! resulting segments are stored in one transaction.
 
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
-use crate::embedder::Embedder;
 use crate::schema::Segment;
 
 use super::segment::{self, Block, BlockKind, SegmentDraft};
@@ -179,14 +177,13 @@ fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
     Ok(blocks)
 }
 
-/// Parse every file, segment it, embed segments, and persist them in source
-/// order. Reports progress as each file completes.
+/// Parse every file, segment it, and persist the segments in source order.
+/// Reports progress as each file completes.
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     tokenizer: Tokenizer,
-    embedder: std::sync::Arc<Embedder>,
     mut on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
 ) -> Result<Vec<Segment>, String> {
     let total_files = file_ids.len();
@@ -223,13 +220,12 @@ pub async fn process_files(
             let index = start + offset;
             let tx = tx.clone();
             let tokenizer = tokenizer.clone();
-            let embedder = embedder.clone();
             let path = path.clone();
             let extension = extension.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let result = (|| -> Result<Vec<SegmentDraft>, String> {
                     let blocks = parse_blocks(&path, &extension)?;
-                    Ok(segment::segment_blocks(blocks, &tokenizer, embedder.as_ref()))
+                    Ok(segment::segment_blocks(blocks, &tokenizer))
                 })();
                 let _ = tx.blocking_send((index, result));
             });
@@ -249,23 +245,14 @@ pub async fn process_files(
         start = end;
     }
 
-    // Embed all drafts in document order (one call keeps vectors aligned).
+    // Flatten drafts in document order, then persist in one transaction.
     let flat: Vec<&SegmentDraft> = segmented.iter().flatten().flatten().collect();
     if flat.is_empty() {
         return Ok(Vec::new());
     }
-    let texts: Vec<String> = flat
-        .iter()
-        .map(|draft| match &draft.heading {
-            Some(heading) => format!("{heading}\n{}", draft.text),
-            None => draft.text.clone(),
-        })
-        .collect();
-    let vectors = embedder.embed(&texts)?;
 
     let mut all_segments = Vec::with_capacity(flat.len());
     let mut position_counter = 0i32;
-    let mut vector_cursor = 0usize;
 
     let mut transaction = pool
         .begin()
@@ -281,13 +268,11 @@ pub async fn process_files(
                 .heading
                 .clone()
                 .filter(|heading| !heading.trim().is_empty());
-            let embedding = vectors.get(vector_cursor).cloned();
-            vector_cursor += 1;
 
             let segment_id = ulid::Ulid::new().to_string();
             sqlx::query(
-                "INSERT INTO chunks (id, worksheet_id, file_id, position, heading, text, embedding)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO chunks (id, worksheet_id, file_id, position, heading, text)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&segment_id)
             .bind(worksheet_id)
@@ -295,7 +280,6 @@ pub async fn process_files(
             .bind(position_counter)
             .bind(&heading_text)
             .bind(&draft.text)
-            .bind(embedding.as_ref().map(|vector| embedding_to_bytes(vector)))
             .execute(&mut *transaction)
             .await
             .map_err(|_| String::from("Failed to insert segment"))?;
@@ -307,7 +291,6 @@ pub async fn process_files(
                 position: position_counter,
                 heading: heading_text,
                 text: draft.text,
-                embedding,
             });
             position_counter += 1;
         }
@@ -327,11 +310,6 @@ pub async fn process_files(
     Ok(all_segments)
 }
 
-/// Serialize a float32 vector into little-endian bytes for a SQLite BLOB.
-fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
-    embedding.iter().flat_map(|value| value.to_le_bytes()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,12 +325,5 @@ mod tests {
     fn test_parse_missing_file() {
         let path = format!("{}/nonexistent.pdf", FIXTURE_DIR);
         assert!(parse_blocks(&path, "pdf").is_err());
-    }
-
-    #[test]
-    fn test_embedding_roundtrip_bytes() {
-        let vector = vec![0.1f32, -0.5, 3.25];
-        let bytes = embedding_to_bytes(&vector);
-        assert_eq!(bytes.len(), 12);
     }
 }

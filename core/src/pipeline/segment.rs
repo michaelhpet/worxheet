@@ -1,14 +1,13 @@
 //! Turns parsed document blocks into contiguous, ordered generation units.
 //!
 //! Strategy: structure first (every heading starts a new candidate section,
-//! sections are packed up to [`TARGET_SEGMENT_TOKENS`]), then embedding-drift
-//! splitting for any oversized structureless stretch, then plain token-window
-//! packing as the last resort. Every input token lands in exactly one
-//! segment: coverage is exhaustive by construction.
+//! sections are packed up to [`TARGET_SEGMENT_TOKENS`]), then token-bounded
+//! sentence packing for any oversized structureless stretch. Every input token
+//! lands in exactly one segment: coverage is exhaustive by construction. The
+//! segmentation is purely structural — the vendored tokenizer (bundled into the
+//! binary) provides token-count semantics, so no external model is required.
 
 use tokenizers::Tokenizer;
-
-use crate::embedder::Embedder;
 
 /// Preferred size of one segment.
 pub const TARGET_SEGMENT_TOKENS: usize = 1_100;
@@ -40,15 +39,11 @@ pub struct SegmentDraft {
     pub text: String,
 }
 
-/// Source of sentence embeddings for drift detection.
-pub trait SentenceEmbedder {
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
-}
-
-impl SentenceEmbedder for Embedder {
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        Embedder::embed(self, texts)
-    }
+/// Load the tokenizer vendored into the binary. Parseable offline; used for
+/// token-count semantics in tests and ingest without any model download.
+pub fn bundled_tokenizer() -> Result<Tokenizer, String> {
+    const TOKENIZER_JSON: &str = include_str!("../../assets/tokenizer.json");
+    Tokenizer::from_bytes(TOKENIZER_JSON).map_err(|e| format!("Failed to parse bundled tokenizer: {e}"))
 }
 
 fn token_count(tokenizer: &Tokenizer, text: &str) -> usize {
@@ -168,56 +163,6 @@ pub fn pack_sections(blocks: &[Block], tokenizer: &Tokenizer) -> Vec<SegmentDraf
     drafts
 }
 
-/// Cosine similarity between two equal-length vectors.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm = a.iter().map(|v| v * v).sum::<f32>().sqrt()
-        * b.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > f32::EPSILON {
-        dot / norm
-    } else {
-        1.0
-    }
-}
-
-/// Indices where topic shifts occur: consecutive-sentence similarities are
-/// smoothed over a 3-wide window, and a shift is kept only when the smoothed
-/// value dips below `mean - deviation_scale × std` while being a local minimum.
-pub fn drift_boundaries(similarities: &[f32], deviation_scale: f32) -> Vec<usize> {
-    if similarities.is_empty() {
-        return Vec::new();
-    }
-
-    let mut smoothed = similarities.to_vec();
-    for index in 0..similarities.len() {
-        let window = [
-            similarities[index.saturating_sub(1)],
-            similarities[index],
-            similarities[(index + 1).min(similarities.len() - 1)],
-        ];
-        smoothed[index] = window.iter().sum::<f32>() / window.len() as f32;
-    }
-
-    let mean = smoothed.iter().sum::<f32>() / smoothed.len() as f32;
-    let variance =
-        smoothed.iter().map(|value| (value - mean).powi(2)).sum::<f32>() / smoothed.len() as f32;
-    let threshold = mean - deviation_scale * variance.sqrt();
-
-    let mut boundaries = Vec::new();
-    for index in 0..smoothed.len() {
-        let value = smoothed[index];
-        if value >= threshold {
-            continue;
-        }
-        let left_ok = index == 0 || smoothed[index - 1] >= value;
-        let right_ok = index == smoothed.len() - 1 || smoothed[index + 1] >= value;
-        if left_ok && right_ok {
-            boundaries.push(index + 1); // cut AFTER sentence `index`
-        }
-    }
-    boundaries
-}
-
 fn hard_token_windows(text: &str, tokenizer: &Tokenizer) -> Vec<String> {
     let Ok(encoding) = tokenizer.encode(text, true) else {
         return vec![text.to_string()];
@@ -261,70 +206,41 @@ fn hard_windows_fallback(section: &SegmentDraft, tokenizer: &Tokenizer) -> Vec<S
         .collect()
 }
 
-/// Drift-split an oversized section: embed its sentences, find topic-shift
-/// boundaries, regroup within token bounds.
-fn drift_split(
+/// Split an oversized section structurally: pack its sentences into
+/// token-bounded groups (no embedding model needed). Long sections are broken
+/// at sentence boundaries to fit within [`MAX_SEGMENT_TOKENS`].
+fn structural_split(
     section: &SegmentDraft,
     tokenizer: &Tokenizer,
-    embedder: &dyn SentenceEmbedder,
 ) -> Vec<SegmentDraft> {
     let sentences = split_sentences(&section.text);
     if sentences.len() < 6 || token_count(tokenizer, &section.text) <= DRIFT_TRIGGER_TOKENS {
         return vec![section.clone()];
     }
 
-    let Ok(embedded) = embedder.embed(&sentences) else {
-        return hard_windows_fallback(section, tokenizer);
-    };
-    if embedded.len() != sentences.len() {
-        return hard_windows_fallback(section, tokenizer);
-    }
-
-    let similarities: Vec<f32> = (0..sentences.len() - 1)
-        .map(|index| cosine(&embedded[index], &embedded[index + 1]))
-        .collect();
-    let boundaries = drift_boundaries(&similarities, 0.75);
-    if boundaries.is_empty() {
-        return hard_windows_fallback(section, tokenizer);
-    }
-
-    let mut groups: Vec<Vec<String>> = Vec::new();
-    let mut current_group: Vec<String> = Vec::new();
-    for (index, sentence) in sentences.iter().enumerate() {
-        current_group.push(sentence.clone());
-        if boundaries.contains(&(index + 1)) {
-            groups.push(std::mem::take(&mut current_group));
-        }
-    }
-    if !current_group.is_empty() {
-        groups.push(current_group);
-    }
-
+    let groups: Vec<Vec<String>> = sentences.into_iter().map(|sentence| vec![sentence]).collect();
     let mut drafts = enforce_token_bounds(groups, tokenizer);
+    if drafts.is_empty() {
+        return hard_windows_fallback(section, tokenizer);
+    }
+
     for draft in &mut drafts {
         if draft.heading.is_none() {
             draft.heading = section.heading.clone();
         }
     }
-    if drafts.is_empty() {
-        drafts.push(section.clone());
-    }
     drafts
 }
 
 /// Full segmentation pipeline for one file's parsed blocks.
-pub fn segment_blocks(
-    blocks: Vec<Block>,
-    tokenizer: &Tokenizer,
-    embedder: &dyn SentenceEmbedder,
-) -> Vec<SegmentDraft> {
+pub fn segment_blocks(blocks: Vec<Block>, tokenizer: &Tokenizer) -> Vec<SegmentDraft> {
     let sections = pack_sections(&blocks, tokenizer);
     let mut drafts = Vec::new();
     for section in sections {
         if token_count(tokenizer, &section.text) <= DRIFT_TRIGGER_TOKENS {
             drafts.push(section);
         } else {
-            drafts.extend(drift_split(&section, tokenizer, embedder));
+            drafts.extend(structural_split(&section, tokenizer));
         }
     }
     merge_undersized(drafts, tokenizer)
@@ -363,32 +279,10 @@ fn merge_undersized(mut drafts: Vec<SegmentDraft>, tokenizer: &Tokenizer) -> Vec
 mod tests {
     use super::*;
 
-    /// Deterministic two-topic embedder: photosynthesis words map to one
-    /// vector, volcano words to another, everything else in between.
-    struct TopicEmbedder;
-
-    impl SentenceEmbedder for TopicEmbedder {
-        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-            Ok(texts
-                .iter()
-                .map(|text| {
-                    if text.to_lowercase().contains("photosynth") {
-                        vec![1.0, 0.0]
-                    } else if text.to_lowercase().contains("volcano") || text.to_lowercase().contains("magma") {
-                        vec![0.0, 1.0]
-                    } else {
-                        vec![0.7, 0.7]
-                    }
-                })
-                .collect())
-        }
-    }
-
     // The bundled production tokenizer keeps token-count semantics honest in
     // tests without downloading any model artifact.
     fn test_tokenizer() -> Tokenizer {
-        Tokenizer::from_bytes(include_str!("../../assets/tokenizer.json"))
-            .expect("bundled tokenizer should parse")
+        bundled_tokenizer().expect("bundled tokenizer should parse")
     }
 
     fn block(kind: BlockKind, text: &str) -> Block {
@@ -428,19 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn test_drift_boundaries_finds_valley_between_topics() {
-        let similarities = vec![0.95, 0.93, 0.42, 0.94, 0.96];
-        let boundaries = drift_boundaries(&similarities, 0.75);
-        assert_eq!(boundaries, vec![3], "cut after sentence index 2");
-    }
-
-    #[test]
-    fn test_drift_boundaries_flat_signal_yields_nothing() {
-        let similarities = vec![0.9, 0.9, 0.9, 0.9];
-        assert!(drift_boundaries(&similarities, 0.75).is_empty());
-    }
-
-    #[test]
     fn test_split_sentences_handles_line_breaks_and_carryover() {
         let text = "First sentence! Second one\nspans lines. A final\nquestion?\nNo terminator here";
         let sentences = split_sentences(text);
@@ -456,21 +337,24 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_blocks_exhausts_two_topic_material() {
+    fn test_segment_blocks_packs_long_runs_within_token_bounds() {
         let tokenizer = test_tokenizer();
-        let topic_a =
-            "Photosynthesis converts light energy into chemical energy stored as glucose. ";
-        let topic_b = "Volcanoes erupt when magma pressure builds beneath the crust. ";
-        let blocks = vec![block(
-            BlockKind::Body,
-            &(topic_a.repeat(60).to_string() + &topic_b.repeat(60)),
-        )];
+        let sentence = "Photosynthesis converts light energy into chemical energy stored as glucose. ";
+        let repeat = 200;
+        let blocks = vec![block(BlockKind::Body, &sentence.repeat(repeat))];
 
-        let drafts = segment_blocks(blocks, &tokenizer, &TopicEmbedder);
-        assert!(drafts.len() >= 2, "two distinct topics must not share one segment");
+        let drafts = segment_blocks(blocks, &tokenizer);
+        assert!(drafts.len() >= 2, "long body must be split into multiple segments");
+
+        for draft in &drafts {
+            assert!(
+                token_count(&tokenizer, &draft.text) <= MAX_SEGMENT_TOKENS,
+                "no segment may exceed MAX_SEGMENT_TOKENS"
+            );
+        }
 
         let covered: usize = drafts.iter().map(|draft| draft.text.len()).sum();
-        let input_len = topic_a.len() * 60 + topic_b.len() * 60;
+        let input_len = sentence.len() * repeat;
         assert!(covered >= input_len * 9 / 10, "segments must cover essentially all input");
     }
 

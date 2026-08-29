@@ -4,7 +4,7 @@
  * native macOS "Preferences…" menu item (relayed by the Rust core).
  */
 
-export type SettingsTab = "provider" | "generation";
+export type SettingsTab = "appearance" | "inference" | "artifacts";
 
 type OpenHandler = (tab?: SettingsTab) => void;
 

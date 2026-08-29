@@ -117,7 +117,7 @@ export function CreateWorksheetDialog({ open, onOpenChange }: CreateWorksheetDia
 								className="underline font-medium"
 								onClick={() => {
 									onOpenChange(false);
-									openSettings("provider");
+									openSettings("inference");
 								}}
 							>
 								Set one up in Settings

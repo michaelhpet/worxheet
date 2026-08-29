@@ -19,6 +19,7 @@ import {
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { PipelineStatusBadge } from "@/components/pipeline-status-badge";
 import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
 import { openSettings } from "@/lib/settings-bus";
 import {
@@ -222,6 +223,35 @@ function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 	);
 }
 
+function FilesCell({ worksheet }: { worksheet: Worksheet }) {
+	return (
+		<>
+			{worksheet.file_count} {worksheet.file_count === 1 ? "file" : "files"}
+			{worksheet.file_extensions.length > 0 && (
+				<span className="text-muted-foreground">
+					{" · "}
+					{worksheet.file_extensions.join(", ")}
+				</span>
+			)}
+		</>
+	);
+}
+
+function QuizCounts({ worksheet }: { worksheet: Worksheet }) {
+	const counts = worksheet.quiz_counts ?? worksheet.artifact_counts;
+	if (!counts) return null;
+
+	const parts = [
+		counts.MultipleChoiceQuiz ? `${counts.MultipleChoiceQuiz} MCQ` : null,
+		counts.EssayQuiz ? `${counts.EssayQuiz} essay` : null,
+		counts.CompletionQuiz ? `${counts.CompletionQuiz} fill` : null,
+	].filter(Boolean);
+
+	if (parts.length === 0) return <span className="text-muted-foreground">—</span>;
+
+	return <>{parts.join(" · ")}</>;
+}
+
 function TableView({ worksheets, page }: { worksheets: Worksheet[]; page: number }) {
 	const navigate = useNavigate();
 
@@ -233,8 +263,10 @@ function TableView({ worksheets, page }: { worksheets: Worksheet[]; page: number
 						<IconSelector className="size-4" />
 					</TableHead>
 					<TableHead>Name</TableHead>
+					<TableHead>Files</TableHead>
+					<TableHead>Quiz content</TableHead>
 					<TableHead>Created</TableHead>
-					<TableHead>Updated</TableHead>
+					<TableHead>Status</TableHead>
 					<TableHead className="w-12" />
 				</TableRow>
 			</TableHeader>
@@ -252,8 +284,16 @@ function TableView({ worksheets, page }: { worksheets: Worksheet[]; page: number
 					>
 						<TableCell className="text-muted-foreground">{(page - 1) * PER_PAGE + index + 1}</TableCell>
 						<TableCell className="font-medium">{worksheet.name}</TableCell>
+						<TableCell className="whitespace-nowrap">
+							<FilesCell worksheet={worksheet} />
+						</TableCell>
+						<TableCell className="whitespace-nowrap text-muted-foreground">
+							<QuizCounts worksheet={worksheet} />
+						</TableCell>
 						<TableCell>{formatDate(worksheet.created_at)}</TableCell>
-						<TableCell>{formatDate(worksheet.updated_at)}</TableCell>
+						<TableCell>
+							<PipelineStatusBadge worksheet={worksheet} />
+						</TableCell>
 						<TableCell>
 							<WorksheetActions worksheet={worksheet} />
 						</TableCell>
@@ -285,7 +325,13 @@ function GridView({ worksheets }: { worksheets: Worksheet[] }) {
 					</div>
 					<IconFile className="size-8 text-muted-foreground" />
 					<span className="font-medium truncate">{worksheet.name}</span>
-					<span className="text-sm text-muted-foreground">Created {formatDate(worksheet.created_at)}</span>
+					<span className="text-sm text-muted-foreground">
+						{worksheet.file_count} {worksheet.file_count === 1 ? "file" : "files"} · Created{" "}
+						{formatDate(worksheet.created_at)}
+					</span>
+					<div className="flex">
+						<PipelineStatusBadge worksheet={worksheet} />
+					</div>
 				</div>
 			))}
 		</div>
@@ -310,9 +356,13 @@ function ListView({ worksheets }: { worksheets: Worksheet[] }) {
 				>
 					<ItemContent>
 						<ItemTitle>{worksheet.name}</ItemTitle>
-						<ItemDescription>Created {formatDate(worksheet.created_at)}</ItemDescription>
+						<ItemDescription>
+							{worksheet.file_count} {worksheet.file_count === 1 ? "file" : "files"} · Created{" "}
+							{formatDate(worksheet.created_at)}
+						</ItemDescription>
 					</ItemContent>
-					<ItemActions className="self-center" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+					<ItemActions className="items-center gap-2">
+						<PipelineStatusBadge worksheet={worksheet} />
 						<WorksheetActions worksheet={worksheet} />
 					</ItemActions>
 				</Item>

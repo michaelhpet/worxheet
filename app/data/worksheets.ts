@@ -8,7 +8,12 @@ export interface Worksheet {
 	name: string;
 	created_at: string;
 	updated_at: string;
+	pipeline_status: "idle" | "running" | "done" | "failed";
+	pipeline_error?: string | null;
+	file_count: number;
+	file_extensions: string[];
 	artifact_counts?: Record<QuizArtifactType, number>;
+	quiz_counts?: Record<QuizArtifactType, number>;
 }
 
 export const WORKSHEETS_QUERY_KEY = "WORKSHEETS";

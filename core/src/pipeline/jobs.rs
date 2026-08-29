@@ -1,8 +1,8 @@
 //! Background pipeline job runner.
 //!
-//! One worksheet pipeline runs at a time (the gate keeps progress reporting
-//! sane; generation itself no longer needs to serialize hardware). Provider
-//! resolution happens per run so settings changes apply immediately.
+//! Each worksheet pipeline runs on its own background task; progress reporting
+//! is keyed by worksheet so runs do not need to serialize. Provider resolution
+//! happens per run so settings changes apply immediately.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,17 +33,15 @@ struct RunningJob {
     tokens_out: u64,
 }
 
-/// Registry of running pipelines plus the serialization gate.
+/// Registry of in-memory running pipelines.
 pub struct PipelineJobs {
     jobs: Mutex<HashMap<String, RunningJob>>,
-    gate: tokio::sync::Mutex<()>,
 }
 
 impl Default for PipelineJobs {
     fn default() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
-            gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -75,7 +73,6 @@ pub fn start_job(
     }
 
     tauri::async_runtime::spawn(async move {
-        let _guard = jobs.gate.lock().await;
         run_job(&app, &pool, &providers, &jobs, &worksheet_id).await;
     });
 }

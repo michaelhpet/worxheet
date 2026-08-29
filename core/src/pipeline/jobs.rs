@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 use sqlx::{Pool, Sqlite};
 use tauri::{AppHandle, Emitter};
 
-use crate::provider::{
-    self, config::ProviderState, client::OpenAiClient, ArtifactBackend,
-};
+use crate::provider::{self, client::OpenAiClient, config::ProviderState, ArtifactBackend};
 use crate::schema::{ArtifactType, PipelineStatus};
 
 use super::segment;
@@ -47,34 +45,46 @@ impl Default for PipelineJobs {
 }
 
 /// Register the worksheet as running and start its pipeline in the background.
+/// Returns `false` (and does nothing) if a job for the worksheet is already
+/// live, so concurrent callers cannot start duplicate pipelines.
 pub fn start_job(
     app: AppHandle,
     pool: Pool<Sqlite>,
     providers: Arc<ProviderState>,
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
-) {
-    {
+) -> bool {
+    let started = {
         let mut running = jobs.jobs.lock().unwrap();
-        running.insert(
-            worksheet_id.clone(),
-            RunningJob {
-                phase: String::from("ingesting"),
-                artifact_type: None,
-                done: 0,
-                total: 0,
-                types_done: 0,
-                types_total: ArtifactType::ALL.len(),
-                requests_done: 0,
-                tokens_in: 0,
-                tokens_out: 0,
-            },
-        );
+        if running.contains_key(&worksheet_id) {
+            false
+        } else {
+            running.insert(
+                worksheet_id.clone(),
+                RunningJob {
+                    phase: String::from("ingesting"),
+                    artifact_type: None,
+                    done: 0,
+                    total: 0,
+                    types_done: 0,
+                    types_total: ArtifactType::ALL.len(),
+                    requests_done: 0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                },
+            );
+            true
+        }
+    };
+
+    if !started {
+        return false;
     }
 
     tauri::async_runtime::spawn(async move {
         run_job(&app, &pool, &providers, &jobs, &worksheet_id).await;
     });
+    true
 }
 
 /// Persist `running` for any worksheet left mid-flight by a previous session
@@ -161,6 +171,49 @@ pub async fn get_status(
     })
 }
 
+/// Ensure a worksheet's pipeline is running, resuming from unchunked or
+/// ungenerated parts. Safe to call on every status poll: if a live job exists
+/// or the worksheet is already `done`, it is a no-op. Returns the current
+/// status so callers can render immediately after a resume is triggered.
+pub async fn resume_if_needed(
+    app: AppHandle,
+    pool: &Pool<Sqlite>,
+    providers: &Arc<ProviderState>,
+    jobs: &Arc<PipelineJobs>,
+    worksheet_id: &str,
+) -> Result<PipelineStatus, String> {
+    let live = jobs.jobs.lock().unwrap().contains_key(worksheet_id);
+    if live {
+        return get_status(pool, jobs, worksheet_id).await;
+    }
+
+    let persisted: Option<(String,)> =
+        sqlx::query_as("SELECT pipeline_status FROM worksheets WHERE id = ?")
+            .bind(worksheet_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| String::from("Failed to fetch pipeline status"))?;
+
+    let Some((status,)) = persisted else {
+        return Err(String::from("Worksheet not found"));
+    };
+
+    if status == "done" {
+        return get_status(pool, jobs, worksheet_id).await;
+    }
+
+    // A live job may have been registered racing with this read; start_job is
+    // idempotent, so only the first caller actually launches the pipeline.
+    start_job(
+        app,
+        pool.clone(),
+        providers.clone(),
+        jobs.clone(),
+        worksheet_id.to_string(),
+    );
+    get_status(pool, jobs, worksheet_id).await
+}
+
 async fn run_job(
     app: &AppHandle,
     pool: &Pool<Sqlite>,
@@ -227,11 +280,13 @@ async fn run_pipeline(
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
 ) -> Result<(), String> {
-    sqlx::query("UPDATE worksheets SET pipeline_status = 'running', pipeline_error = NULL WHERE id = ?")
-        .bind(worksheet_id)
-        .execute(pool)
-        .await
-        .map_err(|_| String::from("Failed to mark worksheet as running"))?;
+    sqlx::query(
+        "UPDATE worksheets SET pipeline_status = 'running', pipeline_error = NULL WHERE id = ?",
+    )
+    .bind(worksheet_id)
+    .execute(pool)
+    .await
+    .map_err(|_| String::from("Failed to mark worksheet as running"))?;
 
     let file_ids: Vec<String> =
         sqlx::query_scalar("SELECT id FROM files WHERE worksheet_id = ? ORDER BY created_at")
@@ -244,31 +299,60 @@ async fn run_pipeline(
         return Err(String::from("Worksheet has no files to process."));
     }
 
+    // Resume from unchunked parts: only ingest files that have no chunks yet.
+    let pending_files = super::unchunked_files(pool, worksheet_id, &file_ids).await?;
+
     // Resolve the cloud backend before doing any local work so a missing
     // configuration fails fast with an actionable message.
     let (backend, concurrency) = resolve_backend(providers)?;
     let tokenizer = segment::bundled_tokenizer()?;
 
     let on_ingest = progress_sink(app, jobs, worksheet_id);
-    super::process_files(pool, worksheet_id, &file_ids, tokenizer, Some(on_ingest)).await?;
-
-    // Clear stale artifacts before regenerating so a re-run never duplicates.
-    sqlx::query("DELETE FROM artifacts WHERE worksheet_id = ?")
-        .bind(worksheet_id)
-        .execute(pool)
-        .await
-        .map_err(|_| String::from("Failed to clear old artifacts"))?;
+    let start_position = super::next_segment_position(pool, worksheet_id).await?;
+    super::process_files(
+        pool,
+        worksheet_id,
+        &pending_files,
+        start_position,
+        tokenizer,
+        Some(on_ingest),
+    )
+    .await?;
 
     set_phase(jobs, worksheet_id, "generating", None);
 
     let segments = super::load_segments(pool, worksheet_id).await?;
+    let existing = super::load_existing_artifacts(pool, worksheet_id).await?;
     let on_generate = generate_progress_sink(app, jobs, worksheet_id);
     let started = std::time::Instant::now();
 
-    let (pending, telemetry) =
-        super::generate_all(backend, concurrency, &segments, None, Some(on_generate)).await?;
+    // Per-item quiz artifacts persist incrementally as each unit completes so
+    // an interruption keeps finished parts. Merged types (Summary/MindMap) are
+    // returned below and persisted once in `pending`.
+    let on_persist = {
+        let pool = pool.clone();
+        let worksheet_id = worksheet_id.to_string();
+        Arc::new(move |artifacts: Vec<super::generate::PendingArtifact>| {
+            let pool = pool.clone();
+            let worksheet_id = worksheet_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = super::persist_artifacts(&pool, &worksheet_id, &artifacts).await;
+            });
+        }) as super::generate::PersistFn
+    };
+
+    let (pending, telemetry) = super::generate_all(
+        backend,
+        concurrency,
+        &segments,
+        existing,
+        None,
+        Some(on_persist),
+        Some(on_generate),
+    )
+    .await?;
     println!(
-        "[pipeline] generated {} artifacts across {} requests (~{}k in / ~{}k out tokens) in {:?}",
+        "[pipeline] generated {} merged artifacts across {} requests (~{}k in / ~{}k out tokens) in {:?}",
         pending.len(),
         telemetry.requests,
         telemetry.tokens_in / 1000,

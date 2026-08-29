@@ -23,14 +23,14 @@ pub fn parse_blocks(path: &str, extension: &str) -> Result<Vec<Block>, String> {
 /// PDFs: span-level extraction with font-size statistics for heading
 /// detection. Falls back to plain page text when layout extraction fails.
 fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
-    let doc = pdf_oxide::PdfDocument::open(path)
-        .map_err(|e| format!("Failed to open PDF: {e}"))?;
+    let doc = pdf_oxide::PdfDocument::open(path).map_err(|e| format!("Failed to open PDF: {e}"))?;
     let page_count = doc
         .page_count()
         .map_err(|e| format!("Failed to get page count: {e}"))?;
 
     // First pass: collect spans to learn the dominant (body) font size.
-    let mut size_histogram: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut size_histogram: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
     let mut page_spans: Vec<Vec<(String, f32)>> = Vec::with_capacity(page_count);
     for page_index in 0..page_count {
         let mut page = Vec::new();
@@ -39,8 +39,9 @@ fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
                 if span.text.trim().is_empty() {
                     continue;
                 }
-                *size_histogram.entry(span.font_size.max(1.0).round() as u32).or_default() +=
-                    span.text.len();
+                *size_histogram
+                    .entry(span.font_size.max(1.0).round() as u32)
+                    .or_default() += span.text.len();
                 page.push((span.text, span.font_size));
             }
         }
@@ -92,7 +93,9 @@ fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
     }
 
     // Layout extraction produced nothing usable — fall back to auto text.
-    if blocks.iter().filter(|block| matches!(block.kind, BlockKind::Heading(_) | BlockKind::Body))
+    if blocks
+        .iter()
+        .filter(|block| matches!(block.kind, BlockKind::Heading(_) | BlockKind::Body))
         .all(|block| block.text.trim().is_empty())
     {
         return parse_pdf_plain(path);
@@ -102,8 +105,7 @@ fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
 }
 
 fn parse_pdf_plain(path: &str) -> Result<Vec<Block>, String> {
-    let doc = pdf_oxide::PdfDocument::open(path)
-        .map_err(|e| format!("Failed to open PDF: {e}"))?;
+    let doc = pdf_oxide::PdfDocument::open(path).map_err(|e| format!("Failed to open PDF: {e}"))?;
     let page_count = doc
         .page_count()
         .map_err(|e| format!("Failed to get page count: {e}"))?;
@@ -126,8 +128,8 @@ fn parse_pdf_plain(path: &str) -> Result<Vec<Block>, String> {
 /// Office formats: markdown export preserves headings (`#`) and slide titles;
 /// split on those markers into structured blocks.
 fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
-    let markdown = office_oxide::to_markdown(path)
-        .map_err(|e| format!("Failed to extract text: {e}"))?;
+    let markdown =
+        office_oxide::to_markdown(path).map_err(|e| format!("Failed to extract text: {e}"))?;
 
     let mut blocks = Vec::new();
     let mut pending_body = String::new();
@@ -135,8 +137,11 @@ fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
     for line in markdown.lines() {
         let trimmed = line.trim_start();
         let heading_level = trimmed.chars().take_while(|c| *c == '#').count();
-        let looks_like_heading =
-            heading_level > 0 && heading_level <= 6 && trimmed.get(heading_level..).is_some_and(|rest| rest.starts_with(' '));
+        let looks_like_heading = heading_level > 0
+            && heading_level <= 6
+            && trimmed
+                .get(heading_level..)
+                .is_some_and(|rest| rest.starts_with(' '));
 
         if looks_like_heading {
             if !pending_body.trim().is_empty() {
@@ -147,7 +152,11 @@ fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
             }
             blocks.push(Block {
                 kind: BlockKind::Heading(heading_level.min(u8::MAX as usize) as u8),
-                text: trimmed[heading_level..].trim_start().trim_end_matches('#').trim().to_string(),
+                text: trimmed[heading_level..]
+                    .trim_start()
+                    .trim_end_matches('#')
+                    .trim()
+                    .to_string(),
             });
         } else {
             pending_body.push_str(line);
@@ -164,8 +173,8 @@ fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
     if blocks.is_empty() {
         // Structure-free fallback: whole document as one body block; drift
         // segmentation will carve it up.
-        let plain = office_oxide::extract_text(path)
-            .map_err(|e| format!("Failed to extract text: {e}"))?;
+        let plain =
+            office_oxide::extract_text(path).map_err(|e| format!("Failed to extract text: {e}"))?;
         if !plain.trim().is_empty() {
             blocks.push(Block {
                 kind: BlockKind::Body,
@@ -179,10 +188,49 @@ fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
 
 /// Parse every file, segment it, and persist the segments in source order.
 /// Reports progress as each file completes.
+pub async fn unchunked_files(
+    pool: &sqlx::SqlitePool,
+    worksheet_id: &str,
+    file_ids: &[String],
+) -> Result<Vec<String>, String> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunked: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT file_id FROM chunks WHERE worksheet_id = ?")
+            .bind(worksheet_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|_| String::from("Failed to query existing chunks"))?;
+
+    let chunked_set: std::collections::HashSet<&str> = chunked.iter().map(String::as_str).collect();
+    Ok(file_ids
+        .iter()
+        .filter(|id| !chunked_set.contains(id.as_str()))
+        .cloned()
+        .collect())
+}
+
+pub async fn next_segment_position(
+    pool: &sqlx::SqlitePool,
+    worksheet_id: &str,
+) -> Result<i32, String> {
+    let (max_position,): (Option<i32>,) =
+        sqlx::query_as("SELECT MAX(position) FROM chunks WHERE worksheet_id = ?")
+            .bind(worksheet_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|_| String::from("Failed to query segment position"))?;
+
+    Ok(max_position.unwrap_or(-1) + 1)
+}
+
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
+    start_position: i32,
     tokenizer: Tokenizer,
     mut on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
 ) -> Result<Vec<Segment>, String> {
@@ -206,8 +254,11 @@ pub async fn process_files(
         metadata.push((file_id.clone(), row.0, row.1));
     }
 
-    let max_parallel = total_files
-        .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+    let max_parallel = total_files.min(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    );
 
     let mut segmented: Vec<Option<Vec<SegmentDraft>>> = vec![None; total_files];
     let (tx, mut rx) = mpsc::channel::<(usize, Result<Vec<SegmentDraft>, String>)>(total_files);
@@ -252,7 +303,7 @@ pub async fn process_files(
     }
 
     let mut all_segments = Vec::with_capacity(flat.len());
-    let mut position_counter = 0i32;
+    let mut position_counter = start_position;
 
     let mut transaction = pool
         .begin()

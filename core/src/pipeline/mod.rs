@@ -14,7 +14,7 @@ pub mod validate;
 
 pub use generate::{generate_all, PendingArtifact};
 pub use jobs::{
-    get_status, remove_job, resolve_backend, resume_stale, start_job, PipelineJobs,
+    remove_job, resolve_backend, resume_if_needed, resume_stale, start_job, PipelineJobs,
 };
 
 /// Parse, segment, and persist every file of a worksheet. Reports progress as
@@ -23,10 +23,35 @@ pub async fn process_files(
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
+    start_position: i32,
     tokenizer: tokenizers::Tokenizer,
     on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
 ) -> Result<Vec<Segment>, String> {
-    ingest::process_files(pool, worksheet_id, file_ids, tokenizer, on_progress).await
+    ingest::process_files(
+        pool,
+        worksheet_id,
+        file_ids,
+        start_position,
+        tokenizer,
+        on_progress,
+    )
+    .await
+}
+
+/// The files of a worksheet that do not yet have any persisted chunks. Used to
+/// resume ingestion from unchunked parts only.
+pub async fn unchunked_files(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+    file_ids: &[String],
+) -> Result<Vec<String>, String> {
+    ingest::unchunked_files(pool, worksheet_id, file_ids).await
+}
+
+/// The next `position` value to assign a new chunk, continuing after the
+/// highest position already persisted for the worksheet.
+pub async fn next_segment_position(pool: &SqlitePool, worksheet_id: &str) -> Result<i32, String> {
+    ingest::next_segment_position(pool, worksheet_id).await
 }
 
 /// Load a worksheet's stored segments in document order.
@@ -53,6 +78,40 @@ pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<
             text,
         })
         .collect())
+}
+
+/// Load the set of already-persisted artifacts for a worksheet so a resumed
+/// generation run can skip them.
+pub async fn load_existing_artifacts(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+) -> Result<generate::ExistingArtifacts, String> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT artifact_type, source FROM artifacts WHERE worksheet_id = ?")
+            .bind(worksheet_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|_| String::from("Failed to query existing artifacts"))?;
+
+    let mut existing = generate::ExistingArtifacts::default();
+    for (artifact_type, source) in rows {
+        match ArtifactType::from_db(&artifact_type) {
+            Ok(ok_type) if items_field_is_merged(&ok_type) => {
+                existing.done_merged.insert(artifact_type);
+            }
+            Ok(_) => {
+                existing.done_items.insert((artifact_type, source));
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(existing)
+}
+
+/// Whether an artifact type is a worksheet-wide merged type rather than a
+/// per-segment item type.
+fn items_field_is_merged(artifact_type: &ArtifactType) -> bool {
+    matches!(artifact_type, ArtifactType::Summary | ArtifactType::MindMap)
 }
 
 /// Persist pending artifacts in one transaction.
@@ -137,10 +196,10 @@ pub async fn get_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::pipeline::generate::{ExistingArtifacts, GenerationParams};
     use crate::provider::mock::MockBackend;
     use crate::provider::{ArtifactBackend, ProviderError};
-    use crate::pipeline::generate::GenerationParams;
+    use std::sync::Arc;
 
     #[allow(unused_imports)]
     use generate as _generate_alias;
@@ -231,14 +290,24 @@ mod tests {
             seed_artifact(&pool, &worksheet_id, "EssayQuiz").await;
         }
 
-        let mcqs = get_artifacts(&pool, &worksheet_id, &ArtifactType::MultipleChoiceQuiz, None)
-            .await
-            .unwrap();
+        let mcqs = get_artifacts(
+            &pool,
+            &worksheet_id,
+            &ArtifactType::MultipleChoiceQuiz,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(mcqs.len(), 5);
 
-        let limited = get_artifacts(&pool, &worksheet_id, &ArtifactType::MultipleChoiceQuiz, Some(2))
-            .await
-            .unwrap();
+        let limited = get_artifacts(
+            &pool,
+            &worksheet_id,
+            &ArtifactType::MultipleChoiceQuiz,
+            Some(2),
+        )
+        .await
+        .unwrap();
         assert_eq!(limited.len(), 2);
 
         let clamped = get_artifacts(&pool, &worksheet_id, &ArtifactType::EssayQuiz, Some(0))
@@ -334,10 +403,17 @@ mod tests {
         })) as Arc<dyn ArtifactBackend>;
 
         let segments = test_segments(2);
-        let (pending, telemetry) =
-            generate_all(backend.clone(), 4, &segments, Some(GenerationParams::default()), None)
-                .await
-                .expect("generation should succeed");
+        let (pending, telemetry) = generate_all(
+            backend.clone(),
+            4,
+            &segments,
+            ExistingArtifacts::default(),
+            Some(GenerationParams::default()),
+            None,
+            None,
+        )
+        .await
+        .expect("generation should succeed");
 
         // Ten units; each quiz unit burns one hallucinated attempt plus one
         // corrective retry (2 x 2), everything else succeeds first try (6).
@@ -378,7 +454,10 @@ mod tests {
                 .content,
         )
         .unwrap();
-        assert!(summary["summary"].as_str().unwrap().contains("mitochondria"));
+        assert!(summary["summary"]
+            .as_str()
+            .unwrap()
+            .contains("mitochondria"));
     }
 
     #[tokio::test]
@@ -395,7 +474,17 @@ mod tests {
             .to_string())
         })) as Arc<dyn ArtifactBackend>;
         let segments = test_segments(1);
-        let (pending, _) = generate_all(backend, 2, &segments, None, None).await.unwrap();
+        let (pending, _) = generate_all(
+            backend,
+            2,
+            &segments,
+            ExistingArtifacts::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             pending
                 .iter()
@@ -415,5 +504,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_existing_artifacts_classifies_items_and_merged() {
+        let pool = setup_db().await;
+        let worksheet_id = seed_worksheet(&pool).await;
+
+        // Two per-item quiz artifacts (one per segment source) plus one merged
+        // Summary artifact.
+        sqlx::query(
+            "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(ulid::Ulid::new().to_string())
+        .bind(&worksheet_id)
+        .bind("MultipleChoiceQuiz")
+        .bind("seg-0")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(ulid::Ulid::new().to_string())
+        .bind(&worksheet_id)
+        .bind("MultipleChoiceQuiz")
+        .bind("seg-1")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_artifact(&pool, &worksheet_id, "Summary").await;
+
+        let existing = load_existing_artifacts(&pool, &worksheet_id).await.unwrap();
+
+        // Per-item quiz units are keyed by (type, source).
+        assert!(existing
+            .done_items
+            .contains(&("MultipleChoiceQuiz".to_string(), "seg-0".to_string())));
+        assert!(existing
+            .done_items
+            .contains(&("MultipleChoiceQuiz".to_string(), "seg-1".to_string())));
+        assert!(!existing
+            .done_items
+            .contains(&("MultipleChoiceQuiz".to_string(), "seg-2".to_string())));
+
+        // Merged types are tracked by artifact type alone.
+        assert!(existing.done_merged.contains("Summary"));
+        assert!(!existing.done_merged.contains("MindMap"));
+        assert_eq!(existing.done_items.len(), 2);
+        assert_eq!(existing.done_merged.len(), 1);
     }
 }

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::provider::{ArtifactBackend, GenerateRequest};
 use crate::schema::{ArtifactType, Segment};
 
-use super::validate::{self, ItemVerdict, references_missing_media, similarity};
+use super::validate::{self, references_missing_media, similarity, ItemVerdict};
 
 /// Sampling parameters applied to every generation request unless overridden.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -76,8 +76,13 @@ pub struct GenerationTick {
     pub types_done: usize,
 }
 
-/// Progress callback fired after every unit attempt.
+/// Progress callback fires after every unit attempt.
 pub type ProgressFn = Arc<dyn Fn(GenerationTick) + Send + Sync>;
+
+/// Persistence hook. When provided, artifacts are routed here as each unit
+/// completes (incremental, so interruptions keep finished parts); when `None`,
+/// all artifacts are returned as `pending` for the caller to persist.
+pub type PersistFn = Arc<dyn Fn(Vec<PendingArtifact>) + Send + Sync>;
 
 /// An artifact ready to be persisted.
 pub struct PendingArtifact {
@@ -94,6 +99,29 @@ pub struct RunTelemetry {
     pub tokens_out: u64,
 }
 
+/// Aggregates which artifacts already exist for a worksheet, so a resumed run
+/// can skip already-generated parts. Per-item quiz units are keyed by
+/// `(artifact_type, source)` where `source` is the originating segment id;
+/// merged types (Summary/MindMap) are treated as atomic per artifact type.
+#[derive(Clone, Debug, Default)]
+pub struct ExistingArtifacts {
+    /// Persisted per-item units: `(artifact_type db string, source)`.
+    pub done_items: std::collections::HashSet<(String, String)>,
+    /// Persisted merged artifact types: `artifact_type` db string.
+    pub done_merged: std::collections::HashSet<String>,
+}
+
+impl ExistingArtifacts {
+    fn unit_done(&self, artifact_type: &ArtifactType, segment_id: &str) -> bool {
+        match items_field(artifact_type) {
+            Some(_) => self
+                .done_items
+                .contains(&(artifact_type.to_db().to_string(), segment_id.to_string())),
+            None => self.done_merged.contains(artifact_type.to_db()),
+        }
+    }
+}
+
 struct Unit {
     /// Position within [`ArtifactType::ALL`].
     type_index: usize,
@@ -102,9 +130,11 @@ struct Unit {
     context: String,
     /// Deterministic per-unit seed derivation input (document position).
     seed_offset: u64,
+    /// Whether this unit's artifact already exists and should be skipped.
+    skip: bool,
 }
 
-fn build_units(segments: &[Segment]) -> Result<Vec<Unit>, String> {
+fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> Result<Vec<Unit>, String> {
     if segments.is_empty() {
         return Err(String::from(
             "No segments found for this worksheet. Run ingestion first.",
@@ -126,6 +156,7 @@ fn build_units(segments: &[Segment]) -> Result<Vec<Unit>, String> {
                 segment_id: segment.id.clone(),
                 context,
                 seed_offset: segment.position as u64 + 17,
+                skip: existing.unit_done(artifact_type, &segment.id),
             });
         }
     }
@@ -364,11 +395,18 @@ fn validate_unit_output(
     let mut rejection_reasons = Vec::new();
     let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
         Ok(value) => value,
-        Err(error) => return rejected(&mut rejection_reasons, format!("output is not valid JSON: {error}")),
+        Err(error) => {
+            return rejected(
+                &mut rejection_reasons,
+                format!("output is not valid JSON: {error}"),
+            )
+        }
     };
 
     if references_missing_media(raw) {
-        rejection_reasons.push(String::from("output references figures/media absent from the source"));
+        rejection_reasons.push(String::from(
+            "output references figures/media absent from the source",
+        ));
     }
 
     match items_field(artifact_type) {
@@ -384,16 +422,24 @@ fn validate_unit_output(
                         validate::validate_mcq_item(entry, source_segment, MIN_MCQ_GROUNDING)
                     }
                     ArtifactType::EssayQuiz => validate::validate_essay_item(entry),
-                    _ => {
-                        validate::validate_completion_item(entry, source_segment, MIN_COMPLETION_GROUNDING)
-                    }
+                    _ => validate::validate_completion_item(
+                        entry,
+                        source_segment,
+                        MIN_COMPLETION_GROUNDING,
+                    ),
                 };
 
                 match verdict {
                     ItemVerdict::Accepted(mut accepted) => {
                         // Cross-unit near-duplicate suppression.
-                        if matches!(artifact_type, ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz) {
-                            let question = accepted["question"].as_str().unwrap_or_default().to_string();
+                        if matches!(
+                            artifact_type,
+                            ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz
+                        ) {
+                            let question = accepted["question"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string();
                             let duplicate = seen_questions.iter().any(|seen| {
                                 similarity(seen, &question) >= DUPLICATE_QUESTION_SIMILARITY
                             });
@@ -407,19 +453,28 @@ fn validate_unit_output(
                     ItemVerdict::Rejected(reason) => rejection_reasons.push(reason),
                 }
             }
-            ValidatedOutput { items, rejection_reasons }
+            ValidatedOutput {
+                items,
+                rejection_reasons,
+            }
         }
         None => {
             // Whole-worksheet section objects get structural checks only;
             // deterministic merging downstream guarantees coverage.
             let shape_ok = match artifact_type {
                 ArtifactType::Summary => {
-                    value.get("summary").is_some_and(serde_json::Value::is_string)
-                        && value.get("key_points").is_some_and(serde_json::Value::is_array)
+                    value
+                        .get("summary")
+                        .is_some_and(serde_json::Value::is_string)
+                        && value
+                            .get("key_points")
+                            .is_some_and(serde_json::Value::is_array)
                 }
                 _ => {
                     value.get("topic").is_some_and(serde_json::Value::is_string)
-                        && value.get("branches").is_some_and(serde_json::Value::is_array)
+                        && value
+                            .get("branches")
+                            .is_some_and(serde_json::Value::is_array)
                 }
             };
             if shape_ok {
@@ -430,7 +485,10 @@ fn validate_unit_output(
             } else {
                 rejected(
                     &mut rejection_reasons,
-                    format!("expected a {} object with the documented fields", artifact_type.to_db()),
+                    format!(
+                        "expected a {} object with the documented fields",
+                        artifact_type.to_db()
+                    ),
                 )
             }
         }
@@ -480,7 +538,10 @@ async fn run_unit(
     let mut user = base_user.clone();
     let mut validated;
 
-    let raw = match backend.generate_json(&make_request(base_seed, user.clone())).await {
+    let raw = match backend
+        .generate_json(&make_request(base_seed, user.clone()))
+        .await
+    {
         Ok(raw) => {
             requests_made += 1;
             tokens_in += approximate_tokens(&system) + approximate_tokens(&user);
@@ -489,15 +550,28 @@ async fn run_unit(
         }
         Err(error) => {
             eprintln!("[pipeline] unit failed ({schema_name}): {error}");
-            return UnitOutcome { items: Vec::new(), requests_made, tokens_in, tokens_out };
+            return UnitOutcome {
+                items: Vec::new(),
+                requests_made,
+                tokens_in,
+                tokens_out,
+            };
         }
     };
 
-    validated = validate_unit_output(&unit.artifact_type, &raw, &unit.context, &seen_questions.lock().unwrap());
+    validated = validate_unit_output(
+        &unit.artifact_type,
+        &raw,
+        &unit.context,
+        &seen_questions.lock().unwrap(),
+    );
 
     if validated.items.is_empty() && !validated.rejection_reasons.is_empty() {
         user.push_str(&retry_feedback(&validated.rejection_reasons));
-        match backend.generate_json(&make_request(base_seed.wrapping_add(7_919), user)).await {
+        match backend
+            .generate_json(&make_request(base_seed.wrapping_add(7_919), user))
+            .await
+        {
             Ok(retry_raw) => {
                 requests_made += 1;
                 tokens_out += approximate_tokens(&retry_raw);
@@ -516,7 +590,10 @@ async fn run_unit(
 
     // Register surviving questions for cross-unit duplicate detection.
     if !validated.items.is_empty()
-        && matches!(unit.artifact_type, ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz)
+        && matches!(
+            unit.artifact_type,
+            ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz
+        )
     {
         let mut seen = seen_questions.lock().unwrap();
         for item in &validated.items {
@@ -531,7 +608,11 @@ async fn run_unit(
     if validated.items.is_empty() {
         eprintln!(
             "[pipeline] dropping unit ({schema_name}): {}",
-            validated.rejection_reasons.first().cloned().unwrap_or_default()
+            validated
+                .rejection_reasons
+                .first()
+                .cloned()
+                .unwrap_or_default()
         );
     }
 
@@ -551,29 +632,42 @@ struct UnitRecord {
 }
 
 /// Generate artifacts for every type across all segments under a concurrency
-/// limit. Returns pending artifacts plus aggregate telemetry.
+/// limit. Already-completed units (per `existing`) are skipped and not counted
+/// in progress or telemetry. When `on_persist` is provided, artifacts are
+/// routed to it as each unit completes (incremental persistence) and nothing
+/// is returned; otherwise all artifacts are returned for the caller to persist.
+/// Returns pending artifacts plus aggregate telemetry.
 pub async fn generate_all(
     backend: Arc<dyn ArtifactBackend>,
     concurrency: usize,
     segments: &[Segment],
+    existing: ExistingArtifacts,
     params: Option<GenerationParams>,
+    on_persist: Option<PersistFn>,
     on_progress: Option<ProgressFn>,
 ) -> Result<(Vec<PendingArtifact>, RunTelemetry), String> {
     let params = params.unwrap_or_default();
-    let units = build_units(segments)?;
-    let total_units = units.len();
+    let units = build_units(segments, &existing)?;
+    let active_units: Vec<Unit> = units.into_iter().filter(|unit| !unit.skip).collect();
+    let total_units = active_units.len();
 
     let mut totals_per_type = [0usize; ArtifactType::ALL.len()];
-    for unit in &units {
+    for unit in &active_units {
         totals_per_type[unit.type_index] += 1;
     }
     let completed_per_type: Arc<Vec<AtomicUsize>> = Arc::new(
-        (0..ArtifactType::ALL.len()).map(|_| AtomicUsize::new(0)).collect(),
+        (0..ArtifactType::ALL.len())
+            .map(|_| AtomicUsize::new(0))
+            .collect(),
     );
     let completed_types = Arc::new(AtomicUsize::new(0));
 
     if let Some(on_progress) = &on_progress {
-        on_progress(GenerationTick { done: 0, total: total_units, types_done: 0 });
+        on_progress(GenerationTick {
+            done: 0,
+            total: total_units,
+            types_done: 0,
+        });
     }
 
     let records: Arc<Mutex<Vec<Option<UnitRecord>>>> =
@@ -584,7 +678,7 @@ pub async fn generate_all(
     let done_counter = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::with_capacity(total_units);
-    for (unit_index, unit) in units.into_iter().enumerate() {
+    for (unit_index, unit) in active_units.into_iter().enumerate() {
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -597,9 +691,9 @@ pub async fn generate_all(
         let telemetry = telemetry.clone();
         let done_counter = done_counter.clone();
         let completed_per_type = completed_per_type.clone();
-        let _ = &completed_per_type;
         let completed_types = completed_types.clone();
         let on_progress = on_progress.clone();
+        let on_persist = on_persist.clone();
 
         handles.push(tokio::spawn(async move {
             let outcome = run_unit(&backend, &unit, &params, &seen_questions).await;
@@ -611,11 +705,31 @@ pub async fn generate_all(
                 stats.tokens_out += outcome.tokens_out;
             }
 
-            records.lock().unwrap()[unit_index] = Some(UnitRecord {
-                type_index: unit.type_index,
-                segment_id: unit.segment_id.clone(),
-                items: outcome.items,
-            });
+            let is_item_type = items_field(&unit.artifact_type).is_some();
+            if is_item_type {
+                // Per-item units are persisted immediately so a mid-run kill
+                // keeps the finished quiz items.
+                let artifacts = build_item_artifacts(&unit, &outcome.items);
+                if let Some(on_persist) = &on_persist {
+                    if !artifacts.is_empty() {
+                        on_persist(artifacts);
+                    }
+                } else {
+                    records.lock().unwrap()[unit_index] = Some(UnitRecord {
+                        type_index: unit.type_index,
+                        segment_id: unit.segment_id.clone(),
+                        items: outcome.items,
+                    });
+                }
+            } else {
+                // Merged types accumulate per-segment sections and are
+                // assembled once the type completes below.
+                records.lock().unwrap()[unit_index] = Some(UnitRecord {
+                    type_index: unit.type_index,
+                    segment_id: unit.segment_id.clone(),
+                    items: outcome.items,
+                });
+            }
 
             let finished = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
             let completed = completed_per_type[unit.type_index].fetch_add(1, Ordering::Relaxed) + 1;
@@ -625,7 +739,11 @@ pub async fn generate_all(
             }
 
             if let Some(on_progress) = &on_progress {
-                on_progress(GenerationTick { done: finished, total: total_units, types_done });
+                on_progress(GenerationTick {
+                    done: finished,
+                    total: total_units,
+                    types_done,
+                });
             }
 
             drop(permit);
@@ -633,20 +751,17 @@ pub async fn generate_all(
     }
 
     for handle in handles {
-        handle.await.map_err(|e| format!("Generation task failed: {e}"))?;
+        handle
+            .await
+            .map_err(|e| format!("Generation task failed: {e}"))?;
     }
 
     let telemetry = *telemetry.lock().unwrap();
-    let records: Vec<Option<UnitRecord>> =
-        records.lock().unwrap().drain(..).collect();
+    let records: Vec<Option<UnitRecord>> = records.lock().unwrap().drain(..).collect();
 
-    let pending = assemble_pending(&records);
-    Ok((pending, telemetry))
-}
-
-fn assemble_pending(records: &[Option<UnitRecord>]) -> Vec<PendingArtifact> {
+    // Streamed persistence leaves only merged artifacts to be returned; in the
+    // non-streaming (test/legacy) path, per-item artifacts come from records.
     let mut pending = Vec::new();
-
     for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
         let sections: Vec<(String, serde_json::Value)> = records
             .iter()
@@ -666,17 +781,19 @@ fn assemble_pending(records: &[Option<UnitRecord>]) -> Vec<PendingArtifact> {
         }
 
         if items_field(artifact_type).is_some() {
-            // One artifact per generated item.
-            for (source, value) in sections {
-                pending.push(PendingArtifact {
-                    artifact_type: artifact_type.clone(),
-                    source,
-                    content: value.to_string(),
-                });
+            if on_persist.is_none() {
+                for (source, value) in sections {
+                    pending.push(PendingArtifact {
+                        artifact_type: artifact_type.clone(),
+                        source,
+                        content: value.to_string(),
+                    });
+                }
             }
-        } else if let Some(content) = merge_sections(artifact_type, &sections) {
-            // One worksheet-wide artifact merged deterministically.
-            pending.push(PendingArtifact {
+            continue;
+        }
+        if let Some(content) = merge_sections(artifact_type, &sections) {
+            let artifact = PendingArtifact {
                 artifact_type: artifact_type.clone(),
                 source: sections
                     .iter()
@@ -684,16 +801,31 @@ fn assemble_pending(records: &[Option<UnitRecord>]) -> Vec<PendingArtifact> {
                     .collect::<Vec<_>>()
                     .join(","),
                 content,
-            });
+            };
+            if let Some(on_persist) = &on_persist {
+                on_persist(vec![artifact]);
+            } else {
+                pending.push(artifact);
+            }
         }
     }
 
-    pending
+    Ok((pending, telemetry))
 }
 
-/// Deterministically merge per-segment section objects into a single
-/// worksheet-wide artifact. No extra LLM call: concatenation preserves order
-/// and guarantees nothing sampled away.
+/// One artifact per generated item for per-item quiz types, keyed by unit.
+fn build_item_artifacts(unit: &Unit, items: &[String]) -> Vec<PendingArtifact> {
+    items
+        .iter()
+        .filter_map(|item| serde_json::from_str::<serde_json::Value>(item).ok())
+        .map(|value| PendingArtifact {
+            artifact_type: unit.artifact_type.clone(),
+            source: unit.segment_id.clone(),
+            content: value.to_string(),
+        })
+        .collect()
+}
+
 fn merge_sections(
     artifact_type: &ArtifactType,
     sections: &[(String, serde_json::Value)],
@@ -715,7 +847,10 @@ fn merge_sections(
                         paragraphs.push(trimmed.to_string());
                     }
                 }
-                if let Some(points) = value.get("key_points").and_then(serde_json::Value::as_array) {
+                if let Some(points) = value
+                    .get("key_points")
+                    .and_then(serde_json::Value::as_array)
+                {
                     for point in points.iter().filter_map(serde_json::Value::as_str) {
                         if !key_points.contains(&point.to_string()) {
                             key_points.push(point.to_string());
@@ -743,7 +878,9 @@ fn merge_sections(
 
             let mut branches: Vec<serde_json::Value> = Vec::new();
             for (_, value) in sections {
-                if let Some(section_branches) = value.get("branches").and_then(serde_json::Value::as_array) {
+                if let Some(section_branches) =
+                    value.get("branches").and_then(serde_json::Value::as_array)
+                {
                     branches.extend(section_branches.iter().cloned());
                 }
             }

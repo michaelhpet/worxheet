@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::pipeline;
 use crate::schema::{Artifact, ArtifactType, PipelineStatus};
@@ -17,11 +17,21 @@ pub async fn get_artifacts(
 }
 
 /// Current pipeline status for a worksheet, merging live progress with the
-/// persisted status column.
+/// persisted status column. Also ensures an unfinished worksheet's pipeline is
+/// resumed (starting on the first poll after the worksheet is opened) so
+/// viewing the worksheet reflects live progress instead of a stale snapshot.
 #[tauri::command]
 pub async fn get_pipeline_status(
+    app: AppHandle,
     state: State<'_, AppState>,
     worksheet_id: String,
 ) -> Result<PipelineStatus, String> {
-    pipeline::get_status(&state.database, &state.jobs, &worksheet_id).await
+    pipeline::resume_if_needed(
+        app,
+        &state.database,
+        &state.providers,
+        &state.jobs,
+        &worksheet_id,
+    )
+    .await
 }

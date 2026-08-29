@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const PRESETS: &[(&str, &str)] = &[
     ("openai", "https://api.openai.com/v1"),
     ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
-    ("ollama", "http://localhost:11434/v1"),
+    ("ollama", "https://ollama.com/v1"),
     ("lmstudio", "http://localhost:1234/v1"),
 ];
 
@@ -21,7 +21,6 @@ pub const DEFAULT_MODEL_BY_PRESET: &[(&str, &str)] = &[
 ];
 
 const KEYRING_SERVICE: &str = "worxheet";
-const KEYRING_ACCOUNT: &str = "provider-api-key";
 
 /// Active generation settings. The API key deliberately lives outside this
 /// struct: it is stored in the OS keychain and only joined at call time.
@@ -65,11 +64,6 @@ impl ProviderConfig {
     pub fn is_configured(&self) -> bool {
         !self.base_url.is_empty() && !self.model.is_empty()
     }
-
-    /// Whether the preset expects no authentication (local servers).
-    pub fn requires_api_key(&self) -> bool {
-        !matches!(self.preset.as_str(), "ollama" | "lmstudio")
-    }
 }
 
 pub fn base_url_for_preset(preset: &str) -> Option<&'static str> {
@@ -87,13 +81,21 @@ pub fn default_model_for_preset(preset: &str) -> &'static str {
         .unwrap_or("")
 }
 
-fn keyring_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|e| format!("Keychain unavailable: {e}"))
+/// Keychain account for a given provider preset. Each provider owns its own
+/// slot so a key can never be sent to a different provider.
+fn keyring_account(preset: &str) -> String {
+    format!("provider-api-key:{preset}")
 }
 
-/// Persist the API key in the OS keychain. An empty string deletes the entry.
-pub fn store_api_key(key: &str) -> Result<(), String> {
-    let entry = keyring_entry()?;
+fn keyring_entry(preset: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, &keyring_account(preset))
+        .map_err(|e| format!("Keychain unavailable: {e}"))
+}
+
+/// Persist a provider's API key in the OS keychain. An empty string deletes
+/// that provider's entry.
+pub fn store_api_key(preset: &str, key: &str) -> Result<(), String> {
+    let entry = keyring_entry(preset)?;
     if key.is_empty() {
         match entry.delete_credential() {
             Ok(()) => Ok(()),
@@ -107,9 +109,9 @@ pub fn store_api_key(key: &str) -> Result<(), String> {
     }
 }
 
-/// Load the stored API key, if any.
-pub fn load_api_key() -> Result<Option<String>, String> {
-    match keyring_entry()?.get_password() {
+/// Load the stored API key for a provider, if any.
+pub fn load_api_key(preset: &str) -> Result<Option<String>, String> {
+    match keyring_entry(preset)?.get_password() {
         Ok(key) => Ok(Some(key)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("Failed to read key from keychain: {e}")),

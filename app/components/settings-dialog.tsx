@@ -1,22 +1,16 @@
+import { useTheme } from "@/components/theme-provider";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogFooter } from "@/components/ui/dialog";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Spinner } from "@/components/ui/spinner";
-import { useTheme } from "@/components/theme-provider";
-import {
-	useProviderModels,
-	useProviderStatus,
-	useSetProviderConfig,
-	useValidateProvider,
-	type ProviderPreset,
-} from "@/data/provider";
+import { useProviderModels, useProviderStatus, useSetProviderConfig, type ProviderPreset } from "@/data/provider";
 import { onOpenSettings, type SettingsTab } from "@/lib/settings-bus";
 import { cn } from "@/lib/utils";
-import { IconBotId, IconCheck, IconFileAi, IconPalette, IconX } from "@tabler/icons-react";
-import { useEffect, useRef, useState } from "react";
+import { IconBotId, IconCheck, IconEye, IconEyeOff, IconFileAi, IconPalette, IconX } from "@tabler/icons-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Sidebar, SidebarContent, SidebarGroup, SidebarMenuButton, SidebarProvider } from "./ui/sidebar";
 
 const PRESETS: { value: ProviderPreset; label: string; hint: string; baseUrl: string; model: string }[] = [
@@ -36,19 +30,25 @@ const PRESETS: { value: ProviderPreset; label: string; hint: string; baseUrl: st
 	},
 	{
 		value: "ollama",
-		label: "Ollama (local)",
-		hint: "Runs on this machine — no key needed",
-		baseUrl: "http://localhost:11434/v1",
+		label: "Ollama Cloud",
+		hint: "Cloud models — needs an API key. Use Custom endpoint for local models",
+		baseUrl: "https://ollama.com/v1",
 		model: "",
 	},
 	{
 		value: "lmstudio",
-		label: "LM Studio (local)",
-		hint: "Runs on this machine — no key needed",
+		label: "LM Studio",
+		hint: "Local models on this machine — no key needed",
 		baseUrl: "http://localhost:1234/v1",
 		model: "",
 	},
-	{ value: "custom", label: "Custom endpoint", hint: "Any OpenAI-compatible server", baseUrl: "", model: "" },
+	{
+		value: "custom",
+		label: "Custom endpoint",
+		hint: "Any OpenAI-compatible server",
+		baseUrl: "http://localhost:11434/v1",
+		model: "",
+	},
 ];
 
 const NAV: { tab: SettingsTab; label: string; icon: typeof IconPalette }[] = [
@@ -63,22 +63,26 @@ const THEME_OPTIONS: { value: "dark" | "light" | "system"; label: string; hint: 
 	{ value: "system", label: "System", hint: "Follows your OS appearance setting." },
 ];
 
+/** Debounce before persisting live edits to reduce write churn. */
+const PERSIST_DELAY_MS = 400;
+
 export function SettingsDialog() {
 	const [open, setOpen] = useState(false);
 	const [tab, setTab] = useState<SettingsTab>("inference");
 
 	const { theme, setTheme } = useTheme();
 
-	const { data: status, refetch } = useProviderStatus();
+	const { data: status } = useProviderStatus();
 	const setConfig = useSetProviderConfig();
-	const validate = useValidateProvider();
 
 	const [preset, setPreset] = useState<ProviderPreset>("openai");
 	const [baseUrl, setBaseUrl] = useState("");
 	const [model, setModel] = useState("");
 	const [apiKey, setApiKey] = useState("");
 	const [concurrency, setConcurrency] = useState(8);
-	const [validation, setValidation] = useState<{ ok: boolean; error?: string } | null>(null);
+	const [connection, setConnection] = useState<{ ok: boolean; error?: string; count?: number } | null>(null);
+	const [testing, setTesting] = useState(false);
+	const [showKey, setShowKey] = useState(false);
 
 	// Artifact generation knobs — frontend-only shell for now. Not persisted
 	// or wired to the backend yet.
@@ -86,16 +90,66 @@ export function SettingsDialog() {
 	const [maxTokens, setMaxTokens] = useState(2048);
 	const [seed, setSeed] = useState(1234);
 
-	// Load current values whenever the dialog opens.
+	// Load stored values once per dialog open, then never overwrite the
+	// user's in-progress edits.
+	const loadedRef = useRef(false);
 	useEffect(() => {
-		if (!open || !status) return;
+		if (!open) {
+			loadedRef.current = false;
+			return;
+		}
+		if (loadedRef.current || !status) return;
+		loadedRef.current = true;
 		setPreset(status.config.preset as ProviderPreset);
 		setBaseUrl(status.config.base_url);
 		setModel(status.config.model);
 		setConcurrency(status.config.concurrency);
 		setApiKey("");
-		setValidation(null);
+		setConnection(null);
 	}, [open, status]);
+
+	// Keep the latest form values in a ref so `persist` (below) reads the
+	// current draft at call time, not a stale closure.
+	const draftRef = useRef({ preset, baseUrl, model, concurrency, apiKey });
+	draftRef.current = { preset, baseUrl, model, concurrency, apiKey };
+
+	// Commit the current draft to the backend — the single source of truth the
+	// test connection and generation both read. Awaitable so "Test connection"
+	// can first flush the form, then list against exactly what was just saved.
+	const lastSavedRef = useRef("");
+	const persist = useCallback(async () => {
+		const { preset, baseUrl, model, concurrency, apiKey } = draftRef.current;
+		const trimmedBase = baseUrl.trim();
+		const trimmedModel = model.trim();
+		const trimmedKey = apiKey.trim();
+		const payload = `${preset}\u0000${trimmedBase}\u0000${trimmedModel}\u0000${concurrency}\u0000${trimmedKey}`;
+		if (payload === lastSavedRef.current) return;
+		lastSavedRef.current = payload;
+		await setConfig.mutateAsync({
+			preset,
+			baseUrl: trimmedBase,
+			model: trimmedModel,
+			concurrency,
+			apiKey: trimmedKey === "" ? undefined : trimmedKey,
+		});
+	}, [setConfig]);
+
+	// Persist live edits, debounced, once the form has been populated. The
+	// draft fields intentionally reset the debounce timer on each edit, even
+	// though `persist` reads them via a ref.
+	const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: debounce timer reset
+	useEffect(() => {
+		if (!loadedRef.current || !open) return;
+		if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+		persistTimerRef.current = setTimeout(() => {
+			void persist();
+		}, PERSIST_DELAY_MS);
+
+		return () => {
+			if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+		};
+	}, [open, preset, baseUrl, model, concurrency, apiKey, persist]);
 
 	// Open from anywhere: gear buttons, blocked flows, native menu event.
 	useEffect(() => {
@@ -128,46 +182,32 @@ export function SettingsDialog() {
 		};
 	}, []);
 
-	// First-run: nothing configured yet → open straight to the inference tab.
-	const autoOpened = useRef(false);
-	useEffect(() => {
-		if (autoOpened.current || !status) return;
-		autoOpened.current = true;
-		const needsKey = status.config.preset !== "ollama" && status.config.preset !== "lmstudio";
-		const ready = Boolean(status.config.base_url && status.config.model && (!needsKey || status.api_key_set));
-		if (!ready) {
-			setTab("inference");
-			setOpen(true);
+	// Models are only fetched after a successful connection (or an explicit
+	// refresh); listing them doubles as the connection test.
+	const modelsQuery = useProviderModels(false);
+
+	// "Test connection" first flushes the in-progress form edits to the
+	// backend, then lists against that freshly-persisted config — the same
+	// state generation reads. Keeps a single source of truth (no separate
+	// test path).
+	const testConnection = async () => {
+		setConnection(null);
+		setTesting(true);
+		try {
+			await persist();
+			const result = await modelsQuery.refetch();
+			if (result.isError) {
+				setConnection({ ok: false, error: String(result.error ?? "Connection failed.") });
+				return;
+			}
+			const models = result.data ?? [];
+			setConnection({ ok: true, count: models.length });
+			if (models.length > 0 && !model.trim()) {
+				setModel(models[0]);
+			}
+		} finally {
+			setTesting(false);
 		}
-	}, [status]);
-
-	const modelsQuery = useProviderModels(open);
-
-	const needsKey = preset !== "ollama" && preset !== "lmstudio";
-	const dirty =
-		status != null &&
-		(status.config.preset !== preset ||
-			status.config.base_url !== baseUrl ||
-			status.config.model !== model ||
-			status.config.concurrency !== concurrency ||
-			apiKey.trim() !== "");
-
-	const save = async () => {
-		await setConfig.mutateAsync({
-			preset,
-			base_url: baseUrl.trim(),
-			model: model.trim(),
-			concurrency,
-			api_key: apiKey.trim() === "" ? undefined : apiKey.trim(),
-		});
-		refetch();
-	};
-
-	const runValidation = async () => {
-		// Validation runs against the *stored* config, so persist unsaved edits first.
-		if (dirty) await save();
-		const result = await validate.mutateAsync();
-		setValidation({ ok: result.ok, error: result.error ?? undefined });
 	};
 
 	return (
@@ -237,13 +277,16 @@ export function SettingsDialog() {
 											value={preset}
 											onValueChange={(value) => {
 												const next = value as ProviderPreset;
+												const target = PRESETS.find((entry) => entry.value === next);
 												setPreset(next);
+												if (target) {
+													setBaseUrl(target.baseUrl);
+													setConnection(null);
+												}
 												if (next !== "custom") {
-													const target = PRESETS.find((entry) => entry.value === next);
-													if (target) {
-														setBaseUrl(target.baseUrl);
-														setModel(target.model);
-													}
+													setModel(target?.model ?? "");
+												} else {
+													setModel("");
 												}
 											}}
 										>
@@ -272,41 +315,77 @@ export function SettingsDialog() {
 										</Field>
 									)}
 
-									{needsKey && (
-										<Field>
-											<FieldLabel>API key</FieldLabel>
+									<Field>
+										<FieldLabel>API key</FieldLabel>
+										<div className="relative">
 											<Input
-												type="password"
-												placeholder={status?.api_key_set ? "Stored in your OS keychain" : "Paste your API key"}
+												type={showKey ? "text" : "password"}
+												placeholder={status?.api_key_set ? "*****************" : "Paste your API key"}
 												value={apiKey}
 												onChange={(event) => setApiKey(event.target.value)}
+												className="pr-10"
 											/>
-											<FieldDescription>
-												{status?.api_key_set
-													? "Leave blank to keep the stored key."
-													: "Stored only in this device's keychain."}
-											</FieldDescription>
-										</Field>
-									)}
+											<button
+												type="button"
+												tabIndex={-1}
+												onClick={() => setShowKey((value) => !value)}
+												className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+												aria-label={showKey ? "Hide API key" : "Show API key"}
+											>
+												{showKey ? <IconEyeOff className="size-4" /> : <IconEye className="size-4" />}
+											</button>
+										</div>
+										<FieldDescription>
+											{status?.api_key_set
+												? "A key is stored for this provider. Entering a new one replaces it."
+												: "No key stored for this provider. Stored only in this device's keychain."}
+										</FieldDescription>
+									</Field>
+
+									<Field>
+										<FieldLabel>Test connection</FieldLabel>
+										<Button
+											type="button"
+											variant="outline"
+											onClick={testConnection}
+											disabled={!baseUrl.trim() || testing}
+										>
+											{testing ? <Spinner /> : null}
+											{testing ? "Connecting…" : "Test connection"}
+										</Button>
+										{connection && (
+											<div
+												className={cn(
+													"flex items-center gap-2 rounded-md border px-3 py-2 text-sm",
+													connection.ok
+														? "border-green-600/30 bg-green-500/10 text-green-700 dark:text-green-400"
+														: "border-destructive/30 bg-destructive/10 text-destructive",
+												)}
+											>
+												{connection.ok ? <IconCheck className="size-4" /> : <IconX className="size-4" />}
+												{connection.ok
+													? connection.count && connection.count > 0
+														? `Connection verified — ${connection.count} ${connection.count === 1 ? "model" : "models"} available.`
+														: "Connection verified."
+													: (connection.error ?? "Connection failed.")}
+											</div>
+										)}
+									</Field>
 
 									<Field>
 										<FieldLabel>Model</FieldLabel>
-										<div className="flex gap-2">
-											<Input
-												placeholder="model id, e.g. gpt-4o-mini"
-												value={model}
-												onChange={(event) => setModel(event.target.value)}
-												list="provider-models"
-											/>
-											<datalist id="provider-models">
+										<Select value={model} onValueChange={(value) => setModel(value ?? "")}>
+											<SelectTrigger>
+												<SelectValue placeholder="Run Test connection to load models" />
+											</SelectTrigger>
+											<SelectContent>
 												{(modelsQuery.data ?? []).map((id) => (
-													<option key={id} value={id} />
+													<SelectItem key={id} value={id}>
+														{id}
+													</SelectItem>
 												))}
-											</datalist>
-											<Button type="button" variant="outline" onClick={() => modelsQuery.refetch()}>
-												{modelsQuery.isFetching ? <Spinner /> : "Fetch"}
-											</Button>
-										</div>
+											</SelectContent>
+										</Select>
 									</Field>
 
 									<Field>
@@ -322,20 +401,6 @@ export function SettingsDialog() {
 											Higher is faster; lower it if you hit provider rate limits. Free tiers often need 2–4.
 										</FieldDescription>
 									</Field>
-
-									{validation && (
-										<div
-											className={cn(
-												"flex items-center gap-2 rounded-md border px-3 py-2 text-sm",
-												validation.ok
-													? "border-green-600/30 bg-green-500/10 text-green-700 dark:text-green-400"
-													: "border-destructive/30 bg-destructive/10 text-destructive",
-											)}
-										>
-											{validation.ok ? <IconCheck className="size-4" /> : <IconX className="size-4" />}
-											{validation.ok ? "Connection verified." : (validation.error ?? "Validation failed.")}
-										</div>
-									)}
 								</div>
 							)}
 
@@ -392,19 +457,6 @@ export function SettingsDialog() {
 								</div>
 							)}
 						</div>
-
-						{tab === "inference" && (
-							<DialogFooter className="shrink-0 gap-3 border-t px-6 py-4">
-								<Button variant="ghost" onClick={runValidation} disabled={!baseUrl || !model || validate.isPending}>
-									{validate.isPending ? <Spinner /> : null}
-									Test connection
-								</Button>
-								<Button onClick={save} disabled={!baseUrl || !model || !dirty || setConfig.isPending}>
-									{setConfig.isPending ? <Spinner /> : null}
-									Save
-								</Button>
-							</DialogFooter>
-						)}
 					</div>
 				</SidebarProvider>
 			</DialogContent>

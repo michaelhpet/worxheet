@@ -17,16 +17,12 @@ pub struct ProviderStatus {
 #[tauri::command]
 pub async fn get_provider_status(state: State<'_, AppState>) -> Result<ProviderStatus, String> {
     let config = state.providers.get();
-    let api_key_set = if config.requires_api_key() {
-        config::load_api_key()?.is_some()
-    } else {
-        true
-    };
+    let api_key_set = config::load_api_key(&config.preset)?.is_some();
     Ok(ProviderStatus { config, api_key_set })
 }
 
-/// Save provider settings. `api_key` of `Some("")` clears the stored key;
-/// `None` leaves it untouched.
+/// Save provider settings. `api_key` of `Some("")` clears the stored key for
+/// the selected provider; `None` leaves it untouched.
 #[tauri::command]
 pub async fn set_provider_config(
     state: State<'_, AppState>,
@@ -47,17 +43,16 @@ pub async fn set_provider_config(
         config.base_url = base_url.to_string();
     }
 
-    if let Some(key) = &api_key {
-        config::store_api_key(key)?;
-    }
+    // Persist the config first so a keychain failure below can never leave the
+    // active base URL/preset stale.
     state.providers.set(config.clone());
 
+    if let Some(key) = &api_key {
+        config::store_api_key(&config.preset, key).map_err(|error| format!("Failed to store API key: {error}"))?;
+    }
+
     Ok(ProviderStatus {
-        api_key_set: if config.requires_api_key() {
-            config::load_api_key()?.is_some()
-        } else {
-            true
-        },
+        api_key_set: config::load_api_key(&config.preset)?.is_some(),
         config,
     })
 }
@@ -99,11 +94,10 @@ pub async fn validate_provider(state: State<'_, AppState>) -> Result<ValidationR
 
 #[tauri::command]
 pub async fn list_provider_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let client = OpenAiClient::new(
-        &state.providers.get().base_url,
-        config::load_api_key()?,
-        &state.providers.get().model,
-    );
+    let config = state.providers.get();
+    // Key presence is the only signal: absent key → no Authorization header.
+    let api_key = config::load_api_key(&config.preset)?.filter(|key| !key.is_empty());
+    let client = OpenAiClient::new(&config.base_url, api_key, &config.model);
     client
         .list_models()
         .await

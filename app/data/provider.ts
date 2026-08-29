@@ -26,11 +26,12 @@ export const PROVIDER_QUERY_KEY = "PROVIDER";
 
 export interface SetProviderConfigInput {
 	preset: string;
-	base_url: string;
+	/** Tauri v2 maps camelCase JS args to snake_case Rust params. */
+	baseUrl: string;
 	model: string;
 	concurrency: number;
-	/** `undefined` keeps the stored key; empty string clears it. */
-	api_key?: string;
+	/** `undefined`/empty keeps the stored key; empty string clears it. */
+	apiKey?: string;
 }
 
 export function useProviderStatus() {
@@ -67,10 +68,8 @@ export function useProviderModels(enabled: boolean) {
 	});
 }
 
-/** Whether the provider can generate right now (configured + key present). */
+/** Whether a provider is configured enough to attempt generation (base URL + model). */
 export function isProviderReady(status: ProviderStatus | undefined): boolean {
 	if (!status) return false;
-	const { config, api_key_set } = status;
-	const needsKey = config.preset !== "ollama" && config.preset !== "lmstudio";
-	return Boolean(config.base_url) && Boolean(config.model) && (!needsKey || api_key_set);
+	return Boolean(status.config.base_url) && Boolean(status.config.model);
 }

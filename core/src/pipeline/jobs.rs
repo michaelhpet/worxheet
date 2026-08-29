@@ -234,16 +234,8 @@ pub fn resolve_backend(
             "No LLM provider is configured. Open Settings and add a provider.",
         ));
     }
-    let api_key = if config.requires_api_key() {
-        provider::config::load_api_key()?.filter(|key| !key.is_empty())
-    } else {
-        None
-    };
-    if config.requires_api_key() && api_key.is_none() {
-        return Err(String::from(
-            "The configured provider needs an API key. Open Settings and sign in again.",
-        ));
-    }
+    // Key presence is the only signal: absent key → no Authorization header.
+    let api_key = provider::config::load_api_key(&config.preset)?.filter(|key| !key.is_empty());
     let backend = Arc::new(OpenAiClient::new(&config.base_url, api_key, &config.model));
     Ok((backend, config.concurrency))
 }

@@ -105,7 +105,9 @@ impl ArtifactBackend for OpenAiClient {
                 body.clone()
             } else {
                 let mut stripped = body.clone();
-                stripped.as_object_mut().map(|map| map.remove("response_format"));
+                stripped
+                    .as_object_mut()
+                    .map(|map| map.remove("response_format"));
                 stripped
             };
 
@@ -133,7 +135,10 @@ impl ArtifactBackend for OpenAiClient {
                     .and_then(|value| value.parse::<u64>().ok())
                     .map(std::time::Duration::from_secs);
                 let message = response.text().await.unwrap_or_default();
-                last_error = ProviderError::RateLimited { retry_after, message };
+                last_error = ProviderError::RateLimited {
+                    retry_after,
+                    message,
+                };
                 match retry_after {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => sleep_backoff(attempt).await,
@@ -167,7 +172,11 @@ impl ArtifactBackend for OpenAiClient {
                 .choices
                 .first()
                 .and_then(|choice| choice.message.content.clone())
-                .ok_or_else(|| ProviderError::InvalidResponse(String::from("completion had no message content")))?;
+                .ok_or_else(|| {
+                    ProviderError::InvalidResponse(String::from(
+                        "completion had no message content",
+                    ))
+                })?;
 
             return Ok(strip_code_fence(&content));
         }
@@ -190,16 +199,19 @@ impl ArtifactBackend for OpenAiClient {
             });
         }
         if status.is_client_error() {
-            return Err(ProviderError::Rejected(format!("model listing failed ({status})")));
+            return Err(ProviderError::Rejected(format!(
+                "model listing failed ({status})"
+            )));
         }
         if status.is_server_error() {
-            return Err(ProviderError::Server(format!("model listing failed ({status})")));
+            return Err(ProviderError::Server(format!(
+                "model listing failed ({status})"
+            )));
         }
 
-        let models: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|error| ProviderError::InvalidResponse(format!("failed to decode models: {error}")))?;
+        let models: ModelsResponse = response.json().await.map_err(|error| {
+            ProviderError::InvalidResponse(format!("failed to decode models: {error}"))
+        })?;
         Ok(models.data.into_iter().map(|entry| entry.id).collect())
     }
 }

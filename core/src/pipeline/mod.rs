@@ -3,6 +3,7 @@
 //! stage is fully local.
 
 use sqlx::SqlitePool;
+use std::sync::Arc;
 
 use crate::schema::{Artifact, ArtifactType, Segment};
 
@@ -18,14 +19,17 @@ pub use jobs::{
 };
 
 /// Parse, segment, and persist every file of a worksheet. Reports progress as
-/// each file completes through `on_progress`.
+/// each file completes through `on_progress`. `logs` (when given) receives
+/// per-file artifacts under `logs/file_reads`, `logs/tokenization`, and
+/// `logs/segmentation`.
 pub async fn process_files(
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     start_position: i32,
-    tokenizer: tokenizers::Tokenizer,
+    tokenizer: Arc<tokenizers::Tokenizer>,
     on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
+    logs: Option<Arc<crate::logging::RunLogs>>,
 ) -> Result<Vec<Segment>, String> {
     ingest::process_files(
         pool,
@@ -34,6 +38,7 @@ pub async fn process_files(
         start_position,
         tokenizer,
         on_progress,
+        logs,
     )
     .await
 }
@@ -423,6 +428,7 @@ mod tests {
             Some(GenerationParams::default()),
             None,
             None,
+            None,
         )
         .await
         .expect("generation should succeed");
@@ -491,6 +497,7 @@ mod tests {
             2,
             &segments,
             ExistingArtifacts::default(),
+            None,
             None,
             None,
             None,

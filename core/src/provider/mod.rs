@@ -50,8 +50,15 @@ impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unconfigured => write!(f, "No LLM provider is configured"),
-            Self::RateLimited { retry_after, message } => match retry_after {
-                Some(delay) => write!(f, "Rate limited (retry after {:.0}s): {message}", delay.as_secs_f32()),
+            Self::RateLimited {
+                retry_after,
+                message,
+            } => match retry_after {
+                Some(delay) => write!(
+                    f,
+                    "Rate limited (retry after {:.0}s): {message}",
+                    delay.as_secs_f32()
+                ),
                 None => write!(f, "Rate limited: {message}"),
             },
             Self::Network(message) => write!(f, "Network error: {message}"),

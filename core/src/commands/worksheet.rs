@@ -23,10 +23,7 @@ pub async fn get_worksheet(
 }
 
 #[tauri::command]
-pub async fn delete_worksheet(
-    state: State<'_, AppState>,
-    id: &str,
-) -> Result<(), String> {
+pub async fn delete_worksheet(state: State<'_, AppState>, id: &str) -> Result<(), String> {
     pipeline::remove_job(&state.jobs, id);
     worksheet::delete_worksheet(&state.database, id).await
 }

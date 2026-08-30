@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::logging::{self, RunLogs};
 use crate::provider::{ArtifactBackend, GenerateRequest};
 use crate::schema::{ArtifactType, Segment};
 
@@ -144,11 +145,27 @@ fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> Result<Vec
         ));
     }
 
+    // Guard generation against content-less units. Segmentation guarantees
+    // real segments for freshly ingested files, but stale or reused chunks can
+    // still carry empty slivers — page/number markers, dot leaders, boilerplate
+    // — whose near-empty context makes the model reply with nothing, which
+    // fails validation. Sampling from the remaining ordered pool keeps coverage
+    // while never emitting an empty context.
+    let usable: Vec<&Segment> = segments
+        .iter()
+        .filter(|segment| !is_degenerate_segment(segment))
+        .collect();
+    if usable.is_empty() {
+        return Err(String::from(
+            "No usable segments found for this worksheet. Re-ingest the source files.",
+        ));
+    }
+
     let mut units = Vec::new();
     for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
-        let indices = pick_indices(segments.len(), MAX_UNITS_PER_TYPE);
+        let indices = pick_indices(usable.len(), MAX_UNITS_PER_TYPE);
         for segment_index in indices {
-            let segment = &segments[segment_index];
+            let segment = usable[segment_index];
             let context = match &segment.heading {
                 Some(heading) => format!("[Section: {heading}]\n{}", segment.text),
                 None => segment.text.clone(),
@@ -165,6 +182,28 @@ fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> Result<Vec
     }
     Ok(units)
 }
+
+/// True when a segment carries no usable source material and must never be
+/// sent to the model. Deliberately content-based and format-agnostic: it does
+/// not assume any particular marker, numbering scheme, or material shape.
+/// Leaves that are indistinguishable from noise — empty text, page/number
+/// markers, dot leaders, numeral runs, spot boilerplate — share one trait:
+/// almost none of their tokens are real words. Rejecting those keeps
+/// legitimately short but prose-bearing segments.
+fn is_degenerate_segment(segment: &Segment) -> bool {
+    fn meaningful_words(text: &str) -> usize {
+        text.split_whitespace()
+            .filter(|word| word.chars().any(char::is_alphabetic))
+            .count()
+    }
+
+    let text = segment.text.trim();
+    text.is_empty() || meaningful_words(text) < MIN_CONTENT_WORDS
+}
+
+/// A unit's source context needs enough real prose to ground an answer; a
+/// couple of full sentences is the smallest plausible source.
+const MIN_CONTENT_WORDS: usize = 10;
 
 /// Evenly sample `cap` indices when there are more than `cap`, else all.
 fn pick_indices(total: usize, cap: usize) -> Vec<usize> {
@@ -520,6 +559,7 @@ async fn run_unit(
     unit: &Unit,
     params: &GenerationParams,
     seen_questions: &Mutex<Vec<String>>,
+    logs: Option<&RunLogs>,
 ) -> UnitOutcome {
     let mut requests_made = 0usize;
     let mut tokens_in = 0u64;
@@ -533,6 +573,9 @@ async fn run_unit(
     let base_seed = params.seed.wrapping_add(unit.seed_offset);
     let base_user = user_prompt(&unit.artifact_type, count, &unit.context);
 
+    let unit_type = unit.artifact_type.to_db();
+    let schema_label = logging::sanitize_label(&schema_name);
+
     let make_request = |seed: u64, user: String| GenerateRequest {
         system: system.clone(),
         user,
@@ -543,13 +586,42 @@ async fn run_unit(
         seed,
     };
 
-    let mut user = base_user.clone();
-    let mut validated;
+    // Best-effort generation trace: one request artifact per attempt, one
+    // response artifact per call, all under logs/generation/.
+    let log_request = |attempt: usize, request: &GenerateRequest| {
+        if let Some(logs) = logs {
+            let record = serde_json::json!({
+                "timestamp": logging::rfc3339_utc(),
+                "unit_type": unit_type,
+                "segment_id": unit.segment_id,
+                "attempt": attempt,
+                "seed": request.seed,
+                "system": request.system,
+                "user": request.user,
+                "schema_name": request.schema_name,
+                "schema": request.schema,
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+            });
+            let label = format!("{}_seed{}_attempt{}", schema_label, request.seed, attempt);
+            logs.write_json("generation", &label, &record);
+        }
+    };
 
-    let raw = match backend
-        .generate_json(&make_request(base_seed, user.clone()))
-        .await
-    {
+    let log_response = |attempt: usize, seed: u64, record: &serde_json::Value| {
+        if let Some(logs) = logs {
+            let label = format!("{}_seed{}_attempt{}_response", schema_label, seed, attempt);
+            logs.write_json("generation", &label, record);
+        }
+    };
+
+    let mut user = base_user.clone();
+
+    // First attempt.
+    let request = make_request(base_seed, user.clone());
+    log_request(0, &request);
+    let started = std::time::Instant::now();
+    let raw = match backend.generate_json(&request).await {
         Ok(raw) => {
             requests_made += 1;
             tokens_in += approximate_tokens(&system) + approximate_tokens(&user);
@@ -557,7 +629,23 @@ async fn run_unit(
             raw
         }
         Err(error) => {
-            eprintln!("[pipeline] unit failed ({schema_name}): {error}");
+            log_response(
+                0,
+                base_seed,
+                &serde_json::json!({
+                    "timestamp": logging::rfc3339_utc(),
+                    "unit_type": unit_type,
+                    "segment_id": unit.segment_id,
+                    "attempt": 0,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "status": "error",
+                    "error": format!("{error}"),
+                }),
+            );
+            eprintln!(
+                "[{}] [pipeline] unit failed ({schema_name}): {error}",
+                logging::rfc3339_utc()
+            );
             return UnitOutcome {
                 items: Vec::new(),
                 requests_made,
@@ -568,19 +656,34 @@ async fn run_unit(
         }
     };
 
-    validated = validate_unit_output(
+    let mut validated = validate_unit_output(
         &unit.artifact_type,
         &raw,
         &unit.context,
         &seen_questions.lock().unwrap(),
     );
+    log_response(
+        0,
+        base_seed,
+        &serde_json::json!({
+            "timestamp": logging::rfc3339_utc(),
+            "unit_type": unit_type,
+            "segment_id": unit.segment_id,
+            "attempt": 0,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "status": "ok",
+            "verdict": if validated.items.is_empty() { "rejected" } else { "ok" },
+            "raw": raw,
+            "rejection_reasons": validated.rejection_reasons.clone(),
+        }),
+    );
 
     if validated.items.is_empty() && !validated.rejection_reasons.is_empty() {
         user.push_str(&retry_feedback(&validated.rejection_reasons));
-        match backend
-            .generate_json(&make_request(base_seed.wrapping_add(7_919), user))
-            .await
-        {
+        let request = make_request(base_seed.wrapping_add(7_919), user);
+        log_request(1, &request);
+        let started = std::time::Instant::now();
+        match backend.generate_json(&request).await {
             Ok(retry_raw) => {
                 requests_made += 1;
                 tokens_out += approximate_tokens(&retry_raw);
@@ -590,9 +693,40 @@ async fn run_unit(
                     &unit.context,
                     &seen_questions.lock().unwrap(),
                 );
+                log_response(
+                    1,
+                    request.seed,
+                    &serde_json::json!({
+                        "timestamp": logging::rfc3339_utc(),
+                        "unit_type": unit_type,
+                        "segment_id": unit.segment_id,
+                        "attempt": 1,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "status": "ok",
+                        "verdict": if validated.items.is_empty() { "rejected" } else { "ok" },
+                        "raw": retry_raw,
+                        "rejection_reasons": validated.rejection_reasons.clone(),
+                    }),
+                );
             }
             Err(error) => {
-                eprintln!("[pipeline] unit retry failed ({schema_name}): {error}");
+                log_response(
+                    1,
+                    request.seed,
+                    &serde_json::json!({
+                        "timestamp": logging::rfc3339_utc(),
+                        "unit_type": unit_type,
+                        "segment_id": unit.segment_id,
+                        "attempt": 1,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "status": "error",
+                        "error": format!("{error}"),
+                    }),
+                );
+                eprintln!(
+                    "[{}] [pipeline] unit retry failed ({schema_name}): {error}",
+                    logging::rfc3339_utc()
+                );
                 if backend_error.is_none() {
                     backend_error = Some(format!("{error}"));
                 }
@@ -619,7 +753,8 @@ async fn run_unit(
 
     if validated.items.is_empty() {
         eprintln!(
-            "[pipeline] dropping unit ({schema_name}): {}",
+            "[{}] [pipeline] dropping unit ({schema_name}): {}",
+            logging::rfc3339_utc(),
             validated
                 .rejection_reasons
                 .first()
@@ -650,6 +785,7 @@ struct UnitRecord {
 /// routed to it as each unit completes (incremental persistence) and nothing
 /// is returned; otherwise all artifacts are returned for the caller to persist.
 /// Returns pending artifacts plus aggregate telemetry.
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_all(
     backend: Arc<dyn ArtifactBackend>,
     concurrency: usize,
@@ -658,6 +794,7 @@ pub async fn generate_all(
     params: Option<GenerationParams>,
     on_persist: Option<PersistFn>,
     on_progress: Option<ProgressFn>,
+    logs: Option<Arc<RunLogs>>,
 ) -> Result<(Vec<PendingArtifact>, RunTelemetry), String> {
     let params = params.unwrap_or_default();
     let units = build_units(segments, &existing)?;
@@ -709,9 +846,11 @@ pub async fn generate_all(
         let completed_types = completed_types.clone();
         let on_progress = on_progress.clone();
         let on_persist = on_persist.clone();
+        let logs = logs.clone();
 
         handles.push(tokio::spawn(async move {
-            let outcome = run_unit(&backend, &unit, &params, &seen_questions).await;
+            let outcome =
+                run_unit(&backend, &unit, &params, &seen_questions, logs.as_deref()).await;
 
             {
                 let mut stats = telemetry.lock().unwrap();
@@ -935,5 +1074,89 @@ fn merge_sections(
             )
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(position: i32, heading: Option<&str>, text: &str) -> Segment {
+        Segment {
+            id: format!("seg-{position}"),
+            worksheet_id: String::from("ws"),
+            file_id: String::from("file"),
+            position,
+            heading: heading.map(str::to_string),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_is_degenerate_segment_rejects_noise_not_short_prose() {
+        // Reason a robust, format-agnostic check matters: none of these
+        // reproduce a specific marker string, yet all are content-less noise.
+        for noise in [
+            "[Page 2]",
+            "[Slide 3]",
+            "1 2 3 4",
+            ". . . . . . . . . . 182 6.4 ATP . . . . . . . . .",
+            "  \t  ",
+        ] {
+            assert!(
+                is_degenerate_segment(&segment(0, None, noise)),
+                "expected {noise:?} to be degenerate"
+            );
+        }
+
+        // Legitimately short real prose must survive.
+        let short = "The mitochondrion is the powerhouse of the cell and respiration produces ATP.";
+        assert!(!is_degenerate_segment(&segment(0, None, short)));
+        let long = "OpenStax provides free, peer-reviewed, openly licensed textbooks. \
+                    Every volume is written by subject experts and reviewed for accuracy.";
+        assert!(!is_degenerate_segment(&segment(1, Some("COLLEGE"), long)));
+    }
+
+    #[test]
+    fn test_build_units_skips_degenerate_segments() {
+        let segments = vec![
+            segment(0, None, "[Page 2]"),
+            segment(1, Some("COLLEGE"), "OpenStax provides free, peer-reviewed, openly licensed \
+                 textbooks used by students and instructors across many institutions."),
+            segment(2, None, ". . . . . 227 8.1 Overview of Photosynthesis . . . . . . . . . ."),
+            segment(3, None, "Mitochondria produce ATP through respiration and the citric acid \
+                 cycle powers cellular work with the energy stored in its bonds."),
+        ];
+
+        let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
+        let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
+        let expected = ["seg-1", "seg-3"].repeat(ArtifactType::ALL.len());
+        assert_eq!(used.len(), expected.len());
+
+        for artifact_type in ArtifactType::ALL.iter() {
+            let contexts: Vec<&str> = units
+                .iter()
+                .filter(|unit| unit.artifact_type == *artifact_type)
+                .map(|unit| unit.context.as_str())
+                .collect();
+            assert_eq!(contexts.len(), 2);
+            assert!(contexts[0].contains("OpenStax provides free"));
+            assert!(contexts[1].contains("Mitochondria produce ATP"));
+        }
+    }
+
+    #[test]
+    fn test_build_units_errors_when_everything_degenerate() {
+        let segments = vec![
+            segment(0, None, "[Page 2]"),
+            segment(1, None, "1 2 3 4"),
+            segment(2, None, "  "),
+        ];
+        let result = build_units(&segments, &ExistingArtifacts::default());
+        let error = match result {
+            Ok(_) => panic!("expected all-degenerate segments to error"),
+            Err(error) => error,
+        };
+        assert!(error.contains("No usable segments"));
     }
 }

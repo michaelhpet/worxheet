@@ -32,7 +32,9 @@ impl MockBackend {
         }
     }
 
-    pub fn with_responder(respond: impl Fn(&GenerateRequest) -> Result<String, ProviderError> + Send + Sync + 'static) -> Self {
+    pub fn with_responder(
+        respond: impl Fn(&GenerateRequest) -> Result<String, ProviderError> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             responses: Mutex::new(VecDeque::new()),
             responder: Some(Box::new(respond)),
@@ -84,7 +86,10 @@ mod tests {
             seed: 1,
         };
 
-        assert_eq!(backend.generate_json(&request).await.unwrap(), r#"{"first": true}"#);
+        assert_eq!(
+            backend.generate_json(&request).await.unwrap(),
+            r#"{"first": true}"#
+        );
         assert!(matches!(
             backend.generate_json(&request).await,
             Err(ProviderError::Rejected(_))

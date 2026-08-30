@@ -68,7 +68,7 @@ const PERSIST_DELAY_MS = 400;
 
 export function SettingsDialog() {
 	const [open, setOpen] = useState(false);
-	const [tab, setTab] = useState<SettingsTab>("inference");
+	const [tab, setTab] = useState<SettingsTab>("appearance");
 
 	const { theme, setTheme } = useTheme();
 

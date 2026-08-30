@@ -306,6 +306,10 @@ async fn run_pipeline(
     // configuration fails fast with an actionable message.
     let (backend, concurrency) = resolve_backend(providers)?;
     let tokenizer = segment::bundled_tokenizer()?;
+    let logs = Arc::new(
+        crate::logging::RunLogs::new()
+            .ok_or_else(|| String::from("Failed to resolve log directory"))?,
+    );
 
     let on_ingest = progress_sink(app, jobs, worksheet_id);
     let start_position = super::next_segment_position(pool, worksheet_id).await?;
@@ -315,6 +319,7 @@ async fn run_pipeline(
     let (to_parse, start_position) =
         super::reuse_chunks(pool, worksheet_id, &pending_files, start_position).await?;
 
+    let tokenizer = Arc::new(tokenizer);
     super::process_files(
         pool,
         worksheet_id,
@@ -322,6 +327,7 @@ async fn run_pipeline(
         start_position,
         tokenizer,
         Some(on_ingest),
+        Some(logs.clone()),
     )
     .await?;
 
@@ -362,10 +368,12 @@ async fn run_pipeline(
         None,
         Some(on_persist),
         Some(on_generate),
+        Some(logs.clone()),
     )
     .await?;
     println!(
-        "[pipeline] generated {} merged artifacts across {} requests (~{}k in / ~{}k out tokens) in {:?}",
+        "[{}] [pipeline] generated {} merged artifacts across {} requests (~{}k in / ~{}k out tokens) in {:?}",
+        crate::logging::rfc3339_utc(),
         pending.len(),
         telemetry.requests,
         telemetry.tokens_in / 1000,

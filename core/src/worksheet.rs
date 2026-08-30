@@ -269,10 +269,7 @@ pub async fn create_worksheet(
             .ok_or_else(|| format!("File has no extension: {}", file_path))?
             .to_string_lossy()
             .to_string();
-        let size = std::fs::metadata(file_path)
-            .map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?
-            .len();
-        let sha256 = sha256_of_path(file_path)?;
+        let (identity, size) = file_identity_key(file_path)?;
 
         let file_id = Ulid::new().to_string();
 
@@ -285,7 +282,7 @@ pub async fn create_worksheet(
         .bind(&file_name)
         .bind(&extension)
         .bind(size as i64)
-        .bind(&sha256)
+        .bind(&identity)
         .execute(&mut *transaction)
         .await
         .map_err(|_| String::from("Failed to register file"))?;
@@ -306,13 +303,22 @@ pub struct FileMetadata {
     size: u64,
 }
 
-/// Content fingerprint of a file, used to detect an already-ingested copy of
-/// the same source so its chunks can be reused without re-parsing.
-pub fn sha256_of_path(path: &str) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
-    let digest = Sha256::digest(&bytes);
-    Ok(hex::encode(digest))
+/// Source-file identity key: absolute path + size + modified time. Used to
+/// detect an already-ingested copy of the same file so its chunks can be
+/// reused without re-parsing. Path+size+mtime never collide for distinct,
+/// unchanged files, and an edited file bumps mtime (usually size too), forcing
+/// a fresh parse. Returns the key and the size for the `files.size` column.
+pub fn file_identity_key(path: &str) -> Result<(String, u64), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read metadata for '{}': {}", path, e))?;
+    let size = metadata.len();
+    let modified = metadata
+        .modified()
+        .map_err(|e| format!("Failed to read modified time for '{}': {}", path, e))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Failed to read modified time for '{}': {}", path, e))?
+        .as_nanos();
+    Ok((format!("{path}\u{1f}{size}\u{1f}{modified}"), size))
 }
 
 pub fn get_file_metadata(path: &str) -> Result<FileMetadata, String> {
@@ -390,5 +396,38 @@ mod tests {
         assert_eq!(result.name, "archive.tar.gz");
         assert_eq!(result.extension, "gz");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_identity_key_stable_for_unchanged_file() {
+        let path = temp_path("identity_a.txt");
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(b"hello").unwrap();
+
+        let (key1, size1) = file_identity_key(&path).unwrap();
+        let (key2, size2) = file_identity_key(&path).unwrap();
+        assert_eq!(size1, 5);
+        assert_eq!(size2, 5);
+        assert_eq!(key1, key2, "unchanged file must keep its identity key");
+        assert!(key1.contains(&path));
+
+        fs::remove_file(&path).unwrap();
+
+        let missing = file_identity_key(&path);
+        assert!(missing.is_err(), "missing file must error");
+    }
+
+    #[test]
+    fn test_file_identity_key_changes_when_file_rewritten() {
+        let path = temp_path("identity_b.txt");
+        fs::write(&path, b"hello").unwrap();
+        let (before, _) = file_identity_key(&path).unwrap();
+
+        fs::write(&path, b"hello world!").unwrap();
+        let (after, size_after) = file_identity_key(&path).unwrap();
+
+        assert_ne!(before, after, "rewriting the file must change its identity key");
+        assert_eq!(size_after, 12);
+        fs::remove_file(&path).unwrap();
     }
 }

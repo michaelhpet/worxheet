@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 /// reached through the `custom` preset with a user-supplied base URL.
 pub const PRESETS: &[(&str, &str)] = &[
     ("openai", "https://api.openai.com/v1"),
-    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
     ("ollama", "https://ollama.com/v1"),
     ("lmstudio", "http://localhost:1234/v1"),
 ];
@@ -38,7 +41,9 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             preset: String::from("openai"),
-            base_url: base_url_for_preset("openai").unwrap_or_default().to_string(),
+            base_url: base_url_for_preset("openai")
+                .unwrap_or_default()
+                .to_string(),
             model: default_model_for_preset("openai").to_string(),
             concurrency: 8,
         }

@@ -4,11 +4,12 @@ use sqlx::{Pool, Sqlite};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager};
 
+use crate::pipeline::{resume_stale, PipelineJobs};
 use crate::provider::config::{ProviderConfig, ProviderState};
-use crate::pipeline::{PipelineJobs, resume_stale};
 
 mod commands;
 mod database;
+mod logging;
 mod pipeline;
 mod provider;
 mod schema;

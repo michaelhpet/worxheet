@@ -3,8 +3,8 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::provider::{client::OpenAiClient, ArtifactBackend};
 use crate::provider::config::{self, ProviderConfig};
+use crate::provider::{client::OpenAiClient, ArtifactBackend};
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -18,7 +18,10 @@ pub struct ProviderStatus {
 pub async fn get_provider_status(state: State<'_, AppState>) -> Result<ProviderStatus, String> {
     let config = state.providers.get();
     let api_key_set = config::load_api_key(&config.preset)?.is_some();
-    Ok(ProviderStatus { config, api_key_set })
+    Ok(ProviderStatus {
+        config,
+        api_key_set,
+    })
 }
 
 /// Save provider settings. `api_key` of `Some("")` clears the stored key for
@@ -48,7 +51,8 @@ pub async fn set_provider_config(
     state.providers.set(config.clone());
 
     if let Some(key) = &api_key {
-        config::store_api_key(&config.preset, key).map_err(|error| format!("Failed to store API key: {error}"))?;
+        config::store_api_key(&config.preset, key)
+            .map_err(|error| format!("Failed to store API key: {error}"))?;
     }
 
     Ok(ProviderStatus {

@@ -42,7 +42,10 @@ fn strip_one_prefix(text: &str) -> Option<&str> {
         }
         if first == b'(' {
             // `(a)` / `(1)` forms
-            if bytes.len() >= 4 && bytes[2] == b')' && (bytes[1].is_ascii_alphabetic() || bytes[1].is_ascii_digit()) {
+            if bytes.len() >= 4
+                && bytes[2] == b')'
+                && (bytes[1].is_ascii_alphabetic() || bytes[1].is_ascii_digit())
+            {
                 return Some(trimmed[3..].trim_start());
             }
         }
@@ -52,7 +55,10 @@ fn strip_one_prefix(text: &str) -> Option<&str> {
     let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits > 0 && digits < 4 {
         let after = &trimmed[digits..];
-        if let Some(rest) = after.strip_prefix('.') .or_else(|| after.strip_prefix(')').or_else(|| after.strip_prefix(':'))) {
+        if let Some(rest) = after
+            .strip_prefix('.')
+            .or_else(|| after.strip_prefix(')').or_else(|| after.strip_prefix(':')))
+        {
             return Some(rest.trim_start());
         }
     }
@@ -64,10 +70,23 @@ fn strip_one_prefix(text: &str) -> Option<&str> {
 pub fn references_missing_media(text: &str) -> bool {
     let lowered = text.to_lowercase();
     let patterns = [
-        "figure ", "fig. ", "fig ", "diagram ", "chart above", "chart below",
-        "table above", "table below", "image above", "image below",
-        "shown above", "shown below", "pictured", "illustrated above",
-        "illustrated below", "as seen in the image", "see appendix",
+        "figure ",
+        "fig. ",
+        "fig ",
+        "diagram ",
+        "chart above",
+        "chart below",
+        "table above",
+        "table below",
+        "image above",
+        "image below",
+        "shown above",
+        "shown below",
+        "pictured",
+        "illustrated above",
+        "illustrated below",
+        "as seen in the image",
+        "see appendix",
     ];
     patterns.iter().any(|pattern| lowered.contains(pattern))
 }
@@ -75,11 +94,11 @@ pub fn references_missing_media(text: &str) -> bool {
 /// Content words (lowercased, stopwords removed) used for grounding checks.
 fn content_words(text: &str) -> HashSet<String> {
     const STOPWORDS: &[&str] = &[
-        "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
-        "with", "as", "by", "at", "from", "is", "are", "was", "were", "be", "been", "being",
-        "it", "its", "this", "that", "these", "those", "which", "what", "who", "when",
-        "where", "why", "how", "not", "no", "yes", "can", "could", "should", "would",
-        "will", "shall", "may", "might", "must", "do", "does", "did", "have", "has", "had",
+        "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for", "with",
+        "as", "by", "at", "from", "is", "are", "was", "were", "be", "been", "being", "it", "its",
+        "this", "that", "these", "those", "which", "what", "who", "when", "where", "why", "how",
+        "not", "no", "yes", "can", "could", "should", "would", "will", "shall", "may", "might",
+        "must", "do", "does", "did", "have", "has", "had",
     ];
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|word| word.len() > 2)
@@ -96,7 +115,10 @@ pub fn grounding_ratio(item_text: &str, source_segment: &str) -> f32 {
         return 1.0;
     }
     let source_words = content_words(source_segment);
-    let hits = item_words.iter().filter(|word| source_words.contains(*word)).count();
+    let hits = item_words
+        .iter()
+        .filter(|word| source_words.contains(*word))
+        .count();
     hits as f32 / item_words.len() as f32
 }
 
@@ -141,7 +163,11 @@ pub fn validate_mcq_item(
 
     let raw_options = match item.get("options").and_then(serde_json::Value::as_array) {
         Some(options) if options.len() == 4 => options,
-        _ => return ItemVerdict::Rejected(format!("question {question:?}: expected exactly 4 options")),
+        _ => {
+            return ItemVerdict::Rejected(format!(
+                "question {question:?}: expected exactly 4 options"
+            ))
+        }
     };
 
     let mut options = Vec::with_capacity(4);
@@ -156,8 +182,7 @@ pub fn validate_mcq_item(
         options.push(normalized);
     }
 
-    let lowered: HashSet<String> =
-        options.iter().map(|option| option.to_lowercase()).collect();
+    let lowered: HashSet<String> = options.iter().map(|option| option.to_lowercase()).collect();
     if lowered.len() != 4 {
         let duplicates: Vec<String> = options.clone();
         return ItemVerdict::Rejected(format!(
@@ -231,10 +256,15 @@ pub fn validate_completion_item(
         ));
     }
 
-    let hint = item.get("hint").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let hint = item
+        .get("hint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     let combined = format!("{sentence} {answer}");
     if references_missing_media(&combined) {
-        return ItemVerdict::Rejected(String::from("references figures/media absent from the source"));
+        return ItemVerdict::Rejected(String::from(
+            "references figures/media absent from the source",
+        ));
     }
 
     ItemVerdict::Accepted(serde_json::json!({
@@ -253,7 +283,9 @@ pub fn validate_essay_item(item: &serde_json::Value) -> ItemVerdict {
         return ItemVerdict::Rejected(String::from("empty question"));
     }
     if references_missing_media(question) {
-        return ItemVerdict::Rejected(String::from("references figures/media absent from the source"));
+        return ItemVerdict::Rejected(String::from(
+            "references figures/media absent from the source",
+        ));
     }
     ItemVerdict::Accepted(item.clone())
 }

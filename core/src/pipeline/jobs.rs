@@ -328,16 +328,23 @@ async fn run_pipeline(
 
     // Per-item quiz artifacts persist incrementally as each unit completes so
     // an interruption keeps finished parts. Merged types (Summary/MindMap) are
-    // returned below and persisted once in `pending`.
+    // returned below and persisted once in `pending`. Handles are tracked so
+    // every write is awaited before the worksheet is marked `done`.
+    let persist_handles: Arc<std::sync::Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let on_persist = {
         let pool = pool.clone();
         let worksheet_id = worksheet_id.to_string();
+        let persist_handles = persist_handles.clone();
         Arc::new(move |artifacts: Vec<super::generate::PendingArtifact>| {
             let pool = pool.clone();
             let worksheet_id = worksheet_id.clone();
-            tauri::async_runtime::spawn(async move {
+            let persist_handles = persist_handles.clone();
+            let handle = tauri::async_runtime::spawn(async move {
                 let _ = super::persist_artifacts(&pool, &worksheet_id, &artifacts).await;
             });
+            persist_handles.lock().unwrap().push(handle);
         }) as super::generate::PersistFn
     };
 

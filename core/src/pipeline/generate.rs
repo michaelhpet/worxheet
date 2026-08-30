@@ -97,6 +97,9 @@ pub struct RunTelemetry {
     pub requests: usize,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Number of units that failed to reach the provider (transport/LLM
+    /// errors), as opposed to being dropped at validation time.
+    pub backend_errors: usize,
 }
 
 /// Aggregates which artifacts already exist for a worksheet, so a resumed run
@@ -506,6 +509,10 @@ struct UnitOutcome {
     requests_made: usize,
     tokens_in: u64,
     tokens_out: u64,
+    /// Set when the request could not reach / be completed by the provider
+    /// (connection, auth, rate-limit, etc.) rather than being a content-level
+    /// rejection. Used to distinguish a provider outage from dropped items.
+    backend_error: Option<String>,
 }
 
 async fn run_unit(
@@ -517,6 +524,7 @@ async fn run_unit(
     let mut requests_made = 0usize;
     let mut tokens_in = 0u64;
     let mut tokens_out = 0u64;
+    let mut backend_error: Option<String> = None;
 
     let count = items_per_unit(&unit.artifact_type);
     let system = system_prompt().to_string();
@@ -555,6 +563,7 @@ async fn run_unit(
                 requests_made,
                 tokens_in,
                 tokens_out,
+                backend_error: Some(format!("{error}")),
             };
         }
     };
@@ -584,6 +593,9 @@ async fn run_unit(
             }
             Err(error) => {
                 eprintln!("[pipeline] unit retry failed ({schema_name}): {error}");
+                if backend_error.is_none() {
+                    backend_error = Some(format!("{error}"));
+                }
             }
         }
     }
@@ -621,6 +633,7 @@ async fn run_unit(
         requests_made,
         tokens_in,
         tokens_out,
+        backend_error,
     }
 }
 
@@ -675,6 +688,7 @@ pub async fn generate_all(
     let seen_questions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32)));
     let telemetry = Arc::new(Mutex::new(RunTelemetry::default()));
+    let first_backend_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let done_counter = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::with_capacity(total_units);
@@ -689,6 +703,7 @@ pub async fn generate_all(
         let records = records.clone();
         let seen_questions = seen_questions.clone();
         let telemetry = telemetry.clone();
+        let first_backend_error = first_backend_error.clone();
         let done_counter = done_counter.clone();
         let completed_per_type = completed_per_type.clone();
         let completed_types = completed_types.clone();
@@ -703,6 +718,15 @@ pub async fn generate_all(
                 stats.requests += outcome.requests_made;
                 stats.tokens_in += outcome.tokens_in;
                 stats.tokens_out += outcome.tokens_out;
+                if outcome.backend_error.is_some() {
+                    stats.backend_errors += 1;
+                    if let Some(message) = &outcome.backend_error {
+                        let mut holder = first_backend_error.lock().unwrap();
+                        if holder.is_none() {
+                            *holder = Some(message.clone());
+                        }
+                    }
+                }
             }
 
             let is_item_type = items_field(&unit.artifact_type).is_some();
@@ -808,6 +832,22 @@ pub async fn generate_all(
                 pending.push(artifact);
             }
         }
+    }
+
+    // A provider outage (connection/auth/rate-limit) that hits every unit is a
+    // hard failure, not an empty success: surface it so the worksheet is marked
+    // `failed` rather than `done` with zero artifacts.
+    if telemetry.backend_errors > 0 && telemetry.backend_errors == total_units {
+        let first = first_backend_error
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| String::from("unknown provider error"));
+        return Err(format!(
+            "LLM generation failed: all {} generation request(s) could not reach \
+             the provider ({first}). Check that a provider is configured and reachable.",
+            telemetry.backend_errors
+        ));
     }
 
     Ok((pending, telemetry))

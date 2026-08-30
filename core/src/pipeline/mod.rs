@@ -54,6 +54,18 @@ pub async fn next_segment_position(pool: &SqlitePool, worksheet_id: &str) -> Res
     ingest::next_segment_position(pool, worksheet_id).await
 }
 
+/// Copy chunks from an existing file with the same content hash for any of
+/// `file_ids`, returning the files that still need a real parse and the next
+/// position to continue from.
+pub async fn reuse_chunks(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+    file_ids: &[String],
+    start_position: i32,
+) -> Result<(Vec<String>, i32), String> {
+    ingest::reuse_chunks(pool, worksheet_id, file_ids, start_position).await
+}
+
 /// Load a worksheet's stored segments in document order.
 pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<Segment>, String> {
     let rows = sqlx::query_as::<_, (String, String, i32, Option<String>, String)>(

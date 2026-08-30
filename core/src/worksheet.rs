@@ -272,11 +272,12 @@ pub async fn create_worksheet(
         let size = std::fs::metadata(file_path)
             .map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?
             .len();
+        let sha256 = sha256_of_path(file_path)?;
 
         let file_id = Ulid::new().to_string();
 
         sqlx::query(
-            "INSERT INTO files (id, worksheet_id, path, name, extension, size) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO files (id, worksheet_id, path, name, extension, size, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&file_id)
         .bind(&worksheet.id)
@@ -284,6 +285,7 @@ pub async fn create_worksheet(
         .bind(&file_name)
         .bind(&extension)
         .bind(size as i64)
+        .bind(&sha256)
         .execute(&mut *transaction)
         .await
         .map_err(|_| String::from("Failed to register file"))?;
@@ -302,6 +304,15 @@ pub struct FileMetadata {
     name: String,
     extension: String,
     size: u64,
+}
+
+/// Content fingerprint of a file, used to detect an already-ingested copy of
+/// the same source so its chunks can be reused without re-parsing.
+pub fn sha256_of_path(path: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let digest = Sha256::digest(&bytes);
+    Ok(hex::encode(digest))
 }
 
 pub fn get_file_metadata(path: &str) -> Result<FileMetadata, String> {

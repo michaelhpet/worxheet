@@ -244,6 +244,106 @@ pub async fn next_segment_position(
     Ok(max_position.unwrap_or(-1) + 1)
 }
 
+/// Copy chunks from an existing file that shares the same content hash as one
+/// of `file_ids`, so a duplicate source is not re-parsed/segmented per
+/// worksheet. Chunks are copied in their original order and assigned fresh
+/// ids/positions for this worksheet. Returns the file ids that still need a
+/// real parse (no hash, or no matching chunked source) and the next position
+/// to continue from.
+pub async fn reuse_chunks(
+    pool: &sqlx::SqlitePool,
+    worksheet_id: &str,
+    file_ids: &[String],
+    start_position: i32,
+) -> Result<(Vec<String>, i32), String> {
+    if file_ids.is_empty() {
+        return Ok((Vec::new(), start_position));
+    }
+
+    let mut remaining = Vec::new();
+    let mut position = start_position;
+
+    for file_id in file_ids {
+        let (sha256,): (Option<String>,) =
+            sqlx::query_as("SELECT sha256 FROM files WHERE id = ? AND worksheet_id = ?")
+                .bind(file_id)
+                .bind(worksheet_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|_| String::from("Failed to load file hash"))?
+                .ok_or_else(|| format!("File not found: {file_id}"))?;
+
+        let Some(sha256) = sha256 else {
+            remaining.push(file_id.clone());
+            continue;
+        };
+
+        // Find an already-chunked file with the same hash in another worksheet.
+        let source: Option<(String,)> = sqlx::query_as(
+            "SELECT c.file_id
+             FROM chunks c
+             JOIN files f ON f.id = c.file_id
+             WHERE f.sha256 = ? AND c.worksheet_id <> ? AND c.worksheet_id IS NOT NULL
+             GROUP BY c.file_id
+             ORDER BY MIN(c.position)
+             LIMIT 1",
+        )
+        .bind(&sha256)
+        .bind(worksheet_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| String::from("Failed to look up reusable chunks"))?;
+
+        let Some((source_file_id,)) = source else {
+            remaining.push(file_id.clone());
+            continue;
+        };
+
+        let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT heading, text FROM chunks
+             WHERE file_id = ?
+             ORDER BY position",
+        )
+        .bind(&source_file_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| String::from("Failed to load reusable chunks"))?;
+
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|_| String::from("Failed to begin reuse transaction"))?;
+        for (heading, text) in rows {
+            sqlx::query(
+                "INSERT INTO chunks (id, worksheet_id, file_id, position, heading, text)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(ulid::Ulid::new().to_string())
+            .bind(worksheet_id)
+            .bind(file_id)
+            .bind(position)
+            .bind(&heading)
+            .bind(&text)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| String::from("Failed to reuse chunk"))?;
+            position += 1;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| String::from("Failed to commit reused chunks"))?;
+
+        sqlx::query("UPDATE worksheets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(worksheet_id)
+            .execute(pool)
+            .await
+            .map_err(|_| String::from("Failed to update worksheet"))?;
+    }
+
+    Ok((remaining, position))
+}
+
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
@@ -412,12 +512,140 @@ mod tests {
 
     #[test]
     fn test_parse_unsupported_extension() {
-        assert!(parse_blocks("test.txt", "txt").is_err());
+        assert!(parse_blocks("test.txt", "txt", None).is_err());
     }
 
     #[test]
     fn test_parse_missing_file() {
         let path = format!("{}/nonexistent.pdf", FIXTURE_DIR);
-        assert!(parse_blocks(&path, "pdf").is_err());
+        assert!(parse_blocks(&path, "pdf", None).is_err());
+    }
+
+    async fn setup_db() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+        pool
+    }
+
+    async fn seed_file(
+        pool: &sqlx::SqlitePool,
+        worksheet_id: &str,
+        sha256: Option<&str>,
+    ) -> String {
+        let id = ulid::Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO files (id, worksheet_id, path, name, extension, size, sha256)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(worksheet_id)
+        .bind("/tmp/sample.pdf")
+        .bind("sample.pdf")
+        .bind("pdf")
+        .bind(10i64)
+        .bind(sha256)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn seed_chunk(
+        pool: &sqlx::SqlitePool,
+        worksheet_id: &str,
+        file_id: &str,
+        position: i32,
+        text: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO chunks (id, worksheet_id, file_id, position, heading, text)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ulid::Ulid::new().to_string())
+        .bind(worksheet_id)
+        .bind(file_id)
+        .bind(position)
+        .bind(Option::<String>::None)
+        .bind(text)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reuse_chunks_copies_matching_source() {
+        let pool = setup_db().await;
+
+        let ws_a = ulid::Ulid::new().to_string();
+        sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
+            .bind(&ws_a)
+            .bind("a")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let source_file = seed_file(&pool, &ws_a, Some("deadbeef")).await;
+        seed_chunk(&pool, &ws_a, &source_file, 0, "first chunk").await;
+        seed_chunk(&pool, &ws_a, &source_file, 1, "second chunk").await;
+
+        let ws_b = ulid::Ulid::new().to_string();
+        sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
+            .bind(&ws_b)
+            .bind("b")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending = seed_file(&pool, &ws_b, Some("deadbeef")).await;
+
+        let (remaining, next_pos) =
+            reuse_chunks(&pool, &ws_b, std::slice::from_ref(&pending), 0).await.unwrap();
+
+        assert!(remaining.is_empty(), "all files should be deduped");
+        assert_eq!(next_pos, 2);
+
+        let copied: Vec<(String, i32)> =
+            sqlx::query_as("SELECT text, position FROM chunks WHERE worksheet_id = ? ORDER BY position")
+                .bind(&ws_b)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0], ("first chunk".to_string(), 0));
+        assert_eq!(copied[1], ("second chunk".to_string(), 1));
+    }
+
+    #[tokio::test]
+    async fn test_reuse_chunks_leaves_nonmatching_for_parse() {
+        let pool = setup_db().await;
+
+        let ws_a = ulid::Ulid::new().to_string();
+        sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
+            .bind(&ws_a)
+            .bind("a")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let source_file = seed_file(&pool, &ws_a, Some("aaaa")).await;
+        seed_chunk(&pool, &ws_a, &source_file, 0, "other").await;
+
+        let ws_b = ulid::Ulid::new().to_string();
+        sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
+            .bind(&ws_b)
+            .bind("b")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let no_match = seed_file(&pool, &ws_b, Some("bbbb")).await;
+        let no_hash = seed_file(&pool, &ws_b, None).await;
+
+        let (remaining, next_pos) =
+            reuse_chunks(&pool, &ws_b, &[no_match.clone(), no_hash.clone()], 5).await.unwrap();
+
+        assert_eq!(remaining, vec![no_match, no_hash]);
+        assert_eq!(next_pos, 5, "no chunks copied, position unchanged");
     }
 }

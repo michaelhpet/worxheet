@@ -309,10 +309,16 @@ async fn run_pipeline(
 
     let on_ingest = progress_sink(app, jobs, worksheet_id);
     let start_position = super::next_segment_position(pool, worksheet_id).await?;
+
+    // Reuse already-ingested chunks for any file whose content matches an
+    // existing source, rather than re-parsing/segmenting a duplicate.
+    let (to_parse, start_position) =
+        super::reuse_chunks(pool, worksheet_id, &pending_files, start_position).await?;
+
     super::process_files(
         pool,
         worksheet_id,
-        &pending_files,
+        &to_parse,
         start_position,
         tokenizer,
         Some(on_ingest),
@@ -366,6 +372,14 @@ async fn run_pipeline(
         telemetry.tokens_out / 1000,
         started.elapsed()
     );
+
+    // Await all incremental persistence so a worksheet is only marked `done`
+    // once its quiz artifacts are actually committed to the database.
+    let handles: Vec<tauri::async_runtime::JoinHandle<()>> =
+        persist_handles.lock().unwrap().drain(..).collect();
+    for handle in handles {
+        let _ = handle.await;
+    }
 
     super::persist_artifacts(pool, worksheet_id, &pending).await?;
 

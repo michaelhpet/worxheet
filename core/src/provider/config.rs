@@ -35,6 +35,12 @@ pub struct ProviderConfig {
     pub model: String,
     /// Parallel in-flight requests during bulk generation.
     pub concurrency: usize,
+    /// Send `reasoning_effort: "none"` so thinking models answer directly
+    /// instead of burning tokens on reasoning (and burying the answer in a
+    /// `reasoning` field some OpenAI-compatible deployments return empty).
+    /// Defaults to on: fast, direct answers are the norm; users opt into
+    /// thinking where a model benefits from it.
+    pub disable_thinking: bool,
 }
 
 impl Default for ProviderConfig {
@@ -46,6 +52,7 @@ impl Default for ProviderConfig {
                 .to_string(),
             model: default_model_for_preset("openai").to_string(),
             concurrency: 8,
+            disable_thinking: true,
         }
     }
 }
@@ -141,5 +148,22 @@ impl ProviderState {
 
     pub fn set(&self, config: ProviderConfig) {
         *self.config.write().unwrap() = config;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_disables_thinking() {
+        assert!(ProviderConfig::default().disable_thinking);
+    }
+
+    #[test]
+    fn test_presets_keep_thinking_disabled() {
+        for preset in ["openai", "gemini", "ollama", "lmstudio"] {
+            assert!(ProviderConfig::for_preset(preset).disable_thinking);
+        }
     }
 }

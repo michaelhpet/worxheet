@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::{ArtifactBackend, GenerateRequest, ProviderError};
+use super::{ArtifactBackend, GenerateReply, GenerateRequest, ProviderError};
 
 /// Deterministic in-memory backend for tests: no network.
 #[allow(dead_code)] // test support
@@ -20,6 +20,16 @@ pub struct MockBackend {
     #[allow(clippy::type_complexity)]
     responder: Option<Box<dyn Fn(&GenerateRequest) -> Result<String, ProviderError> + Send + Sync>>,
     pub requests: Mutex<Vec<GenerateRequest>>,
+}
+
+/// Wrap scripted strings into a reply sourced from `content`.
+fn reply(text: &str) -> GenerateReply {
+    GenerateReply {
+        text: text.to_string(),
+        finish_reason: String::from("stop"),
+        refusal: None,
+        field_source: "content",
+    }
 }
 
 #[allow(dead_code)] // test support
@@ -49,14 +59,15 @@ impl MockBackend {
 
 #[async_trait]
 impl ArtifactBackend for MockBackend {
-    async fn generate_json(&self, request: &GenerateRequest) -> Result<String, ProviderError> {
+    async fn generate_json(&self, request: &GenerateRequest) -> Result<GenerateReply, ProviderError> {
         self.requests.lock().unwrap().push(request.clone());
         if let Some(responder) = &self.responder {
-            return responder(request);
+            return responder(request).map(|text| reply(&text));
         }
         match self.responses.lock().unwrap().pop_front() {
-            Some(result) => result,
-            None => Ok(String::from("{}")),
+            Some(Ok(text)) => Ok(reply(&text)),
+            Some(Err(error)) => Err(error),
+            None => Ok(reply("{}")),
         }
     }
 
@@ -87,7 +98,7 @@ mod tests {
         };
 
         assert_eq!(
-            backend.generate_json(&request).await.unwrap(),
+            backend.generate_json(&request).await.unwrap().text,
             r#"{"first": true}"#
         );
         assert!(matches!(
@@ -96,7 +107,7 @@ mod tests {
         ));
 
         // Script exhausted → echo fallback.
-        assert_eq!(backend.generate_json(&request).await.unwrap(), "{}");
+        assert_eq!(backend.generate_json(&request).await.unwrap().text, "{}");
         assert_eq!(backend.request_count(), 3);
     }
 

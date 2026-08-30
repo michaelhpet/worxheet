@@ -269,8 +269,13 @@ pub fn resolve_backend(
     }
     // Key presence is the only signal: absent key → no Authorization header.
     let api_key = provider::config::load_api_key(&config.preset)?.filter(|key| !key.is_empty());
-    let backend = Arc::new(OpenAiClient::new(&config.base_url, api_key, &config.model));
-    Ok((backend, config.concurrency))
+    let backend = OpenAiClient::new(&config.base_url, api_key, &config.model)
+        .with_reasoning_effort(
+            config
+                .disable_thinking
+                .then(|| String::from("none")),
+        );
+    Ok((Arc::new(backend), config.concurrency))
 }
 
 async fn run_pipeline(

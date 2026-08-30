@@ -34,12 +34,14 @@ pub async fn set_provider_config(
     model: String,
     concurrency: usize,
     api_key: Option<String>,
+    disable_thinking: Option<bool>,
 ) -> Result<ProviderStatus, String> {
     let mut config = ProviderConfig {
         preset,
         base_url,
         model,
         concurrency: concurrency.clamp(1, 32),
+        disable_thinking: disable_thinking.unwrap_or(true),
     };
     if let Some(base_url) = config::base_url_for_preset(&config.preset) {
         // Re-pin known presets so stale custom URLs cannot linger.

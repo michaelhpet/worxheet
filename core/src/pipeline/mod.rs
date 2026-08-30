@@ -335,23 +335,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_all_produces_and_validates_with_mock_backend() {
-        // Two segments x five types = ten units. Every quiz request answers
-        // with a figure-referencing hallucination; the corrective retry
-        // returns a valid, segment-specific item. Routing keys off request
-        // content so scheduling order cannot change the outcome.
-        let hallucinated_mcq = json!({
-            "questions": [{
-                "question": "As shown in Figure 9, what is depicted?",
-                "options": ["A diagram", "Another diagram", "A chart", "An image"],
-                "answer": "A diagram",
-                "explanation": "The figure shows it."
-            }]
-        })
-        .to_string();
-
+        // Two segments x five types = ten units, one turn each (no retries).
+        // Routing keys off request content so scheduling order cannot change
+        // the outcome.
         let backend = Arc::new(MockBackend::with_responder(move |request| {
-            if request.user.contains("previous reply was rejected") {
-                let content = if request.user.contains("mitochondrion") {
+            let source_has_mitochondria = request.user.contains("mitochondrion");
+            match request.schema_name.as_str() {
+                "MultipleChoiceQuiz" => Ok(if source_has_mitochondria {
                     json!({
                         "questions": [{
                             "question": "Where does respiration produce ATP?",
@@ -369,13 +359,8 @@ mod tests {
                             "explanation": "Pressure accumulates underground."
                         }]
                     })
-                };
-                return Ok(content.to_string());
-            }
-
-            let source_has_mitochondria = request.user.contains("mitochondrion");
-            match request.schema_name.as_str() {
-                "MultipleChoiceQuiz" => Ok(hallucinated_mcq.clone()),
+                }
+                .to_string()),
                 "EssayQuiz" => Ok(json!({
                     "questions": [{
                         "question": if source_has_mitochondria {
@@ -433,9 +418,8 @@ mod tests {
         .await
         .expect("generation should succeed");
 
-        // Ten units; each quiz unit burns one hallucinated attempt plus one
-        // corrective retry (2 x 2), everything else succeeds first try (6).
-        assert_eq!(telemetry.requests, 12);
+        // Ten units, exactly one turn each.
+        assert_eq!(telemetry.requests, 10);
 
         for artifact in &pending {
             if matches!(artifact.artifact_type, ArtifactType::MultipleChoiceQuiz) {

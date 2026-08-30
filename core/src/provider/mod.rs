@@ -72,8 +72,21 @@ impl fmt::Display for ProviderError {
 /// Anything that can turn prompts into schema-constrained JSON.
 #[async_trait]
 pub trait ArtifactBackend: Send + Sync {
-    async fn generate_json(&self, request: &GenerateRequest) -> Result<String, ProviderError>;
+    async fn generate_json(&self, request: &GenerateRequest) -> Result<GenerateReply, ProviderError>;
 
     /// Best-effort listing of model ids for settings UIs.
     async fn list_models(&self) -> Result<Vec<String>, ProviderError>;
+}
+
+/// One completed provider reply. `text` is the usable payload (the message
+/// `content`, falling back to reasoning fields for thinking models whose
+/// content comes back empty); the rest is diagnosis for response logs.
+#[derive(Clone, Debug)]
+pub struct GenerateReply {
+    pub text: String,
+    /// Provider-reported stop reason (`stop`, `length`, `content_filter`, ...).
+    pub finish_reason: String,
+    pub refusal: Option<String>,
+    /// Where `text` was read from: `content`, `reasoning`, or `reasoning_content`.
+    pub field_source: &'static str,
 }

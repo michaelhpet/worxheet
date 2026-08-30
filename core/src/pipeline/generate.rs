@@ -1,11 +1,11 @@
 //! Cloud-hosted artifact generation.
 //!
 //! Every segment feeds one request per artifact type; requests run under a
-//! semaphore so bulk generation stays inside provider rate limits. Model
-//! output is validated locally (`validate`): malformed or hallucinated items
-//! trigger one retry with fresh seed and corrective feedback, then failing
-//! items are dropped individually. Summary and MindMap are assembled
-//! deterministically from per-segment sections, so coverage is exhaustive.
+//! semaphore so bulk generation stays inside provider rate limits. Each unit
+//! gets exactly one model turn — a failed turn (empty reply, malformed or
+//! hallucinated output) drops that segment's items rather than retrying.
+//! Summary and MindMap are assembled deterministically from per-segment
+//! sections, so coverage is exhaustive.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,16 +33,6 @@ impl Default for GenerationParams {
             max_tokens: 2048,
             seed: 1234,
         }
-    }
-}
-
-/// Items requested per unit, per artifact type.
-fn items_per_unit(artifact_type: &ArtifactType) -> usize {
-    match artifact_type {
-        ArtifactType::MultipleChoiceQuiz => 4,
-        ArtifactType::EssayQuiz => 3,
-        ArtifactType::CompletionQuiz => 4,
-        _ => 1,
     }
 }
 
@@ -153,7 +143,7 @@ fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> Result<Vec
     // while never emitting an empty context.
     let usable: Vec<&Segment> = segments
         .iter()
-        .filter(|segment| !is_degenerate_segment(segment))
+        .filter(|segment| !is_degenerate_segment(segment) && !is_non_teachable_segment(segment))
         .collect();
     if usable.is_empty() {
         return Err(String::from(
@@ -205,6 +195,60 @@ fn is_degenerate_segment(segment: &Segment) -> bool {
 /// couple of full sentences is the smallest plausible source.
 const MIN_CONTENT_WORDS: usize = 10;
 
+/// Generic, publisher-agnostic book-furniture headings: title pages, tables of
+/// contents, prefaces, and the like carry no teachable material. Matched on
+/// the segment heading only; no publisher names or other variable tokens are
+/// encoded so the filter stays valid across publishers and material types.
+const FRONT_MATTER_HEADING_MARKERS: &[&str] = &[
+    "table of contents",
+    "contents",
+    "preface",
+    "foreword",
+    "acknowledg",
+    "about this book",
+    "about the author",
+    "about the textbook",
+    "how to use",
+    "welcome to",
+    "index",
+    "colophon",
+];
+
+/// Licensing / copyright indicators in the opening text of a segment, used to
+/// catch filing pages that carry their own headings (e.g. the publisher's
+/// imprint page). Kept generic — no publisher or product names.
+const FRONT_MATTER_TEXT_MARKERS: &[&str] = &[
+    "copyright",
+    "©",
+    "creative commons",
+    "licensed under",
+    "all rights reserved",
+    "library of congress",
+    "isbn",
+];
+
+/// Front matter (title/imprint/TOC/preface pages, licensing boilerplate) holds
+/// no educational content and would otherwise make the model reply to nothing
+/// or, worse, fake an answer. These segments stay in the worksheet (searchable
+/// history) but never reach generation.
+fn is_non_teachable_segment(segment: &Segment) -> bool {
+    if let Some(heading) = &segment.heading {
+        let heading = heading.to_lowercase();
+        if FRONT_MATTER_HEADING_MARKERS
+            .iter()
+            .any(|marker| heading.contains(marker))
+        {
+            return true;
+        }
+    }
+    // Only the opening slice is inspected so a chapter that mentions "index"
+    // or "copyright" deep in its body is not flagged.
+    let lead: String = segment.text.chars().take(800).collect::<String>().to_lowercase();
+    FRONT_MATTER_TEXT_MARKERS
+        .iter()
+        .any(|marker| lead.contains(marker))
+}
+
 /// Evenly sample `cap` indices when there are more than `cap`, else all.
 fn pick_indices(total: usize, cap: usize) -> Vec<usize> {
     if total <= cap {
@@ -226,7 +270,10 @@ fn system_prompt() -> &'static str {
      3. Never write self-referential wording such as \"the passage\", \"the document\",\n\
         \"the source\", or \"this section\" inside question text.\n\
      4. Write in the same language as the source material.\n\
-     5. Reply with exactly one JSON object matching the required schema and nothing else."
+     5. Reply with exactly one JSON object matching the required schema and nothing else.\n\
+     6. If the source material is front matter, licensing/copyright text, or other non-core\n\
+        content (title pages, tables of contents, prefaces, forewords, colophons), reply with\n\
+        an empty collection (e.g. {\"questions\": []}) instead of inventing or padding content."
 }
 
 const MCQ_EXAMPLE: &str = r#"Example question object:
@@ -235,11 +282,13 @@ const MCQ_EXAMPLE: &str = r#"Example question object:
  "answer":"Mitochondrial matrix",
  "explanation":"The cycle runs in the matrix, producing NADH for oxidative phosphorylation."}"#;
 
-fn user_prompt(artifact_type: &ArtifactType, count: usize, context: &str) -> String {
+fn user_prompt(artifact_type: &ArtifactType, context: &str) -> String {
     let task = match artifact_type {
         ArtifactType::MultipleChoiceQuiz => format!(
-            "Write exactly {count} multiple-choice questions testing analysis, application, or \
-             evaluation of the material below. For every question:\n\
+            "Write multiple-choice questions testing analysis, application, or evaluation \
+             of the material below. Write as many as the material genuinely supports — \
+             cover its key ideas, and never pad with shallow or near-identical questions. \
+             For every question:\n\
              - Exactly 4 answer options in plain text: no lettering, numbering, or bullet marks.\n\
              - Options must be mutually exclusive, comparable in length, plausible but clearly\n\
              wrong to someone who knows the material. Never offer options like \"all of the above\".\n\
@@ -248,15 +297,15 @@ fn user_prompt(artifact_type: &ArtifactType, count: usize, context: &str) -> Str
              - One-sentence explanation citing the supporting fact.\n\
              - Do not repeat near-identical questions.\n{MCQ_EXAMPLE}"
         ),
-        ArtifactType::EssayQuiz => format!(
-            "Write exactly {count} essay questions requiring students to explain, compare, or \
-             evaluate ideas from the material below. Each needs clear instructions and a concise \
-             model answer grounded in the material."
+        ArtifactType::EssayQuiz => String::from(
+            "Write essay questions that require students to explain, compare, or evaluate \
+             ideas from the material below. Write as many as the material genuinely supports. \
+             Each needs clear instructions and a concise model answer grounded in the material.",
         ),
-        ArtifactType::CompletionQuiz => format!(
-            "Write exactly {count} fill-in-the-blank statements drawn from the material below. \
-             Mark each blank with ____________ . The expected answer must appear word-for-word in \
-             the material. Add a short hint per statement."
+        ArtifactType::CompletionQuiz => String::from(
+            "Write fill-in-the-blank statements drawn from the material below. Mark each blank \
+             with ____________. Write as many as the material genuinely supports. The expected \
+             answer must appear word-for-word in the material. Add a short hint per statement.",
         ),
         ArtifactType::Summary => String::from(
             "Summarize this slice of the material: a short title, a focused paragraph capturing \
@@ -268,15 +317,6 @@ fn user_prompt(artifact_type: &ArtifactType, count: usize, context: &str) -> Str
         ),
     };
     format!("{task}\n\nSource material:\n\"\"\"\n{context}\n\"\"\"")
-}
-
-fn retry_feedback(reasons: &[String]) -> String {
-    let mut feedback =
-        String::from("\n\nYour previous reply was rejected for these reasons; fix them and return the full corrected JSON object:\n");
-    for reason in reasons.iter().take(5) {
-        feedback.push_str(&format!("- {reason}\n"));
-    }
-    feedback
 }
 
 // --- Schemas (strict-mode friendly: every property listed in `required`,
@@ -291,11 +331,11 @@ fn string_array(min_items: usize, max_items: usize) -> serde_json::Value {
     })
 }
 
-pub fn schema_for(artifact_type: &ArtifactType, items: usize) -> serde_json::Value {
+pub fn schema_for(artifact_type: &ArtifactType) -> serde_json::Value {
     match artifact_type {
         ArtifactType::MultipleChoiceQuiz => serde_json::json!({
             "type": "object",
-            "properties": { "questions": mcq_questions_schema(items) },
+            "properties": { "questions": mcq_questions_schema() },
             "required": ["questions"],
             "additionalProperties": false,
         }),
@@ -304,8 +344,6 @@ pub fn schema_for(artifact_type: &ArtifactType, items: usize) -> serde_json::Val
             "properties": {
                 "questions": {
                     "type": "array",
-                    "minItems": 1,
-                    "maxItems": items,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -326,8 +364,6 @@ pub fn schema_for(artifact_type: &ArtifactType, items: usize) -> serde_json::Val
             "properties": {
                 "items": {
                     "type": "array",
-                    "minItems": 1,
-                    "maxItems": items,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -378,11 +414,9 @@ pub fn schema_for(artifact_type: &ArtifactType, items: usize) -> serde_json::Val
     }
 }
 
-fn mcq_questions_schema(items: usize) -> serde_json::Value {
+fn mcq_questions_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "array",
-        "minItems": 1,
-        "maxItems": items,
         "items": {
             "type": "object",
             "properties": {
@@ -414,6 +448,27 @@ const MIN_MCQ_GROUNDING: f32 = 0.15;
 const MIN_COMPLETION_GROUNDING: f32 = 0.5;
 const DUPLICATE_QUESTION_SIMILARITY: f32 = 0.75;
 
+/// Parse the model reply, tolerating prose/markdown around the JSON object
+/// some servers emit beyond what the client's fence stripping removes: fall
+/// back to the substring between the first `{` and the last `}`.
+fn parse_json_anyhow(raw: &str) -> Result<serde_json::Value, String> {
+    let trimmed = raw.trim();
+    match serde_json::from_str(trimmed) {
+        Ok(value) => Ok(value),
+        Err(first) => {
+            if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
+                if open < close {
+                    let slice = &trimmed[open..=close];
+                    return serde_json::from_str(slice).map_err(|second| {
+                        format!("{first}; also failed on the extracted object: {second}")
+                    });
+                }
+            }
+            Err(first.to_string())
+        }
+    }
+}
+
 struct ValidatedOutput {
     /// Serialized item objects (or whole section objects).
     items: Vec<String>,
@@ -435,7 +490,7 @@ fn validate_unit_output(
     }
 
     let mut rejection_reasons = Vec::new();
-    let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+    let value: serde_json::Value = match parse_json_anyhow(raw) {
         Ok(value) => value,
         Err(error) => {
             return rejected(
@@ -541,6 +596,18 @@ fn approximate_tokens(text: &str) -> u64 {
     (text.len() as u64 / 4).max(1)
 }
 
+/// Human label for a unit's outcome: delivered items, rejected on content, or
+/// deliberately skipped (front matter / empty reply).
+fn outcome_verdict(validated: &ValidatedOutput) -> &'static str {
+    if validated.items.is_empty() && validated.rejection_reasons.is_empty() {
+        "skipped"
+    } else if validated.items.is_empty() {
+        "rejected"
+    } else {
+        "ok"
+    }
+}
+
 /// What one unit produced.
 struct UnitOutcome {
     /// `(item_json, …)` serialized outputs ready for assembly.
@@ -564,14 +631,13 @@ async fn run_unit(
     let mut requests_made = 0usize;
     let mut tokens_in = 0u64;
     let mut tokens_out = 0u64;
-    let mut backend_error: Option<String> = None;
+    let backend_error: Option<String> = None;
 
-    let count = items_per_unit(&unit.artifact_type);
     let system = system_prompt().to_string();
     let schema_name = unit.artifact_type.to_db().to_string();
-    let schema = schema_for(&unit.artifact_type, count);
+    let schema = schema_for(&unit.artifact_type);
     let base_seed = params.seed.wrapping_add(unit.seed_offset);
-    let base_user = user_prompt(&unit.artifact_type, count, &unit.context);
+    let base_user = user_prompt(&unit.artifact_type, &unit.context);
 
     let unit_type = unit.artifact_type.to_db();
     let schema_label = logging::sanitize_label(&schema_name);
@@ -615,18 +681,15 @@ async fn run_unit(
         }
     };
 
-    let mut user = base_user.clone();
-
-    // First attempt.
-    let request = make_request(base_seed, user.clone());
+    let request = make_request(base_seed, base_user.clone());
     log_request(0, &request);
     let started = std::time::Instant::now();
-    let raw = match backend.generate_json(&request).await {
-        Ok(raw) => {
+    let reply = match backend.generate_json(&request).await {
+        Ok(reply) => {
             requests_made += 1;
-            tokens_in += approximate_tokens(&system) + approximate_tokens(&user);
-            tokens_out += approximate_tokens(&raw);
-            raw
+            tokens_in += approximate_tokens(&system) + approximate_tokens(&request.user);
+            tokens_out += approximate_tokens(&reply.text);
+            reply
         }
         Err(error) => {
             log_response(
@@ -656,12 +719,25 @@ async fn run_unit(
         }
     };
 
-    let mut validated = validate_unit_output(
-        &unit.artifact_type,
-        &raw,
-        &unit.context,
-        &seen_questions.lock().unwrap(),
-    );
+    // One turn per unit: no retries. A failed turn (empty reply, invalid JSON,
+    // low grounding) simply drops that segment's items.
+    let validated = if reply.text.trim().is_empty() {
+        // The provider returned nothing: the model declining front matter or an
+        // anomalous empty generation. Either way a clean skip — one turn was
+        // spent, nothing is fabricated, and finish_reason/refusal below explain
+        // the emptiness. Not a backend error and not retried.
+        ValidatedOutput {
+            items: Vec::new(),
+            rejection_reasons: Vec::new(),
+        }
+    } else {
+        validate_unit_output(
+            &unit.artifact_type,
+            &reply.text,
+            &unit.context,
+            &seen_questions.lock().unwrap(),
+        )
+    };
     log_response(
         0,
         base_seed,
@@ -672,67 +748,14 @@ async fn run_unit(
             "attempt": 0,
             "elapsed_ms": started.elapsed().as_millis(),
             "status": "ok",
-            "verdict": if validated.items.is_empty() { "rejected" } else { "ok" },
-            "raw": raw,
+            "verdict": outcome_verdict(&validated),
+            "field": reply.field_source,
+            "finish_reason": reply.finish_reason,
+            "refusal": reply.refusal,
+            "raw": reply.text,
             "rejection_reasons": validated.rejection_reasons.clone(),
         }),
     );
-
-    if validated.items.is_empty() && !validated.rejection_reasons.is_empty() {
-        user.push_str(&retry_feedback(&validated.rejection_reasons));
-        let request = make_request(base_seed.wrapping_add(7_919), user);
-        log_request(1, &request);
-        let started = std::time::Instant::now();
-        match backend.generate_json(&request).await {
-            Ok(retry_raw) => {
-                requests_made += 1;
-                tokens_out += approximate_tokens(&retry_raw);
-                validated = validate_unit_output(
-                    &unit.artifact_type,
-                    &retry_raw,
-                    &unit.context,
-                    &seen_questions.lock().unwrap(),
-                );
-                log_response(
-                    1,
-                    request.seed,
-                    &serde_json::json!({
-                        "timestamp": logging::rfc3339_utc(),
-                        "unit_type": unit_type,
-                        "segment_id": unit.segment_id,
-                        "attempt": 1,
-                        "elapsed_ms": started.elapsed().as_millis(),
-                        "status": "ok",
-                        "verdict": if validated.items.is_empty() { "rejected" } else { "ok" },
-                        "raw": retry_raw,
-                        "rejection_reasons": validated.rejection_reasons.clone(),
-                    }),
-                );
-            }
-            Err(error) => {
-                log_response(
-                    1,
-                    request.seed,
-                    &serde_json::json!({
-                        "timestamp": logging::rfc3339_utc(),
-                        "unit_type": unit_type,
-                        "segment_id": unit.segment_id,
-                        "attempt": 1,
-                        "elapsed_ms": started.elapsed().as_millis(),
-                        "status": "error",
-                        "error": format!("{error}"),
-                    }),
-                );
-                eprintln!(
-                    "[{}] [pipeline] unit retry failed ({schema_name}): {error}",
-                    logging::rfc3339_utc()
-                );
-                if backend_error.is_none() {
-                    backend_error = Some(format!("{error}"));
-                }
-            }
-        }
-    }
 
     // Register surviving questions for cross-unit duplicate detection.
     if !validated.items.is_empty()
@@ -751,15 +774,11 @@ async fn run_unit(
         }
     }
 
-    if validated.items.is_empty() {
+    if validated.items.is_empty() && !validated.rejection_reasons.is_empty() {
         eprintln!(
             "[{}] [pipeline] dropping unit ({schema_name}): {}",
             logging::rfc3339_utc(),
-            validated
-                .rejection_reasons
-                .first()
-                .cloned()
-                .unwrap_or_default()
+            validated.rejection_reasons[0]
         );
     }
 
@@ -1158,5 +1177,183 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("No usable segments"));
+    }
+
+    #[test]
+    fn test_is_non_teachable_segment_filters_book_furniture() {
+        let colophon = segment(
+            0,
+            Some("OpenStax"),
+            "© 2018 Rice University. Textbook content produced by this publisher is \
+             licensed under a Creative Commons Attribution license. Download for free at \
+             the publisher website and provide attribution on every page.",
+        );
+        assert!(is_non_teachable_segment(&colophon));
+
+        assert!(is_non_teachable_segment(&segment(1, Some("Table of Contents"), "Chapter 1 ...")));
+        assert!(is_non_teachable_segment(&segment(2, Some("Preface"), "This book introduces...")));
+        assert!(is_non_teachable_segment(&segment(3, None, "ISBN 978-0-000-00000-0")));
+
+        // Real teaching content must survive, even when a heading looks book-ish.
+        let chapter = segment(
+            4,
+            Some("The Cell"),
+            "Cells are the fundamental unit of life. All organisms are composed of cells \
+             that carry out the processes of life.",
+        );
+        assert!(!is_non_teachable_segment(&chapter));
+        // A word like "index" deep in a chapter body (beyond the scanned lead)
+        // must not trip the filter.
+        let long = format!(
+            "{} The full body of this chapter goes on at length. {} index",
+            "Metabolism converts nutrients into usable energy.".repeat(40),
+            "See also".repeat(3)
+        );
+        assert!(!is_non_teachable_segment(&segment(5, Some("Metabolism"), &long)));
+    }
+
+    #[test]
+    fn test_build_units_skips_front_matter_and_degenerate_segments() {
+        let segments = vec![
+            segment(0, None, "[Page 2]"),
+            segment(1, Some("COLLEGE"), "OpenStax provides free, peer-reviewed, openly licensed \
+                 textbooks used by students and instructors across many institutions."),
+            segment(2, None, ". . . . . 227 8.1 Overview of Photosynthesis . . . . . . . . . ."),
+            segment(3, None, "Mitochondria produce ATP through respiration and the citric acid \
+                 cycle powers cellular work with the energy stored in its bonds."),
+            segment(4, Some("Colophon"), "© Rice University. Licensed under a Creative Commons \
+                 Attribution license. Provide attribution on every page when redistributing."),
+        ];
+
+        let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
+        let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
+        let expected = ["seg-1", "seg-3"].repeat(ArtifactType::ALL.len());
+        assert_eq!(used.len(), expected.len());
+        assert!(!used.contains(&"seg-4"), "front matter must never reach units");
+        assert!(!used.contains(&"seg-0") && !used.contains(&"seg-2"));
+    }
+
+    #[test]
+    fn test_user_prompt_has_no_fixed_count() {
+        for artifact_type in ArtifactType::ALL.iter() {
+            let prompt = user_prompt(artifact_type, "context");
+            let lowered = prompt.to_lowercase();
+            assert!(
+                !["exactly 2 questions", "exactly 3 questions", "exactly 4 questions",
+                  "exactly 5 questions", "exactly 6 questions"]
+                    .iter()
+                    .any(|phrase| lowered.contains(phrase)),
+                "prompt must not fix a question count: {prompt}"
+            );
+        }
+        let mcq = user_prompt(&ArtifactType::MultipleChoiceQuiz, "context");
+        assert!(mcq.contains("as many as the material genuinely supports"));
+    }
+
+    #[test]
+    fn test_question_arrays_are_unbounded() {
+        for (artifact_type, array_key) in [
+            (ArtifactType::MultipleChoiceQuiz, "questions"),
+            (ArtifactType::EssayQuiz, "questions"),
+            (ArtifactType::CompletionQuiz, "items"),
+        ] {
+            let schema = schema_for(&artifact_type);
+            let array = &schema["properties"][array_key];
+            assert!(
+                array.get("minItems").is_none() && array.get("maxItems").is_none(),
+                "{artifact_type:?} question array must not bound the count"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_json_anyhow_recovers_wrapped_json() {
+        let wrapped = "Sure — here is the response:\n```json\n{\"questions\":[]}\n```\nHope this helps.";
+        assert_eq!(
+            parse_json_anyhow(wrapped).unwrap(),
+            serde_json::json!({ "questions": [] })
+        );
+        assert!(parse_json_anyhow("not json at all").is_err());
+    }
+
+    #[test]
+    fn test_empty_questions_validates_as_clean_skip() {
+        let validated = validate_unit_output(
+            &ArtifactType::MultipleChoiceQuiz,
+            r#"{"questions":[]}"#,
+            "source words here",
+            &[],
+        );
+        assert!(validated.items.is_empty());
+        assert!(validated.rejection_reasons.is_empty(), "silent skip, not a rejection");
+    }
+
+    #[test]
+    fn test_blank_response_is_skipped_without_retry() {
+        use crate::provider::mock::MockBackend;
+
+        let mock = Arc::new(MockBackend::new(vec![Ok(String::from(""))]));
+        let backend: Arc<dyn ArtifactBackend> = mock.clone();
+        let unit = Unit {
+            type_index: 0,
+            artifact_type: ArtifactType::MultipleChoiceQuiz,
+            segment_id: String::from("seg-1"),
+            context: String::from(
+                "The mitochondrion produces ATP through respiration and the citric acid cycle.",
+            ),
+            seed_offset: 0,
+            skip: false,
+        };
+        let seen_questions = Mutex::new(Vec::<String>::new());
+
+        let outcome = tauri::async_runtime::block_on(run_unit(
+            &backend,
+            &unit,
+            &GenerationParams::default(),
+            &seen_questions,
+            None,
+        ));
+
+        assert!(outcome.items.is_empty());
+        assert_eq!(outcome.requests_made, 1, "no retry on a blank reply");
+        assert!(outcome.backend_error.is_none(), "blank reply is not a backend error");
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[test]
+    fn test_valid_questions_flow_through() {
+        use crate::provider::mock::MockBackend;
+
+        let mock = Arc::new(MockBackend::new(vec![Ok(String::from(
+            r#"{"questions":[{"question":"Where does the citric acid cycle run?",
+                                 "options":["Mitochondrial matrix","Cell nucleus","Ribosome","Golgi apparatus"],
+                                 "answer":"Mitochondrial matrix",
+                                 "explanation":"The cycle runs in the matrix producing NADH for the electron transport chain."}]}"#,
+        ))]));
+        let backend: Arc<dyn ArtifactBackend> = mock.clone();
+        let unit = Unit {
+            type_index: 0,
+            artifact_type: ArtifactType::MultipleChoiceQuiz,
+            segment_id: String::from("seg-1"),
+            context: String::from(
+                "The mitochondrion produces ATP through respiration and the citric acid cycle \
+                 runs in the mitochondrial matrix producing NADH.",
+            ),
+            seed_offset: 0,
+            skip: false,
+        };
+        let seen_questions = Mutex::new(Vec::<String>::new());
+
+        let outcome = tauri::async_runtime::block_on(run_unit(
+            &backend,
+            &unit,
+            &GenerationParams::default(),
+            &seen_questions,
+            None,
+        ));
+
+        assert_eq!(outcome.items.len(), 1);
+        assert_eq!(outcome.requests_made, 1);
+        assert!(outcome.backend_error.is_none());
     }
 }

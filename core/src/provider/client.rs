@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ArtifactBackend, GenerateRequest, ProviderError};
+use super::{ArtifactBackend, GenerateReply, GenerateRequest, ProviderError};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const MAX_ATTEMPTS: usize = 4;
@@ -23,11 +23,43 @@ struct ChatCompletionResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatMessage {
     content: Option<String>,
+    /// Some deployments (Ollama's thinking models) place the generated text
+    /// here and leave `content` empty.
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// OpenAI-style name for the same reasoning payload.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// Populated when the model declines to answer (content filters, refusals).
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+impl ChatMessage {
+    /// Best available text: ordinary content first, then reasoning fields so a
+    /// thinking-model reply that ships in `reasoning` is not mistaken for an
+    /// empty generation. Returns the source field for diagnosis.
+    fn effective_text(&self) -> (&str, &'static str) {
+        for (field, name) in [
+            (self.content.as_deref(), "content"),
+            (self.reasoning.as_deref(), "reasoning"),
+            (self.reasoning_content.as_deref(), "reasoning_content"),
+        ] {
+            if let Some(text) = field {
+                if !text.trim().is_empty() {
+                    return (text, name);
+                }
+            }
+        }
+        ("", "content")
+    }
 }
 
 #[derive(Deserialize)]
@@ -46,6 +78,9 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    /// `Some("none")` disables model thinking when set; `None` omits the field
+    /// entirely so providers that reject unknown params keep working.
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiClient {
@@ -58,7 +93,15 @@ impl OpenAiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model: model.to_string(),
+            reasoning_effort: None,
         }
+    }
+
+    /// Set the `reasoning_effort` sent with every request (`Some("none")` for
+    /// fast, direct answers from thinking models).
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -75,7 +118,7 @@ impl OpenAiClient {
 
 #[async_trait]
 impl ArtifactBackend for OpenAiClient {
-    async fn generate_json(&self, request: &GenerateRequest) -> Result<String, ProviderError> {
+    async fn generate_json(&self, request: &GenerateRequest) -> Result<GenerateReply, ProviderError> {
         let mut body = json!({
             "model": self.model,
             "messages": [
@@ -86,6 +129,9 @@ impl ArtifactBackend for OpenAiClient {
             "max_tokens": request.max_tokens,
             "seed": request.seed,
         });
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+        }
         if !request.schema.is_null() {
             body["response_format"] = json!({
                 "type": "json_schema",
@@ -168,17 +214,18 @@ impl ArtifactBackend for OpenAiClient {
                 ProviderError::InvalidResponse(format!("failed to decode completion: {error}"))
             })?;
 
-            let content = completion
-                .choices
-                .first()
-                .and_then(|choice| choice.message.content.clone())
-                .ok_or_else(|| {
-                    ProviderError::InvalidResponse(String::from(
-                        "completion had no message content",
-                    ))
-                })?;
+            let choice = completion.choices.first().ok_or_else(|| {
+                ProviderError::InvalidResponse(String::from("completion had no choices"))
+            })?;
+            let message = &choice.message;
+            let (text, field_source) = message.effective_text();
 
-            return Ok(strip_code_fence(&content));
+            return Ok(GenerateReply {
+                text: strip_code_fence(text),
+                finish_reason: choice.finish_reason.clone().unwrap_or_default(),
+                refusal: message.refusal.clone(),
+                field_source,
+            });
         }
 
         Err(last_error)
@@ -235,4 +282,54 @@ fn strip_code_fence(content: &str) -> String {
         return rest.trim_end_matches("```").trim().to_string();
     }
     trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(content: Option<&str>, reasoning: Option<&str>, reasoning_content: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            content: content.map(String::from),
+            reasoning: reasoning.map(String::from),
+            reasoning_content: reasoning_content.map(String::from),
+            refusal: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_text_prefers_content() {
+        let msg = message(Some(r#"{"ok":true}"#), None, None);
+        assert_eq!(msg.effective_text(), (r#"{"ok":true}"#, "content"));
+    }
+
+    #[test]
+    fn test_effective_text_falls_back_to_reasoning_when_content_empty() {
+        // Ollama thinking models: text lands in `reasoning`, content stays empty.
+        let msg = message(None, Some(r#"[answer]"#), None);
+        assert_eq!(msg.effective_text(), ("[answer]", "reasoning"));
+        let msg = message(Some(""), Some("[answer]"), Some("[also]"));
+        assert_eq!(msg.effective_text(), ("[answer]", "reasoning"));
+    }
+
+    #[test]
+    fn test_effective_text_falls_back_to_reasoning_content() {
+        let msg = message(None, None, Some(r#"[answer]"#));
+        assert_eq!(msg.effective_text(), ("[answer]", "reasoning_content"));
+    }
+
+    #[test]
+    fn test_effective_text_empty_when_nothing_present() {
+        let msg = message(None, None, None);
+        assert_eq!(msg.effective_text(), ("", "content"));
+    }
+
+    #[test]
+    fn test_strip_code_fence() {
+        assert_eq!(
+            strip_code_fence("```json\n{\"a\":1}\n```"),
+            "{\"a\":1}"
+        );
+        assert_eq!(strip_code_fence("plain"), "plain");
+    }
 }

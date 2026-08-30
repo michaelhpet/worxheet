@@ -5,6 +5,8 @@ import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
+import { useProviderStatus, useSetProviderConfig } from "@/data/provider";
 import { onOpenSettings, type SettingsTab } from "@/lib/settings-bus";
 import { IconBotId, IconFileAi, IconPalette } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
@@ -27,6 +29,12 @@ export function SettingsDialog() {
 	const [tab, setTab] = useState<SettingsTab>("appearance");
 
 	const { theme, setTheme } = useTheme();
+
+	// Thinking-mode toggle is live: it writes `disable_thinking` through the
+	// provider config. The knobs below remain a preview for now.
+	const { data: status } = useProviderStatus();
+	const setConfig = useSetProviderConfig();
+	const thinkingEnabled = status ? !status.config.disable_thinking : true;
 
 	// Artifact generation knobs — frontend-only shell for now. Not persisted
 	// or wired to the backend yet.
@@ -177,8 +185,33 @@ export function SettingsDialog() {
 										</FieldDescription>
 									</Field>
 
+									<Field>
+										<FieldLabel>Thinking mode</FieldLabel>
+										<div className="flex items-center gap-3">
+											<Switch
+												checked={thinkingEnabled}
+												onCheckedChange={(enabled) => {
+													if (!status) return;
+													void setConfig.mutateAsync({
+														preset: status.config.preset,
+														baseUrl: status.config.base_url,
+														model: status.config.model,
+														concurrency: status.config.concurrency,
+														disableThinking: !enabled,
+													});
+												}}
+											/>
+											<span className="text-sm text-muted-foreground">{thinkingEnabled ? "Allowed" : "Disabled"}</span>
+										</div>
+										<FieldDescription>
+											Thinking models reason step-by-step before answering. Disabled by default — questions come back
+											faster and directly. Turn on only if your model produces better results with reasoning.
+										</FieldDescription>
+									</Field>
+
 									<div className="rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground">
-										These generation settings are not wired up yet — they're a preview of what's coming.
+										The creativity, output, and seed settings above are not wired up yet — they're a preview of what's
+										coming.
 									</div>
 								</div>
 							)}

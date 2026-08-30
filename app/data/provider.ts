@@ -8,6 +8,8 @@ export interface ProviderConfig {
 	base_url: string;
 	model: string;
 	concurrency: number;
+	/** Send `reasoning_effort: "none"` so thinking models answer directly. */
+	disable_thinking: boolean;
 }
 
 export interface ProviderStatus {
@@ -32,6 +34,8 @@ export interface SetProviderConfigInput {
 	concurrency: number;
 	/** `undefined`/empty keeps the stored key; empty string clears it. */
 	apiKey?: string;
+	/** `undefined` keeps the stored value. */
+	disableThinking?: boolean;
 }
 
 export function useProviderStatus() {

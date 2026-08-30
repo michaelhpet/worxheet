@@ -1,7 +1,6 @@
 //! Deterministic post-generation quality gates. No LLM involvement: every
 //! check is a pure function over the model output plus its source segment.
-//! Invalid items are either repaired (normalization) or rejected so the
-//! caller can retry the unit with a different seed.
+//! Invalid items are either repaired (normalization) or rejected and dropped.
 
 use std::collections::HashSet;
 
@@ -144,7 +143,7 @@ pub fn similarity(left: &str, right: &str) -> f32 {
 pub enum ItemVerdict {
     /// Normalized item, safe to persist.
     Accepted(serde_json::Value),
-    /// Human-readable reason; triggers retry/drop upstream.
+    /// Human-readable reason; the item is dropped upstream.
     Rejected(String),
 }
 

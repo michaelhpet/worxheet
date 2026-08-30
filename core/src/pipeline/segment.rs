@@ -23,7 +23,7 @@ pub enum BlockKind {
     Body,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Block {
     pub kind: BlockKind,
     pub text: String,

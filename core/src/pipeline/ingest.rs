@@ -11,10 +11,16 @@ use crate::schema::Segment;
 
 use super::segment::{self, Block, BlockKind, SegmentDraft};
 
-/// Parse a file into ordered typed blocks.
-pub fn parse_blocks(path: &str, extension: &str) -> Result<Vec<Block>, String> {
+/// Parse a file into ordered typed blocks. `on_page` (when given) reports
+/// `(pages_done, pages_total)` as extraction progresses so ingestion can surface
+/// a live progress bar even for a single large file.
+pub fn parse_blocks(
+    path: &str,
+    extension: &str,
+    on_page: Option<&mut dyn FnMut(usize, usize)>,
+) -> Result<Vec<Block>, String> {
     match extension.to_lowercase().as_str() {
-        "pdf" => parse_pdf_blocks(path),
+        "pdf" => parse_pdf_blocks(path, on_page),
         "pptx" | "docx" | "ppt" | "doc" => parse_office_blocks(path),
         _ => Err(format!("Unsupported file extension: {}", extension)),
     }
@@ -22,7 +28,10 @@ pub fn parse_blocks(path: &str, extension: &str) -> Result<Vec<Block>, String> {
 
 /// PDFs: span-level extraction with font-size statistics for heading
 /// detection. Falls back to plain page text when layout extraction fails.
-fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
+fn parse_pdf_blocks(
+    path: &str,
+    mut on_page: Option<&mut dyn FnMut(usize, usize)>,
+) -> Result<Vec<Block>, String> {
     let doc = pdf_oxide::PdfDocument::open(path).map_err(|e| format!("Failed to open PDF: {e}"))?;
     let page_count = doc
         .page_count()
@@ -33,6 +42,9 @@ fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
         std::collections::HashMap::new();
     let mut page_spans: Vec<Vec<(String, f32)>> = Vec::with_capacity(page_count);
     for page_index in 0..page_count {
+        if let Some(on_page) = on_page.as_deref_mut() {
+            on_page(page_index + 1, page_count);
+        }
         let mut page = Vec::new();
         if let Ok(spans) = doc.extract_spans(page_index) {
             for span in spans {
@@ -98,19 +110,25 @@ fn parse_pdf_blocks(path: &str) -> Result<Vec<Block>, String> {
         .filter(|block| matches!(block.kind, BlockKind::Heading(_) | BlockKind::Body))
         .all(|block| block.text.trim().is_empty())
     {
-        return parse_pdf_plain(path);
+        return parse_pdf_plain(path, on_page);
     }
 
     Ok(blocks)
 }
 
-fn parse_pdf_plain(path: &str) -> Result<Vec<Block>, String> {
+fn parse_pdf_plain(
+    path: &str,
+    mut on_page: Option<&mut dyn FnMut(usize, usize)>,
+) -> Result<Vec<Block>, String> {
     let doc = pdf_oxide::PdfDocument::open(path).map_err(|e| format!("Failed to open PDF: {e}"))?;
     let page_count = doc
         .page_count()
         .map_err(|e| format!("Failed to get page count: {e}"))?;
     let mut blocks = Vec::new();
     for page_index in 0..page_count {
+        if let Some(on_page) = on_page.as_deref_mut() {
+            on_page(page_index + 1, page_count);
+        }
         let text = doc
             .extract_text_auto(page_index)
             .map_err(|e| format!("Failed to extract page {page_index}: {e}"))?;
@@ -261,7 +279,15 @@ pub async fn process_files(
     );
 
     let mut segmented: Vec<Option<Vec<SegmentDraft>>> = vec![None; total_files];
-    let (tx, mut rx) = mpsc::channel::<(usize, Result<Vec<SegmentDraft>, String>)>(total_files);
+
+    // Single channel carrying both live page progress and file completions so
+    // the async side can report progress while workers parse.
+    enum Msg {
+        Progress(usize, usize),
+        Done(usize, Result<Vec<SegmentDraft>, String>),
+    }
+    let capacity = total_files.max(1) * 4096;
+    let (tx, mut rx) = mpsc::channel::<Msg>(capacity);
 
     let mut done = 0usize;
     let mut start = 0;
@@ -275,22 +301,39 @@ pub async fn process_files(
             let extension = extension.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let result = (|| -> Result<Vec<SegmentDraft>, String> {
-                    let blocks = parse_blocks(&path, &extension)?;
-                    Ok(segment::segment_blocks(blocks, &tokenizer))
+                    let tx_page = tx.clone();
+                    let blocks = parse_blocks(&path, &extension, Some(&mut move |pd, pt| {
+                        let _ = tx_page.blocking_send(Msg::Progress(pd, pt));
+                    }))?;
+                    let tx_seg = tx.clone();
+                    let drafts = segment::segment_blocks(
+                        blocks,
+                        &tokenizer,
+                        Some(&mut move |bd, bt| {
+                            let _ = tx_seg.blocking_send(Msg::Progress(bd, bt));
+                        }),
+                    );
+                    Ok(drafts)
                 })();
-                let _ = tx.blocking_send((index, result));
+                let _ = tx.blocking_send(Msg::Done(index, result));
             });
         }
 
-        for _ in start..end {
-            let (index, result) = rx
+        while done < end {
+            match rx
                 .recv()
                 .await
-                .ok_or_else(|| String::from("Parse channel closed unexpectedly"))?;
-            segmented[index] = Some(result?);
-            done += 1;
-            if let Some(on_progress) = on_progress.as_deref_mut() {
-                on_progress(done, total_files);
+                .ok_or_else(|| String::from("Parse channel closed unexpectedly"))?
+            {
+                Msg::Progress(pages_done, pages_total) => {
+                    if let Some(on_progress) = on_progress.as_deref_mut() {
+                        on_progress(pages_done, pages_total);
+                    }
+                }
+                Msg::Done(index, result) => {
+                    segmented[index] = Some(result?);
+                    done += 1;
+                }
             }
         }
         start = end;

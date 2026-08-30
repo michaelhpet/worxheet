@@ -110,14 +110,24 @@ fn flush_draft(drafts: &mut Vec<SegmentDraft>, heading: Option<String>, text: &s
 }
 
 /// Group blocks into heading-scoped sections no larger than
-/// [`TARGET_SEGMENT_TOKENS`].
-pub fn pack_sections(blocks: &[Block], tokenizer: &Tokenizer) -> Vec<SegmentDraft> {
+/// [`TARGET_SEGMENT_TOKENS`]. `on_progress` (when given) reports
+/// `(blocks_processed, total_blocks)` so ingestion can keep advancing its
+/// progress bar through the (CPU-heavy) tokenization of this stage.
+pub fn pack_sections(
+    blocks: &[Block],
+    tokenizer: &Tokenizer,
+    mut on_progress: Option<&mut dyn FnMut(usize, usize)>,
+) -> Vec<SegmentDraft> {
     let mut drafts: Vec<SegmentDraft> = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
     let mut current_tokens = 0usize;
+    let total_blocks = blocks.len();
 
-    for block in blocks {
+    for (block_index, block) in blocks.iter().enumerate() {
+        if let Some(on_progress) = on_progress.as_deref_mut() {
+            on_progress(block_index + 1, total_blocks);
+        }
         match block.kind {
             BlockKind::Heading(_) => {
                 flush_draft(&mut drafts, current_heading.take(), &current_text);
@@ -232,9 +242,15 @@ fn structural_split(
     drafts
 }
 
-/// Full segmentation pipeline for one file's parsed blocks.
-pub fn segment_blocks(blocks: Vec<Block>, tokenizer: &Tokenizer) -> Vec<SegmentDraft> {
-    let sections = pack_sections(&blocks, tokenizer);
+/// Full segmentation pipeline for one file's parsed blocks. `on_progress`
+/// (when given) reports `(blocks_processed, total_blocks)` as sections are
+/// packed, advancing the ingest progress bar through tokenization.
+pub fn segment_blocks(
+    blocks: Vec<Block>,
+    tokenizer: &Tokenizer,
+    on_progress: Option<&mut dyn FnMut(usize, usize)>,
+) -> Vec<SegmentDraft> {
+    let sections = pack_sections(&blocks, tokenizer, on_progress);
     let mut drafts = Vec::new();
     for section in sections {
         if token_count(tokenizer, &section.text) <= DRIFT_TRIGGER_TOKENS {
@@ -302,7 +318,7 @@ mod tests {
             block(BlockKind::Body, "Beta body text."),
         ];
 
-        let drafts = pack_sections(&blocks, &tokenizer);
+        let drafts = pack_sections(&blocks, &tokenizer, None);
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts[0].heading.as_deref(), Some("Chapter 1"));
         assert_eq!(drafts[0].text, "Alpha body text.");
@@ -317,7 +333,7 @@ mod tests {
             .repeat(150);
         let blocks = vec![block(BlockKind::Body, &long_body)];
 
-        let drafts = pack_sections(&blocks, &tokenizer);
+        let drafts = pack_sections(&blocks, &tokenizer, None);
         assert!(drafts.len() >= 2, "long body should be packed into multiple sections");
     }
 
@@ -343,7 +359,7 @@ mod tests {
         let repeat = 200;
         let blocks = vec![block(BlockKind::Body, &sentence.repeat(repeat))];
 
-        let drafts = segment_blocks(blocks, &tokenizer);
+        let drafts = segment_blocks(blocks, &tokenizer, None);
         assert!(drafts.len() >= 2, "long body must be split into multiple segments");
 
         for draft in &drafts {

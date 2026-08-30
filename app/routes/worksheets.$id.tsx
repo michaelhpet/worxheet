@@ -51,6 +51,7 @@ function WorksheetDetail() {
 
 	if (status && status.status === "running") {
 		const artifactType = ARTIFACT_TYPE_OPTIONS.find((o) => o.value === status.artifact_type);
+		const showProgress = (artifactType && status.total > 0) || (status.phase === "ingesting" && status.total > 0);
 		return (
 			<Layout onBack={exitWorksheet}>
 				<div className="grow w-full flex flex-col items-center gap-3 mt-40">
@@ -63,9 +64,11 @@ function WorksheetDetail() {
 							<ItemTitle className="line-clamp-1 capitalize">{status.phase ?? "Preparing"}...</ItemTitle>
 						</ItemContent>
 						<ItemContent className="min-w-30 flex-none justify-end">
-							{!!artifactType && (
+							{showProgress && (
 								<>
-									<span className="text-sm text-muted-foreground tabular-nums">{artifactType.label}</span>
+									<span className="text-sm text-muted-foreground tabular-nums">
+										{status.phase === "ingesting" ? `${status.done}/${status.total}` : artifactType?.label}
+									</span>
 									<Progress value={status.done} max={status.total} />
 								</>
 							)}

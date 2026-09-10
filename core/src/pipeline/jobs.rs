@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use sqlx::{Pool, Sqlite};
 use tauri::{AppHandle, Emitter};
 
-use crate::provider::{self, client::OpenAiClient, config::ProviderState, ArtifactBackend};
+use crate::provider::{self, client::OpenAiClient, ArtifactBackend};
 use crate::schema::{ArtifactType, PipelineStatus, TypeProgress};
+use crate::settings::SettingsState;
 
 use super::segment;
 
@@ -52,7 +53,7 @@ impl Default for PipelineJobs {
 pub fn start_job(
     app: AppHandle,
     pool: Pool<Sqlite>,
-    providers: Arc<ProviderState>,
+    settings: Arc<SettingsState>,
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
 ) -> bool {
@@ -85,7 +86,7 @@ pub fn start_job(
     }
 
     tauri::async_runtime::spawn(async move {
-        run_job(&app, &pool, &providers, &jobs, &worksheet_id).await;
+        run_job(&app, &pool, &settings, &jobs, &worksheet_id).await;
     });
     true
 }
@@ -95,7 +96,7 @@ pub fn start_job(
 pub async fn resume_stale(
     app: AppHandle,
     pool: Pool<Sqlite>,
-    providers: Arc<ProviderState>,
+    settings: Arc<SettingsState>,
     jobs: Arc<PipelineJobs>,
 ) {
     let rows = sqlx::query_as::<_, (String,)>(
@@ -109,7 +110,7 @@ pub async fn resume_stale(
         start_job(
             app.clone(),
             pool.clone(),
-            providers.clone(),
+            settings.clone(),
             jobs.clone(),
             worksheet_id,
         );
@@ -183,7 +184,7 @@ pub async fn get_status(
 pub async fn resume_if_needed(
     app: AppHandle,
     pool: &Pool<Sqlite>,
-    providers: &Arc<ProviderState>,
+    settings: &Arc<SettingsState>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
 ) -> Result<PipelineStatus, String> {
@@ -212,7 +213,7 @@ pub async fn resume_if_needed(
     start_job(
         app,
         pool.clone(),
-        providers.clone(),
+        settings.clone(),
         jobs.clone(),
         worksheet_id.to_string(),
     );
@@ -222,11 +223,11 @@ pub async fn resume_if_needed(
 async fn run_job(
     app: &AppHandle,
     pool: &Pool<Sqlite>,
-    providers: &Arc<ProviderState>,
+    settings: &Arc<SettingsState>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
 ) {
-    let result = run_pipeline(app, pool, providers, jobs, worksheet_id).await;
+    let result = run_pipeline(app, pool, settings, jobs, worksheet_id).await;
 
     let (status, error) = match result {
         Ok(()) => (String::from("done"), None),
@@ -264,17 +265,18 @@ async fn run_job(
 }
 
 /// Build the generation backend from the current provider configuration.
-pub fn resolve_backend(
-    providers: &Arc<ProviderState>,
+fn resolve_backend(
+    settings: &Arc<SettingsState>,
 ) -> Result<(Arc<dyn ArtifactBackend>, usize), String> {
-    let config = providers.get();
+    let provider = settings.get().provider;
+    let config = provider.active_config();
     if !config.is_configured() {
         return Err(String::from(
             "No LLM provider is configured. Open Settings and add a provider.",
         ));
     }
     // Key presence is the only signal: absent key → no Authorization header.
-    let api_key = provider::config::load_api_key(&config.preset)?.filter(|key| !key.is_empty());
+    let api_key = provider::config::load_api_key(&provider.active)?.filter(|key| !key.is_empty());
     let backend = OpenAiClient::new(&config.base_url, api_key, &config.model)
         .with_reasoning_effort(
             config
@@ -287,7 +289,7 @@ pub fn resolve_backend(
 async fn run_pipeline(
     app: &AppHandle,
     pool: &Pool<Sqlite>,
-    providers: &Arc<ProviderState>,
+    settings: &Arc<SettingsState>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
 ) -> Result<(), String> {
@@ -315,7 +317,7 @@ async fn run_pipeline(
 
     // Resolve the cloud backend before doing any local work so a missing
     // configuration fails fast with an actionable message.
-    let (backend, concurrency) = resolve_backend(providers)?;
+    let (backend, concurrency) = resolve_backend(settings)?;
     let tokenizer = segment::bundled_tokenizer()?;
     let logs = Arc::new(
         crate::logging::RunLogs::new()

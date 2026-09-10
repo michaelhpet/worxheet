@@ -1,6 +1,8 @@
 /* eslint-disable react-refresh/only-export-components */
 import * as React from "react";
 
+import { useSettings, useUpdateSettings } from "@/data/settings";
+
 type Theme = "dark" | "light" | "system";
 type ResolvedTheme = "dark" | "light";
 
@@ -70,13 +72,27 @@ export function ThemeProvider({
 		return defaultTheme;
 	});
 
+	const { data: savedSettings } = useSettings();
+	const updateSettings = useUpdateSettings();
+
 	const setTheme = React.useCallback(
 		(nextTheme: Theme) => {
 			localStorage.setItem(storageKey, nextTheme);
 			setThemeState(nextTheme);
+			updateSettings.mutate({ appearance: { theme: nextTheme } });
 		},
-		[storageKey],
+		[storageKey, updateSettings],
 	);
+
+	// Adopt the persisted theme once, only when there is no local bootstrap
+	// value yet — the local store stays the instant, flash-free source.
+	React.useEffect(() => {
+		const storedTheme = localStorage.getItem(storageKey);
+		const savedTheme = savedSettings?.appearance.theme;
+		if (!isTheme(storedTheme) && savedTheme) {
+			setTheme(savedTheme);
+		}
+	}, [savedSettings, storageKey, setTheme]);
 
 	const applyTheme = React.useCallback(
 		(nextTheme: Theme) => {

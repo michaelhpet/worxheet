@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 
+import { SETTINGS_QUERY_KEY } from "./settings";
+
 export type ProviderPreset = "openai" | "gemini" | "ollama" | "lmstudio" | "custom";
 
-export interface ProviderConfig {
-	preset: string;
+export interface PerPresetConfig {
 	base_url: string;
 	model: string;
 	concurrency: number;
@@ -13,15 +14,15 @@ export interface ProviderConfig {
 }
 
 export interface ProviderStatus {
-	config: ProviderConfig;
+	preset: string;
+	config: PerPresetConfig;
 	/** Whether an API key is stored in the OS keychain (never the key itself). */
 	api_key_set: boolean;
 }
 
-export interface ValidationResult {
-	ok: boolean;
-	error: string | null;
-	models: string[];
+export interface ProviderSettings {
+	active: string;
+	presets: Record<string, PerPresetConfig>;
 }
 
 export const PROVIDER_QUERY_KEY = "PROVIDER";
@@ -52,13 +53,8 @@ export function useSetProviderConfig() {
 		mutationFn: (input: SetProviderConfigInput) => invoke<ProviderStatus>("set_provider_config", { ...input }),
 		onSuccess: (status) => {
 			queryClient.setQueryData([PROVIDER_QUERY_KEY], status);
+			queryClient.invalidateQueries({ queryKey: [SETTINGS_QUERY_KEY] });
 		},
-	});
-}
-
-export function useValidateProvider() {
-	return useMutation({
-		mutationFn: () => invoke<ValidationResult>("validate_provider"),
 	});
 }
 

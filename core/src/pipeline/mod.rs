@@ -14,9 +14,7 @@ pub mod segment;
 pub mod validate;
 
 pub use generate::{generate_all, PendingArtifact};
-pub use jobs::{
-    remove_job, resolve_backend, resume_if_needed, resume_stale, start_job, PipelineJobs,
-};
+pub use jobs::{remove_job, resume_if_needed, resume_stale, start_job, PipelineJobs};
 
 /// Parse, segment, and persist every file of a worksheet. Reports progress as
 /// each file completes through `on_progress`. `logs` (when given) receives

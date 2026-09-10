@@ -29,7 +29,7 @@ pub async fn get_pipeline_status(
     pipeline::resume_if_needed(
         app,
         &state.database,
-        &state.providers,
+        &state.settings,
         &state.jobs,
         &worksheet_id,
     )

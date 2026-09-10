@@ -5,7 +5,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager};
 
 use crate::pipeline::{resume_stale, PipelineJobs};
-use crate::provider::config::{ProviderConfig, ProviderState};
+use crate::settings::SettingsState;
 
 mod commands;
 mod database;
@@ -13,11 +13,12 @@ mod logging;
 mod pipeline;
 mod provider;
 mod schema;
+mod settings;
 mod worksheet;
 
 pub struct AppState {
     pub(crate) database: Pool<Sqlite>,
-    pub(crate) providers: Arc<ProviderState>,
+    pub(crate) settings: Arc<SettingsState>,
     pub(crate) jobs: Arc<PipelineJobs>,
 }
 
@@ -28,19 +29,24 @@ pub fn run() {
             let handle = app.handle();
             let pool = tauri::async_runtime::block_on(database::connect(handle))?;
 
-            let providers = Arc::new(ProviderState::new(ProviderConfig::default()));
+            let settings_path = handle
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("Failed to resolve app data dir: {e}"))?
+                .join("settings.json");
+            let settings = Arc::new(SettingsState::load(settings_path)?);
             let jobs = Arc::new(PipelineJobs::default());
 
             setup_native_menu(handle)?;
             tauri::async_runtime::spawn(resume_stale(
                 handle.clone(),
                 pool.clone(),
-                providers.clone(),
+                settings.clone(),
                 jobs.clone(),
             ));
             app.manage(AppState {
                 database: pool,
-                providers,
+                settings,
                 jobs,
             });
             Ok(())
@@ -58,8 +64,9 @@ pub fn run() {
             commands::pipeline::get_pipeline_status,
             commands::provider::get_provider_status,
             commands::provider::set_provider_config,
-            commands::provider::validate_provider,
-            commands::provider::list_provider_models
+            commands::provider::list_provider_models,
+            commands::settings::get_settings,
+            commands::settings::update_settings
         ])
         .run(tauri::generate_context!())
         .expect("Error while running application");

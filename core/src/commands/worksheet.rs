@@ -40,7 +40,7 @@ pub async fn create_worksheet(
         pipeline::start_job(
             app,
             state.database.clone(),
-            state.providers.clone(),
+            state.settings.clone(),
             state.jobs.clone(),
             worksheet.id.clone(),
         );

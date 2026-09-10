@@ -7,9 +7,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { useProviderModels, useProviderStatus, useSetProviderConfig, type ProviderPreset } from "@/data/provider";
 import { cn } from "@/lib/utils";
 import { IconCheck, IconEye, IconEyeOff, IconX } from "@tabler/icons-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useForm } from "@tanstack/react-form";
+import { useCallback, useEffect, useState } from "react";
 
-const PRESETS: { value: ProviderPreset; label: string; hint: string; baseUrl: string; model: string }[] = [
+const PRESETS = [
 	{
 		value: "openai",
 		label: "OpenAI",
@@ -49,152 +50,129 @@ const PRESETS: { value: ProviderPreset; label: string; hint: string; baseUrl: st
 
 const PERSIST_DELAY_MS = 400;
 
-interface ProviderInferenceFormProps {
-	onTestResult?: (ok: boolean) => void;
-}
-
-export function ProviderInferenceForm({ onTestResult }: ProviderInferenceFormProps) {
-	const { data: status } = useProviderStatus();
-	const setConfig = useSetProviderConfig();
-
-	const [preset, setPreset] = useState<ProviderPreset>("openai");
-	const [baseUrl, setBaseUrl] = useState("");
-	const [model, setModel] = useState("");
-	const [apiKey, setApiKey] = useState("");
-	const [concurrency, setConcurrency] = useState(8);
+export function ProviderInferenceForm() {
 	const [connection, setConnection] = useState<{ ok: boolean; error?: string; count?: number } | null>(null);
 	const [testing, setTesting] = useState(false);
 	const [showKey, setShowKey] = useState(false);
+	const modelsQuery = useProviderModels(false);
+	const setConfig = useSetProviderConfig();
+	const { data: status, isLoading } = useProviderStatus();
+	const form = useForm({
+		defaultValues: {
+			preset: status?.preset ?? "",
+			baseUrl: status?.config.base_url ?? "",
+			model: status?.config.model ?? "",
+			apiKey: "",
+			concurrency: status?.config.concurrency ?? 8,
+		},
+	});
 
-	const loadedRef = useRef(false);
-	useEffect(() => {
-		if (loadedRef.current || !status) return;
-		loadedRef.current = true;
-		setPreset(status.config.preset as ProviderPreset);
-		setBaseUrl(status.config.base_url);
-		setModel(status.config.model);
-		setConcurrency(status.config.concurrency);
-		setApiKey("");
-		setConnection(null);
-	}, [status]);
-
-	const draftRef = useRef({ preset, baseUrl, model, concurrency, apiKey });
-	draftRef.current = { preset, baseUrl, model, concurrency, apiKey };
-
-	const lastSavedRef = useRef("");
-
-	const persist = useCallback(async () => {
-		const { preset, baseUrl, model, concurrency, apiKey } = draftRef.current;
-		const trimmedBase = baseUrl.trim();
-		const trimmedModel = model.trim();
-		const trimmedKey = apiKey.trim();
-		const payload = `${preset}\u0000${trimmedBase}\u0000${trimmedModel}\u0000${concurrency}\u0000${trimmedKey}`;
-		if (payload === lastSavedRef.current) return;
-		lastSavedRef.current = payload;
+	const persistSettings = useCallback(async () => {
+		const { preset, baseUrl, model, apiKey, concurrency } = form.state.values;
 		await setConfig.mutateAsync({
 			preset,
-			baseUrl: trimmedBase,
-			model: trimmedModel,
+			baseUrl: baseUrl.trim(),
+			model: model.trim(),
 			concurrency,
-			apiKey: trimmedKey === "" ? undefined : trimmedKey,
+			apiKey: apiKey.trim() === "" ? undefined : apiKey.trim(),
 		});
-	}, [setConfig]);
-
-	const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: FIXME
-	useEffect(() => {
-		if (!loadedRef.current) return;
-		if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-		persistTimerRef.current = setTimeout(() => {
-			void persist();
-		}, PERSIST_DELAY_MS);
-
-		return () => {
-			if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-		};
-	}, [preset, baseUrl, model, concurrency, apiKey, persist]);
-
-	const modelsQuery = useProviderModels(false);
+	}, [form.state.values, setConfig]);
 
 	const testConnection = async () => {
 		setConnection(null);
 		setTesting(true);
 		try {
-			await persist();
+			await persistSettings();
 			const result = await modelsQuery.refetch();
-			if (result.isError) {
-				setConnection({ ok: false, error: String(result.error ?? "Connection failed.") });
-				onTestResult?.(false);
-				return;
-			}
+			if (result.isError) return setConnection({ ok: false, error: String(result.error ?? "Connection failed.") });
 			const models = result.data ?? [];
 			setConnection({ ok: true, count: models.length });
-			if (models.length > 0 && !model.trim()) {
-				setModel(models[0]);
+			if (models.length > 0 && !form.state.values.model.trim()) {
+				form.setFieldValue("model", models[0]);
 			}
-			onTestResult?.(true);
 		} finally {
 			setTesting(false);
 		}
 	};
 
+	useEffect(() => {
+		if (!form.state.values.preset) return;
+		const timeoutId = setTimeout(persistSettings, PERSIST_DELAY_MS);
+		return () => clearTimeout(timeoutId);
+	}, [persistSettings, form.state.values.preset]);
+
+	if (isLoading) {
+		return <Spinner />;
+	}
+
 	return (
-		<div className="flex flex-col gap-5">
+		<form onSubmit={(e) => e.preventDefault()} className="flex flex-col gap-5">
 			<Field>
 				<FieldLabel>Provider</FieldLabel>
-				<Select
-					value={preset}
-					onValueChange={(value) => {
-						const next = value as ProviderPreset;
-						const target = PRESETS.find((entry) => entry.value === next);
-						setPreset(next);
-						if (target) {
-							setBaseUrl(target.baseUrl);
-							setConnection(null);
-						}
-						if (next !== "custom") {
-							setModel(target?.model ?? "");
-						} else {
-							setModel("");
-						}
-					}}
-				>
-					<SelectTrigger>
-						<SelectValue />
-					</SelectTrigger>
-					<SelectContent>
-						{PRESETS.map((entry) => (
-							<SelectItem key={entry.value} value={entry.value}>
-								{entry.label}
-							</SelectItem>
-						))}
-					</SelectContent>
-				</Select>
-				<FieldDescription>{PRESETS.find((entry) => entry.value === preset)?.hint}</FieldDescription>
+				<form.Field name="preset">
+					{(field) => (
+						<Select
+							value={field.state.value}
+							onValueChange={(value) => {
+								const next = value as ProviderPreset;
+								const target = PRESETS.find((entry) => entry.value === next);
+								field.handleChange(next);
+								if (target) {
+									form.setFieldValue("baseUrl", target.baseUrl);
+									setConnection(null);
+								}
+								form.setFieldValue("model", next !== "custom" ? (target?.model ?? "") : "");
+							}}
+						>
+							<SelectTrigger>
+								<SelectValue />
+							</SelectTrigger>
+							<SelectContent>
+								{PRESETS.map((entry) => (
+									<SelectItem key={entry.value} value={entry.value}>
+										{entry.label}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+					)}
+				</form.Field>
+				<form.Field name="preset">
+					{(field) => (
+						<FieldDescription>{PRESETS.find((entry) => entry.value === field.state.value)?.hint}</FieldDescription>
+					)}
+				</form.Field>
 			</Field>
 
-			{preset === "custom" && (
-				<Field>
-					<FieldLabel>Base URL</FieldLabel>
-					<Input
-						placeholder="https://your-server.example.com/v1"
-						value={baseUrl}
-						onChange={(event) => setBaseUrl(event.target.value)}
-					/>
-				</Field>
-			)}
+			<form.Field name="baseUrl">
+				{(field) =>
+					form.state.values.preset === "custom" ? (
+						<Field>
+							<FieldLabel>Base URL</FieldLabel>
+							<Input
+								placeholder="https://your-server.example.com/v1"
+								value={field.state.value}
+								onChange={(event) => field.handleChange(event.target.value)}
+							/>
+						</Field>
+					) : null
+				}
+			</form.Field>
 
 			<Field>
 				<FieldLabel>API key</FieldLabel>
 				<div className="relative">
-					<Input
-						type={showKey ? "text" : "password"}
-						placeholder={status?.api_key_set ? "*****************" : "Paste your API key"}
-						value={apiKey}
-						onChange={(event) => setApiKey(event.target.value)}
-						className="pr-10"
-					/>
+					<form.Field name="apiKey">
+						{(field) => (
+							<Input
+								type={showKey ? "text" : "password"}
+								placeholder={status?.api_key_set ? "*****************" : "Paste your API key"}
+								value={field.state.value}
+								onChange={(event) => field.handleChange(event.target.value)}
+								className="pr-10"
+							/>
+						)}
+					</form.Field>
 					<button
 						type="button"
 						tabIndex={-1}
@@ -214,7 +192,12 @@ export function ProviderInferenceForm({ onTestResult }: ProviderInferenceFormPro
 
 			<Field>
 				<FieldLabel>Test connection</FieldLabel>
-				<Button type="button" variant="outline" onClick={testConnection} disabled={!baseUrl.trim() || testing}>
+				<Button
+					type="button"
+					variant="outline"
+					onClick={testConnection}
+					disabled={!form.state.values.baseUrl.trim() || testing}
+				>
 					{testing ? <Spinner /> : null}
 					{testing ? "Connecting…" : "Test connection"}
 				</Button>
@@ -239,33 +222,41 @@ export function ProviderInferenceForm({ onTestResult }: ProviderInferenceFormPro
 
 			<Field>
 				<FieldLabel>Model</FieldLabel>
-				<Select value={model} onValueChange={(value) => setModel(value ?? "")}>
-					<SelectTrigger>
-						<SelectValue placeholder="Run Test connection to load models" />
-					</SelectTrigger>
-					<SelectContent>
-						{(modelsQuery.data ?? []).map((id) => (
-							<SelectItem key={id} value={id}>
-								{id}
-							</SelectItem>
-						))}
-					</SelectContent>
-				</Select>
+				<form.Field name="model">
+					{(field) => (
+						<Select value={field.state.value} onValueChange={(value) => field.handleChange(value ?? "")}>
+							<SelectTrigger>
+								<SelectValue placeholder="Run Test connection to load models" />
+							</SelectTrigger>
+							<SelectContent>
+								{(modelsQuery.data ?? []).map((id) => (
+									<SelectItem key={id} value={id}>
+										{id}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+					)}
+				</form.Field>
 			</Field>
 
-			<Field>
-				<FieldLabel>Parallel requests — {concurrency}</FieldLabel>
-				<Slider
-					min={1}
-					max={32}
-					step={1}
-					value={concurrency}
-					onValueChange={(value) => setConcurrency(Number(value))}
-				/>
-				<FieldDescription>
-					Higher is faster; lower it if you hit provider rate limits. Free tiers often need 2–4.
-				</FieldDescription>
-			</Field>
-		</div>
+			<form.Field name="concurrency">
+				{(field) => (
+					<Field>
+						<FieldLabel>Parallel requests — {field.state.value}</FieldLabel>
+						<Slider
+							min={1}
+							max={32}
+							step={1}
+							value={field.state.value}
+							onValueChange={(value) => field.handleChange(Number(value))}
+						/>
+						<FieldDescription>
+							Higher is faster; lower it if you hit provider rate limits. Free tiers often need 2–4.
+						</FieldDescription>
+					</Field>
+				)}
+			</form.Field>
+		</form>
 	);
 }

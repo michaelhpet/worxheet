@@ -6,10 +6,12 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { useProviderStatus, useSetProviderConfig } from "@/data/provider";
+import { isProviderReady, useProviderStatus, useSetProviderConfig } from "@/data/provider";
+import { useSettings, useUpdateSettings } from "@/data/settings";
 import { onOpenSettings, type SettingsTab } from "@/lib/settings-bus";
+import { listen } from "@tauri-apps/api/event";
 import { IconBotId, IconFileAi, IconPalette } from "@tabler/icons-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Sidebar, SidebarContent, SidebarGroup, SidebarMenuButton, SidebarProvider } from "./ui/sidebar";
 
 const NAV: { tab: SettingsTab; label: string; icon: typeof IconPalette }[] = [
@@ -30,19 +32,24 @@ export function SettingsDialog() {
 
 	const { theme, setTheme } = useTheme();
 
-	// Thinking-mode toggle is live: it writes `disable_thinking` through the
-	// provider config. The knobs below remain a preview for now.
-	const { data: status } = useProviderStatus();
+	const { data: status, isLoading } = useProviderStatus();
 	const setConfig = useSetProviderConfig();
 	const thinkingEnabled = status ? !status.config.disable_thinking : true;
 
-	// Artifact generation knobs — frontend-only shell for now. Not persisted
-	// or wired to the backend yet.
-	const [temperature, setTemperature] = useState(0.7);
-	const [maxTokens, setMaxTokens] = useState(2048);
-	const [seed, setSeed] = useState(1234);
+	const { data: settings } = useSettings();
+	const updateSettings = useUpdateSettings();
 
-	// Open from anywhere: gear buttons, blocked flows, native menu event.
+	const checkedRef = useRef(false);
+	useEffect(() => {
+		if (checkedRef.current) return;
+		if (isLoading || !status) return;
+		checkedRef.current = true;
+		if (!isProviderReady(status)) {
+			setTab("inference");
+			setOpen(true);
+		}
+	}, [isLoading, status]);
+
 	useEffect(() => {
 		return onOpenSettings((requested) => {
 			setTab(requested ?? "appearance");
@@ -50,26 +57,13 @@ export function SettingsDialog() {
 		});
 	}, []);
 
-	// Relay the native macOS Preferences… menu item.
 	useEffect(() => {
-		let unlisten: (() => void) | undefined;
-		let disposed = false;
-
-		import("@tauri-apps/api/event")
-			.then(({ listen }) =>
-				listen("settings:open", () => {
-					setTab("appearance");
-					setOpen(true);
-				}),
-			)
-			.then((unregister) => {
-				if (disposed) unregister();
-				else unlisten = unregister;
-			});
-
+		const unlisten = listen("settings:open", () => {
+			setTab("appearance");
+			setOpen(true);
+		});
 		return () => {
-			disposed = true;
-			unlisten?.();
+			unlisten.then((fn) => fn());
 		};
 	}, []);
 
@@ -77,8 +71,6 @@ export function SettingsDialog() {
 		<Dialog
 			open={open}
 			onOpenChange={(nextOpen, details) => {
-				// Only the close button may dismiss the dialog; ignore outside
-				// clicks and the Escape key.
 				if (!nextOpen && details?.reason !== "close-press") return;
 				setOpen(nextOpen);
 			}}
@@ -138,7 +130,7 @@ export function SettingsDialog() {
 								</div>
 							)}
 
-							{tab === "artifacts" && (
+							{tab === "artifacts" && settings && (
 								<div className="flex flex-col gap-5">
 									<div>
 										<h2 className="text-base font-medium">Artifacts</h2>
@@ -148,13 +140,13 @@ export function SettingsDialog() {
 									</div>
 
 									<Field>
-										<FieldLabel>Creativity (temperature) — {temperature.toFixed(1)}</FieldLabel>
+										<FieldLabel>Creativity (temperature) — {settings.artifacts.temperature.toFixed(1)}</FieldLabel>
 										<Slider
 											min={0}
 											max={2}
 											step={0.1}
-											value={temperature}
-											onValueChange={(value) => setTemperature(Number(value))}
+											value={settings.artifacts.temperature}
+											onValueChange={(value) => updateSettings.mutate({ artifacts: { temperature: Number(value) } })}
 										/>
 										<FieldDescription>
 											Lower is more factual and predictable; higher is more varied. Quiz questions stay grounded so
@@ -163,13 +155,13 @@ export function SettingsDialog() {
 									</Field>
 
 									<Field>
-										<FieldLabel>Max output tokens — {maxTokens}</FieldLabel>
+										<FieldLabel>Max output tokens — {settings.artifacts.max_tokens}</FieldLabel>
 										<Slider
 											min={512}
 											max={4096}
 											step={256}
-											value={maxTokens}
-											onValueChange={(value) => setMaxTokens(Number(value))}
+											value={settings.artifacts.max_tokens}
+											onValueChange={(value) => updateSettings.mutate({ artifacts: { max_tokens: Number(value) } })}
 										/>
 										<FieldDescription>
 											Ceiling on how much a single generation request may write. Summaries and mind maps are capped
@@ -179,7 +171,15 @@ export function SettingsDialog() {
 
 									<Field>
 										<FieldLabel>Random seed</FieldLabel>
-										<Input type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value))} />
+										<Input
+											type="number"
+											value={settings.artifacts.seed ?? ""}
+											onChange={(event) => {
+												const value = event.target.value;
+												const next = value === "" ? null : Number(value);
+												updateSettings.mutate({ artifacts: { seed: next } });
+											}}
+										/>
 										<FieldDescription>
 											Fixing the seed makes regeneration reproducible. Unset to vary results each run.
 										</FieldDescription>
@@ -193,7 +193,7 @@ export function SettingsDialog() {
 												onCheckedChange={(enabled) => {
 													if (!status) return;
 													void setConfig.mutateAsync({
-														preset: status.config.preset,
+														preset: status.preset,
 														baseUrl: status.config.base_url,
 														model: status.config.model,
 														concurrency: status.config.concurrency,

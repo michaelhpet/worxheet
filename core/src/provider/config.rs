@@ -1,6 +1,6 @@
 //! Provider configuration, presets, and keychain-backed API key storage.
 
-use std::sync::RwLock;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,12 +25,10 @@ pub const DEFAULT_MODEL_BY_PRESET: &[(&str, &str)] = &[
 
 const KEYRING_SERVICE: &str = "worxheet";
 
-/// Active generation settings. The API key deliberately lives outside this
-/// struct: it is stored in the OS keychain and only joined at call time.
+/// Per-provider generation settings. The API key deliberately lives outside
+/// this struct: it is stored in the OS keychain and only joined at call time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    /// One of [`PRESETS`] names or `"custom"`.
-    pub preset: String,
+pub struct PerPresetConfig {
     pub base_url: String,
     pub model: String,
     /// Parallel in-flight requests during bulk generation.
@@ -43,38 +41,61 @@ pub struct ProviderConfig {
     pub disable_thinking: bool,
 }
 
-impl Default for ProviderConfig {
+impl Default for PerPresetConfig {
     fn default() -> Self {
         Self {
-            preset: String::from("openai"),
-            base_url: base_url_for_preset("openai")
-                .unwrap_or_default()
-                .to_string(),
-            model: default_model_for_preset("openai").to_string(),
+            base_url: String::new(),
+            model: String::new(),
             concurrency: 8,
             disable_thinking: true,
         }
     }
 }
 
-impl ProviderConfig {
-    #[allow(dead_code)] // used by frontend-driven flows and tests
-    pub fn for_preset(preset: &str) -> Self {
-        let mut config = Self::default();
-        if let Some(base_url) = base_url_for_preset(preset) {
-            config.preset = preset.to_string();
-            config.base_url = base_url.to_string();
-            config.model = default_model_for_preset(preset).to_string();
-        } else {
-            config.preset = String::from("custom");
-            config.base_url = String::new();
-            config.model = String::new();
-        }
-        config
-    }
-
+impl PerPresetConfig {
     pub fn is_configured(&self) -> bool {
         !self.base_url.is_empty() && !self.model.is_empty()
+    }
+}
+
+/// Full provider state: which preset is active plus the saved config for
+/// each configured preset. Switching presets loads that preset's saved
+/// settings; changes are persisted per-preset so the user's per-provider
+/// configuration survives across switches.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderSettings {
+    pub active: String,
+    pub presets: HashMap<String, PerPresetConfig>,
+}
+
+impl Default for ProviderSettings {
+    fn default() -> Self {
+        let mut presets = HashMap::new();
+        for &(name, url) in PRESETS {
+            presets.insert(
+                name.to_string(),
+                PerPresetConfig {
+                    base_url: url.to_string(),
+                    model: default_model_for_preset(name).to_string(),
+                    ..PerPresetConfig::default()
+                },
+            );
+        }
+        Self {
+            active: "openai".to_string(),
+            presets,
+        }
+    }
+}
+
+impl ProviderSettings {
+    /// The active preset's config, falling back to defaults if the preset
+    /// was never explicitly configured.
+    pub fn active_config(&self) -> PerPresetConfig {
+        self.presets
+            .get(&self.active)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -130,40 +151,34 @@ pub fn load_api_key(preset: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Process-wide holder of the active provider configuration.
-pub struct ProviderState {
-    config: RwLock<ProviderConfig>,
-}
-
-impl ProviderState {
-    pub fn new(config: ProviderConfig) -> Self {
-        Self {
-            config: RwLock::new(config),
-        }
-    }
-
-    pub fn get(&self) -> ProviderConfig {
-        self.config.read().unwrap().clone()
-    }
-
-    pub fn set(&self, config: ProviderConfig) {
-        *self.config.write().unwrap() = config;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_default_disables_thinking() {
-        assert!(ProviderConfig::default().disable_thinking);
+        let settings = ProviderSettings::default();
+        assert!(settings.active_config().disable_thinking);
     }
 
     #[test]
     fn test_presets_keep_thinking_disabled() {
+        let settings = ProviderSettings::default();
         for preset in ["openai", "gemini", "ollama", "lmstudio"] {
-            assert!(ProviderConfig::for_preset(preset).disable_thinking);
+            let config = settings.presets.get(preset).unwrap();
+            assert!(config.disable_thinking, "preset {preset} should default thinking disabled");
         }
+    }
+
+    #[test]
+    fn test_active_config_falls_back_for_unknown_preset() {
+        let settings = ProviderSettings {
+            active: "nonexistent".to_string(),
+            ..ProviderSettings::default()
+        };
+        let config = settings.active_config();
+        assert!(config.base_url.is_empty());
+        assert!(config.model.is_empty());
+        assert!(!config.is_configured());
     }
 }

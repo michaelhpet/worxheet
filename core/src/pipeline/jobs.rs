@@ -11,7 +11,7 @@ use sqlx::{Pool, Sqlite};
 use tauri::{AppHandle, Emitter};
 
 use crate::provider::{self, client::OpenAiClient, config::ProviderState, ArtifactBackend};
-use crate::schema::{ArtifactType, PipelineStatus};
+use crate::schema::{ArtifactType, PipelineStatus, TypeProgress};
 
 use super::segment;
 
@@ -24,6 +24,8 @@ struct RunningJob {
     artifact_type: Option<ArtifactType>,
     done: usize,
     total: usize,
+    /// Per-artifact-type unit progress in the current phase.
+    per_type: Vec<TypeProgress>,
     types_done: usize,
     types_total: usize,
     requests_done: usize,
@@ -66,6 +68,7 @@ pub fn start_job(
                     artifact_type: None,
                     done: 0,
                     total: 0,
+                    per_type: Vec::new(),
                     types_done: 0,
                     types_total: ArtifactType::ALL.len(),
                     requests_done: 0,
@@ -143,6 +146,7 @@ pub async fn get_status(
                 .map(String::from),
             done: running.done,
             total: running.total,
+            types: running.per_type.clone(),
             types_done: running.types_done,
             types_total: running.types_total,
             requests_done: running.requests_done,
@@ -158,6 +162,7 @@ pub async fn get_status(
         artifact_type: None,
         done: 0,
         total: 0,
+        types: Vec::new(),
         types_done: if persisted == "done" {
             ArtifactType::ALL.len()
         } else {
@@ -250,6 +255,7 @@ async fn run_job(
             "artifact_type": null,
             "done": 0,
             "total": 0,
+            "types": [],
             "types_done": 0,
             "types_total": ArtifactType::ALL.len(),
             "error": error,
@@ -343,25 +349,18 @@ async fn run_pipeline(
     let on_generate = generate_progress_sink(app, jobs, worksheet_id);
     let started = std::time::Instant::now();
 
-    // Per-item quiz artifacts persist incrementally as each unit completes so
+    // Per-item quiz artifacts persist synchronously as each unit completes so
     // an interruption keeps finished parts. Merged types (Summary/MindMap) are
-    // returned below and persisted once in `pending`. Handles are tracked so
-    // every write is awaited before the worksheet is marked `done`.
-    let persist_handles: Arc<std::sync::Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-
+    // returned below and persisted once in `pending`.
     let on_persist = {
         let pool = pool.clone();
         let worksheet_id = worksheet_id.to_string();
-        let persist_handles = persist_handles.clone();
         Arc::new(move |artifacts: Vec<super::generate::PendingArtifact>| {
             let pool = pool.clone();
             let worksheet_id = worksheet_id.clone();
-            let persist_handles = persist_handles.clone();
-            let handle = tauri::async_runtime::spawn(async move {
+            Box::pin(async move {
                 let _ = super::persist_artifacts(&pool, &worksheet_id, &artifacts).await;
-            });
-            persist_handles.lock().unwrap().push(handle);
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         }) as super::generate::PersistFn
     };
 
@@ -385,14 +384,6 @@ async fn run_pipeline(
         telemetry.tokens_out / 1000,
         started.elapsed()
     );
-
-    // Await all incremental persistence so a worksheet is only marked `done`
-    // once its quiz artifacts are actually committed to the database.
-    let handles: Vec<tauri::async_runtime::JoinHandle<()>> =
-        persist_handles.lock().unwrap().drain(..).collect();
-    for handle in handles {
-        let _ = handle.await;
-    }
 
     super::persist_artifacts(pool, worksheet_id, &pending).await?;
 
@@ -431,8 +422,10 @@ fn generate_progress_sink(
         {
             let mut running = jobs.jobs.lock().unwrap();
             if let Some(job) = running.get_mut(&worksheet_id) {
+                job.artifact_type = tick.artifact_type;
                 job.done = tick.done;
                 job.total = tick.total;
+                job.per_type = tick.per_type;
                 job.types_done = tick.types_done;
             }
         }
@@ -469,6 +462,7 @@ fn emit_progress(app: &AppHandle, jobs: &Arc<PipelineJobs>, worksheet_id: &str) 
             "artifact_type": job.artifact_type.as_ref().map(ArtifactType::to_db),
             "done": job.done,
             "total": job.total,
+            "types": job.per_type,
             "types_done": job.types_done,
             "types_total": job.types_total,
             "requests_done": job.requests_done,

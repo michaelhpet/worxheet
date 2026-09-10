@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::logging::{self, RunLogs};
 use crate::provider::{ArtifactBackend, GenerateRequest};
-use crate::schema::{ArtifactType, Segment};
+use crate::schema::{ArtifactType, Segment, TypeProgress};
 
 use super::validate::{self, references_missing_media, similarity, ItemVerdict};
 
@@ -60,10 +60,18 @@ fn max_tokens_for(artifact_type: &ArtifactType, params: &GenerationParams) -> i3
 const MAX_UNITS_PER_TYPE: usize = 48;
 
 /// Progress tick emitted as units complete.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GenerationTick {
+    /// The artifact type whose unit most recently completed. `None` before the
+    /// first unit finishes (and during the ingesting phase).
+    pub artifact_type: Option<ArtifactType>,
+    /// Units completed in the current phase, across all artifact types.
     pub done: usize,
+    /// Total units in the current phase, across all artifact types.
     pub total: usize,
+    /// Per-artifact-type progress for the current phase.
+    pub per_type: Vec<TypeProgress>,
+    /// Fully completed artifact type count.
     pub types_done: usize,
 }
 
@@ -73,7 +81,27 @@ pub type ProgressFn = Arc<dyn Fn(GenerationTick) + Send + Sync>;
 /// Persistence hook. When provided, artifacts are routed here as each unit
 /// completes (incremental, so interruptions keep finished parts); when `None`,
 /// all artifacts are returned as `pending` for the caller to persist.
-pub type PersistFn = Arc<dyn Fn(Vec<PendingArtifact>) + Send + Sync>;
+pub type PersistFn = Arc<
+    dyn Fn(Vec<PendingArtifact>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Build a per-artifact-type progress snapshot from the completed-unit counters.
+fn per_type_progress(
+    completed_per_type: &[AtomicUsize],
+    totals_per_type: &[usize; ArtifactType::ALL.len()],
+) -> Vec<TypeProgress> {
+    ArtifactType::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| TypeProgress {
+            artifact_type: ty.to_db().to_string(),
+            done: completed_per_type[index].load(Ordering::Relaxed),
+            total: totals_per_type[index],
+        })
+        .collect()
+}
 
 /// An artifact ready to be persisted.
 pub struct PendingArtifact {
@@ -833,8 +861,10 @@ pub async fn generate_all(
 
     if let Some(on_progress) = &on_progress {
         on_progress(GenerationTick {
+            artifact_type: None,
             done: 0,
             total: total_units,
+            per_type: per_type_progress(&completed_per_type, &totals_per_type),
             types_done: 0,
         });
     }
@@ -894,7 +924,7 @@ pub async fn generate_all(
                 let artifacts = build_item_artifacts(&unit, &outcome.items);
                 if let Some(on_persist) = &on_persist {
                     if !artifacts.is_empty() {
-                        on_persist(artifacts);
+                        on_persist(artifacts).await;
                     }
                 } else {
                     records.lock().unwrap()[unit_index] = Some(UnitRecord {
@@ -922,8 +952,10 @@ pub async fn generate_all(
 
             if let Some(on_progress) = &on_progress {
                 on_progress(GenerationTick {
+                    artifact_type: Some(unit.artifact_type.clone()),
                     done: finished,
                     total: total_units,
+                    per_type: per_type_progress(&completed_per_type, &totals_per_type),
                     types_done,
                 });
             }
@@ -985,7 +1017,7 @@ pub async fn generate_all(
                 content,
             };
             if let Some(on_persist) = &on_persist {
-                on_persist(vec![artifact]);
+                on_persist(vec![artifact]).await;
             } else {
                 pending.push(artifact);
             }

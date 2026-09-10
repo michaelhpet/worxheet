@@ -1,12 +1,20 @@
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 
+export interface TypeProgress {
+	artifact_type: string;
+	done: number;
+	total: number;
+}
+
 export interface PipelineStatus {
 	status: "idle" | "running" | "done" | "failed";
 	phase: "ingesting" | "generating" | null;
 	artifact_type: string | null;
 	done: number;
 	total: number;
+	/** Per-artifact-type progress for the current phase. */
+	types: TypeProgress[];
 	types_done: number;
 	types_total: number;
 	/** Provider requests issued so far in this run. */

@@ -1,33 +1,23 @@
+import { usePipelineStatus } from "@/data/pipeline";
 import type { Worksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPES } from "@/lib/constants";
-import type { ArtifactType, ArtifactTypeOption, QuizArtifactType } from "@/lib/types";
-import { IconAlarm } from "@tabler/icons-react";
+import type { ArtifactTypeOption, QuizArtifactType } from "@/lib/types";
+import { useForm } from "@tanstack/react-form";
 import { useNavigate } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
+import { z } from "zod";
+import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
-import { Label } from "./ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
-import { Slider } from "./ui/slider";
+import { Field, FieldContent, FieldError, FieldLabel } from "./ui/field";
+import { Input } from "./ui/input";
+import { Spinner } from "./ui/spinner";
 import { TabsContent } from "./ui/tabs";
 
 interface Props {
 	worksheet: Worksheet;
 	artifactType: ArtifactTypeOption;
 }
-
-const QUIZ_QUESTIONS_COUNT: Record<QuizArtifactType, number> = {
-	[ARTIFACT_TYPES.MultipleChoiceQuiz]: 10,
-	[ARTIFACT_TYPES.EssayQuiz]: 1,
-	[ARTIFACT_TYPES.CompletionQuiz]: 10,
-};
-
-const TIME_MULTIPLIERS = [0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3];
-const QUIZ_TYPE_MULTIPLIER: Partial<Record<ArtifactType, number>> = {
-	MultipleChoiceQuiz: 1,
-	CompletionQuiz: 1.5,
-	EssayQuiz: 10,
-};
 
 const QUIZ_ROUTES: Record<
 	QuizArtifactType,
@@ -38,77 +28,131 @@ const QUIZ_ROUTES: Record<
 	[ARTIFACT_TYPES.CompletionQuiz]: "/worksheets/$id/completion",
 };
 
+const quizSchema = z.object({
+	count: z
+		.string()
+		.refine(
+			(v) => Number.isInteger(Number(v.trim())) && Number(v.trim()) >= 1,
+			"Number of questions must be at least 1.",
+		),
+	time: z
+		.string()
+		.refine(
+			(v) => v.trim() === "" || (Number.isInteger(Number(v)) && Number(v) >= 1),
+			"Time limit must be at least 1 minute.",
+		),
+});
+
 export function QuizTabContent({ worksheet, artifactType }: Props) {
 	const navigate = useNavigate();
 	const quizType = artifactType.value as QuizArtifactType;
 	const available = worksheet.artifact_counts?.[quizType] ?? 0;
-	const max = Math.max(available, 1);
-	const defaultCount = Math.min(QUIZ_QUESTIONS_COUNT[quizType], max);
-	const [count, setCount] = useState(defaultCount);
-	const [timed, setTimed] = useState<number | null>(null);
 
-	const timeOptions = useMemo(() => {
-		const times = TIME_MULTIPLIERS.map((t) => Math.ceil(t * count * (QUIZ_TYPE_MULTIPLIER[artifactType.value] ?? 1)));
-		return [null, ...times].map((value) => ({
-			value,
-			label: value ? `${value} ${value === 1 ? "minute" : "minutes"}` : "Untimed",
-		}));
-	}, [artifactType, count]);
+	const { data: pipelineStatus } = usePipelineStatus(worksheet.id);
+
+	const generating = useMemo(() => {
+		if (pipelineStatus?.status !== "running" || pipelineStatus.phase !== "generating") return false;
+		const progress = pipelineStatus.types?.find((t) => t.artifact_type === artifactType.value);
+		return (progress?.done ?? 0) < (progress?.total ?? 0);
+	}, [pipelineStatus, artifactType]);
+
+	const form = useForm({
+		defaultValues: { count: "", time: "" },
+		validators: { onChange: quizSchema },
+		onSubmit: async ({ value }) => {
+			if (available === 0) return;
+			const count = Number(value.count.trim());
+			const time = value.time.trim() === "" ? undefined : Number(value.time);
+			navigate({
+				to: QUIZ_ROUTES[quizType],
+				params: { id: worksheet.id },
+				search: { count, time },
+			});
+		},
+	});
 
 	return (
 		<TabsContent key={artifactType.value} value={artifactType.value} className="grow">
 			<div className="w-full h-full flex flex-col items-center gap-3 mt-40">
 				<artifactType.icon />
-				<p className="text-lg font-medium">{artifactType.label}</p>
+				<p className="text-lg font-medium">
+					{artifactType.label}&nbsp;
+					<Badge variant="secondary">
+						{generating && <Spinner />}
+						{available}
+					</Badge>
+				</p>
 				<p className="max-w-80 text-center text-muted-foreground">{artifactType.description}</p>
-				<Card className="w-full max-w-100">
-					<CardContent>
-						<div className="w-full flex flex-col gap-4">
-							<div className="flex flex-col gap-2">
-								<Label>Number of questions</Label>
-								<div className="w-full flex items-center gap-3 select-none">
-									<p className="text-lg">{count}</p>
-									<Slider
-										min={quizType === "EssayQuiz" ? 1 : 5}
-										max={max}
-										step={quizType === "EssayQuiz" ? 1 : 5}
-										value={count}
-										onValueChange={(value) => {
-											setCount(Number(value));
-											setTimed(null);
-										}}
-									/>
-								</div>
-							</div>
-							<div className="flex items-center gap-2">
-								<IconAlarm />
-								<Select items={timeOptions} value={timed} onValueChange={setTimed}>
-									<SelectTrigger size="sm" className="w-full">
-										<SelectValue />
-									</SelectTrigger>
-									<SelectContent>
-										{timeOptions.map((item) => (
-											<SelectItem key={item.value} value={item.value}>
-												{item.label}
-											</SelectItem>
-										))}
-									</SelectContent>
-								</Select>
-							</div>
-						</div>
-					</CardContent>
-				</Card>
-				<Button
-					onClick={() =>
-						navigate({
-							to: QUIZ_ROUTES[quizType],
-							params: { id: worksheet.id },
-							search: { count, time: timed ?? undefined },
-						})
-					}
+				<form
+					className="w-full max-w-100 flex flex-col items-center gap-3"
+					onSubmit={(e) => {
+						e.preventDefault();
+						e.stopPropagation();
+						form.handleSubmit();
+					}}
 				>
-					Start quiz
-				</Button>
+					<Card className="w-full">
+						<CardContent>
+							<div className="w-full flex flex-col gap-4">
+								<form.Field name="count">
+									{(field) => (
+										<Field data-invalid={field.state.meta.isTouched && !field.state.meta.isValid}>
+											<FieldLabel htmlFor={`${quizType}-count`}>Number of questions</FieldLabel>
+											<FieldContent>
+												<Input
+													type="number"
+													inputMode="numeric"
+													id={`${quizType}-count`}
+													min={1}
+													step={1}
+													placeholder="10"
+													value={field.state.value}
+													onChange={(e) => field.handleChange(e.target.value)}
+													onBlur={field.handleBlur}
+													aria-invalid={field.state.meta.isTouched && !field.state.meta.isValid}
+												/>
+												{field.state.meta.isTouched && field.state.meta.errors.length > 0 && (
+													<FieldError>{field.state.meta.errors.map((error) => error?.message).join(", ")}</FieldError>
+												)}
+											</FieldContent>
+										</Field>
+									)}
+								</form.Field>
+								<form.Field name="time">
+									{(field) => (
+										<Field data-invalid={field.state.meta.isTouched && !field.state.meta.isValid}>
+											<FieldLabel htmlFor={`${quizType}-time`}>Time limit (minutes)</FieldLabel>
+											<FieldContent>
+												<Input
+													id={`${quizType}-time`}
+													type="number"
+													inputMode="numeric"
+													min={1}
+													step={1}
+													placeholder="Untimed"
+													value={field.state.value}
+													onChange={(e) => field.handleChange(e.target.value)}
+													onBlur={field.handleBlur}
+													aria-invalid={field.state.meta.isTouched && !field.state.meta.isValid}
+												/>
+												{field.state.meta.isTouched && field.state.meta.errors.length > 0 && (
+													<FieldError>{field.state.meta.errors.map((error) => error?.message).join(", ")}</FieldError>
+												)}
+											</FieldContent>
+										</Field>
+									)}
+								</form.Field>
+							</div>
+						</CardContent>
+					</Card>
+					<form.Subscribe selector={(state) => state.canSubmit}>
+						{(canSubmit) => (
+							<Button type="submit" disabled={!canSubmit || available === 0}>
+								Start quiz
+							</Button>
+						)}
+					</form.Subscribe>
+				</form>
 			</div>
 		</TabsContent>
 	);

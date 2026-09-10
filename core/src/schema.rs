@@ -44,13 +44,15 @@ pub struct PipelineStatus {
     /// `ingesting` or `generating` while running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
-    /// Artifact type currently being generated (generation phase only).
+    /// Artifact type whose unit most recently completed (generation phase).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<String>,
-    /// Units completed in the current phase.
+    /// Units completed in the current phase, across all artifact types.
     pub done: usize,
-    /// Total units in the current phase.
+    /// Total units in the current phase, across all artifact types.
     pub total: usize,
+    /// Per-artifact-type progress for the current phase.
+    pub types: Vec<TypeProgress>,
     /// Artifact types completed so far.
     pub types_done: usize,
     /// Total artifact types to generate.
@@ -67,6 +69,14 @@ pub struct PipelineStatus {
     /// Error message when `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Progress of one artifact type's units in the current generation phase.
+#[derive(Clone, Debug, Serialize)]
+pub struct TypeProgress {
+    pub artifact_type: String,
+    pub done: usize,
+    pub total: usize,
 }
 
 fn is_zero(value: &usize) -> bool {

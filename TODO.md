@@ -3,6 +3,8 @@ If pipeline status remains as processing, more materials can be added realtime t
 
 [ ] cleanup inference dialog/wizard - should not close when user clicks on test connection
 
+[ ] ability to stop/kill the pipeline
+
 [ ] test ability to run multiple files and different types
 
 [ ] build evaluation metrics and benchmarks based on data we have in core/logs

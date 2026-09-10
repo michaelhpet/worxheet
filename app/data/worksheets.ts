@@ -1,7 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import type { QuizArtifactType } from "@/lib/types";
-import type { Paginated } from "@/lib/types";
+import type { ArtifactType, Paginated, QuizArtifactType } from "@/lib/types";
 
 export interface Worksheet {
 	id: string;
@@ -12,7 +11,7 @@ export interface Worksheet {
 	pipeline_error?: string | null;
 	file_count: number;
 	file_extensions: string[];
-	artifact_counts?: Record<QuizArtifactType, number>;
+	artifact_counts?: Partial<Record<ArtifactType, number>>;
 	quiz_counts?: Record<QuizArtifactType, number>;
 }
 
@@ -25,10 +24,11 @@ export function useWorksheets(page?: number, perPage?: number) {
 	});
 }
 
-export function useWorksheet(id: string) {
+export function useWorksheet(id: string, pipelineStatus?: string) {
 	return useQuery({
 		queryKey: [WORKSHEETS_QUERY_KEY, id],
 		queryFn: () => invoke<Worksheet>("get_worksheet", { id }),
+		refetchInterval: pipelineStatus === "running" ? 1500 : false,
 	});
 }
 

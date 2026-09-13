@@ -5,11 +5,15 @@
 //! happens per run so settings changes apply immediately.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use sqlx::{Pool, Sqlite};
 use tauri::{AppHandle, Emitter};
 
+use super::CANCELLED_MESSAGE;
 use crate::provider::{self, client::OpenAiClient, ArtifactBackend};
 use crate::schema::{ArtifactType, PipelineStatus, TypeProgress};
 use crate::settings::SettingsState;
@@ -17,8 +21,8 @@ use crate::settings::SettingsState;
 use super::segment;
 
 /// Live in-memory state of a running pipeline. The authoritative
-/// `running`/`done`/`failed` marker lives on the worksheet row so it survives
-/// a restart; this carries the transient progress the UI shows.
+/// `running`/`done`/`failed`/`cancelled` marker lives on the worksheet row so
+/// it survives a restart; this carries the transient progress the UI shows.
 #[derive(Clone)]
 struct RunningJob {
     phase: String,
@@ -35,16 +39,26 @@ struct RunningJob {
 }
 
 /// Registry of in-memory running pipelines.
+///
+/// Each entry is keyed by worksheet id so stopping one worksheet never
+/// touches another worksheet's run: the cancel flag is per worksheet and the
+/// background task only observes its own flag.
 pub struct PipelineJobs {
     jobs: Mutex<HashMap<String, RunningJob>>,
+    cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl Default for PipelineJobs {
     fn default() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            cancel: Mutex::new(HashMap::new()),
         }
     }
+}
+
+fn is_cancelled(cancel: &Arc<AtomicBool>) -> bool {
+    cancel.load(Ordering::Relaxed)
 }
 
 /// Register the worksheet as running and start its pipeline in the background.
@@ -57,6 +71,7 @@ pub fn start_job(
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
 ) -> bool {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
     let started = {
         let mut running = jobs.jobs.lock().unwrap();
         if running.contains_key(&worksheet_id) {
@@ -77,6 +92,10 @@ pub fn start_job(
                     tokens_out: 0,
                 },
             );
+            jobs.cancel
+                .lock()
+                .unwrap()
+                .insert(worksheet_id.clone(), cancel_flag.clone());
             true
         }
     };
@@ -86,8 +105,60 @@ pub fn start_job(
     }
 
     tauri::async_runtime::spawn(async move {
-        run_job(&app, &pool, &settings, &jobs, &worksheet_id).await;
+        run_job(&app, &pool, &settings, &jobs, &cancel_flag, &worksheet_id).await;
     });
+    true
+}
+
+/// Request cancellation of a worksheet's pipeline.
+///
+/// Per-worksheet isolation: only the flag for `worksheet_id` is set, so other
+/// running worksheets are unaffected. The running task observes the flag at
+/// its next checkpoint (and in-flight generation units are aborted inside
+/// `generate_all`), then exits without overwriting the `cancelled` row this
+/// function persists. Idempotent: returns `false` when nothing was running.
+pub async fn stop_job(
+    app: &AppHandle,
+    pool: &Pool<Sqlite>,
+    jobs: &Arc<PipelineJobs>,
+    worksheet_id: &str,
+) -> bool {
+    let flag = jobs.cancel.lock().unwrap().get(worksheet_id).cloned();
+    let Some(flag) = flag else {
+        // No live task, but a stale `running` row (e.g. crash before resume)
+        // should still transition to `cancelled` so Stop never appears stuck.
+        let result = sqlx::query(
+            "UPDATE worksheets SET pipeline_status = 'cancelled', pipeline_error = NULL
+              WHERE id = ? AND pipeline_status IN ('running', 'idle')",
+        )
+        .bind(worksheet_id)
+        .execute(pool)
+        .await;
+        let stopped = matches!(result, Ok(done) if done.rows_affected() > 0);
+        if stopped {
+            emit_terminal(app, worksheet_id, "cancelled", None);
+        }
+        return stopped;
+    };
+
+    flag.store(true, Ordering::Relaxed);
+    // Drop the progress snapshot now so status polls immediately reflect the
+    // persisted `cancelled` row instead of a stale `running` snapshot. The
+    // flag entry stays until `run_job` cleans up so the task still sees it.
+    jobs.jobs.lock().unwrap().remove(worksheet_id);
+
+    let result = sqlx::query(
+        "UPDATE worksheets SET pipeline_status = 'cancelled', pipeline_error = NULL
+          WHERE id = ? AND pipeline_status IN ('running', 'idle')",
+    )
+    .bind(worksheet_id)
+    .execute(pool)
+    .await;
+    // A live task existed, so report stopped even if the row had already
+    // flipped (e.g. finished racing with this call — `run_job` preserves the
+    // cancelled outcome in that case, see below).
+    let _ = result;
+    emit_terminal(app, worksheet_id, "cancelled", None);
     true
 }
 
@@ -118,7 +189,13 @@ pub async fn resume_stale(
 }
 
 /// Forget an in-memory job, e.g. when its worksheet is deleted.
+///
+/// Signals cancellation first so the orphaned task exits at its next
+/// checkpoint instead of continuing provider requests for a deleted row.
 pub fn remove_job(jobs: &Arc<PipelineJobs>, worksheet_id: &str) {
+    if let Some(flag) = jobs.cancel.lock().unwrap().get(worksheet_id).cloned() {
+        flag.store(true, Ordering::Relaxed);
+    }
     jobs.jobs.lock().unwrap().remove(worksheet_id);
 }
 
@@ -204,15 +281,15 @@ pub async fn resume_if_needed(
         return Err(String::from("Worksheet not found"));
     };
 
-    if status == "done" {
+    if status == "done" || status == "failed" || status == "cancelled" {
         return get_status(pool, jobs, worksheet_id).await;
     }
 
     // Only auto-resume pipelines that are genuinely supposed to run: a stale
     // `running` row left by a crash or a fresh `idle` worksheet. A `failed`
-    // worksheet is not restarted automatically (that would retry in a tight
-    // loop and mask the recorded error) — the UI surfaces the error and the
-    // user can deliberately retry via `retry_pipeline`.
+    // or `cancelled` worksheet is not restarted automatically (that would
+    // retry in a tight loop and mask the recorded outcome) — the UI surfaces
+    // the state and the user can deliberately retry via `retry_pipeline`.
     if status == "running" || status == "idle" {
         // A live job may have been registered racing with this read; start_job is
         // idempotent, so only the first caller actually launches the pipeline.
@@ -232,9 +309,28 @@ async fn run_job(
     pool: &Pool<Sqlite>,
     settings: &Arc<SettingsState>,
     jobs: &Arc<PipelineJobs>,
+    cancel: &Arc<AtomicBool>,
     worksheet_id: &str,
 ) {
-    let result = run_pipeline(app, pool, settings, jobs, worksheet_id).await;
+    let result = run_pipeline(app, pool, settings, jobs, cancel, worksheet_id).await;
+
+    // A stop request wins over a racing completion: `stop_job` already
+    // persisted `cancelled`, so never overwrite it with `done`/`failed`.
+    // Already-finished per-item artifacts stay persisted; retry resumes the rest.
+    if is_cancelled(cancel) || matches!(&result, Err(message) if message == CANCELLED_MESSAGE) {
+        sqlx::query(
+            "UPDATE worksheets SET pipeline_status = 'cancelled', pipeline_error = NULL
+              WHERE id = ? AND pipeline_status = 'running'",
+        )
+        .bind(worksheet_id)
+        .execute(pool)
+        .await
+        .ok();
+        jobs.jobs.lock().unwrap().remove(worksheet_id);
+        jobs.cancel.lock().unwrap().remove(worksheet_id);
+        emit_terminal(app, worksheet_id, "cancelled", None);
+        return;
+    }
 
     let (status, error) = match result {
         Ok(()) => (String::from("done"), None),
@@ -253,7 +349,12 @@ async fn run_job(
         .ok();
 
     jobs.jobs.lock().unwrap().remove(worksheet_id);
+    jobs.cancel.lock().unwrap().remove(worksheet_id);
 
+    emit_terminal(app, worksheet_id, &status, error);
+}
+
+fn emit_terminal(app: &AppHandle, worksheet_id: &str, status: &str, error: Option<String>) {
     let _ = app.emit(
         "pipeline-progress",
         serde_json::json!({
@@ -294,8 +395,12 @@ async fn run_pipeline(
     pool: &Pool<Sqlite>,
     settings: &Arc<SettingsState>,
     jobs: &Arc<PipelineJobs>,
+    cancel: &Arc<AtomicBool>,
     worksheet_id: &str,
 ) -> Result<(), String> {
+    if is_cancelled(cancel) {
+        return Err(String::from(CANCELLED_MESSAGE));
+    }
     sqlx::query(
         "UPDATE worksheets SET pipeline_status = 'running', pipeline_error = NULL WHERE id = ?",
     )
@@ -335,6 +440,9 @@ async fn run_pipeline(
     let (to_parse, start_position) =
         super::reuse_chunks(pool, worksheet_id, &pending_files, start_position).await?;
 
+    if is_cancelled(cancel) {
+        return Err(String::from(CANCELLED_MESSAGE));
+    }
     let tokenizer = Arc::new(tokenizer);
     super::process_files(
         pool,
@@ -344,8 +452,12 @@ async fn run_pipeline(
         tokenizer,
         Some(on_ingest),
         Some(logs.clone()),
+        Some(cancel.clone()),
     )
     .await?;
+    if is_cancelled(cancel) {
+        return Err(String::from(CANCELLED_MESSAGE));
+    }
 
     set_phase(jobs, worksheet_id, "generating", None);
 
@@ -378,8 +490,12 @@ async fn run_pipeline(
         Some(on_persist),
         Some(on_generate),
         Some(logs.clone()),
+        Some(cancel.clone()),
     )
     .await?;
+    if is_cancelled(cancel) {
+        return Err(String::from(CANCELLED_MESSAGE));
+    }
     println!(
         "[{}] [pipeline] generated {} merged artifacts across {} requests (~{}k in / ~{}k out tokens) in {:?}",
         crate::logging::rfc3339_utc(),

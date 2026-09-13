@@ -51,7 +51,9 @@ export function QuizTabContent({ worksheet, artifactType }: Props) {
 	const { data: pipelineStatus } = usePipelineStatus(worksheet.id);
 
 	const generating = useMemo(() => {
-		if (pipelineStatus?.status !== "running" || pipelineStatus.phase !== "generating") return false;
+		if (pipelineStatus?.status !== "running") return false;
+		if (pipelineStatus.phase === "ingesting") return true;
+		if (pipelineStatus.phase !== "generating") return false;
 		const progress = pipelineStatus.types?.find((t) => t.artifact_type === artifactType.value);
 		return (progress?.done ?? 0) < (progress?.total ?? 0);
 	}, [pipelineStatus, artifactType]);

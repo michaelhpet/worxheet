@@ -37,8 +37,9 @@ pub async fn get_pipeline_status(
 }
 
 /// Restart a worksheet's pipeline, e.g. after the user fixes the cause of a
-/// failure (missing provider config, etc.). Idempotent: if a job for the
-/// worksheet is already live, it is a no-op.
+/// failure (missing provider config, etc.) or after a user-requested stop.
+/// Resumes from already-persisted chunks/artifacts. Idempotent: if a job for
+/// the worksheet is already live, it is a no-op.
 #[tauri::command]
 pub async fn retry_pipeline(
     app: AppHandle,
@@ -53,4 +54,17 @@ pub async fn retry_pipeline(
         worksheet_id,
     );
     Ok(())
+}
+
+/// Stop a worksheet's pipeline on demand. Only the named worksheet is
+/// affected; other running worksheets continue untouched. Finished artifacts
+/// stay persisted so a later `retry_pipeline` resumes the remainder.
+/// Idempotent: returns `false` when nothing was running.
+#[tauri::command]
+pub async fn stop_pipeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    worksheet_id: String,
+) -> Result<bool, String> {
+    Ok(pipeline::stop_job(&app, &state.database, &state.jobs, &worksheet_id).await)
 }

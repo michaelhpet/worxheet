@@ -39,7 +39,7 @@ pub struct Paginated<T: Serialize> {
 /// through `get_pipeline_status` and the `pipeline-progress` event.
 #[derive(Clone, Debug, Serialize)]
 pub struct PipelineStatus {
-    /// One of `idle`, `running`, `done`, `failed`.
+    /// One of `idle`, `running`, `done`, `failed`, `cancelled`.
     pub status: String,
     /// `ingesting` or `generating` while running.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -7,8 +7,10 @@
 //! Summary and MindMap are assembled deterministically from per-segment
 //! sections, so coverage is exhaustive.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use super::{is_cancel_requested, CANCELLED_MESSAGE};
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +103,17 @@ fn per_type_progress(
             total: totals_per_type[index],
         })
         .collect()
+}
+
+/// Abort pending unit tasks and drain them. Only the handles of the
+/// cancelled worksheet are touched.
+async fn abort_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
 }
 
 /// An artifact ready to be persisted.
@@ -271,7 +284,12 @@ fn is_non_teachable_segment(segment: &Segment) -> bool {
     }
     // Only the opening slice is inspected so a chapter that mentions "index"
     // or "copyright" deep in its body is not flagged.
-    let lead: String = segment.text.chars().take(800).collect::<String>().to_lowercase();
+    let lead: String = segment
+        .text
+        .chars()
+        .take(800)
+        .collect::<String>()
+        .to_lowercase();
     FRONT_MATTER_TEXT_MARKERS
         .iter()
         .any(|marker| lead.contains(marker))
@@ -842,7 +860,11 @@ pub async fn generate_all(
     on_persist: Option<PersistFn>,
     on_progress: Option<ProgressFn>,
     logs: Option<Arc<RunLogs>>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(Vec<PendingArtifact>, RunTelemetry), String> {
+    if is_cancel_requested(&cancel) {
+        return Err(String::from(CANCELLED_MESSAGE));
+    }
     let params = params.unwrap_or_default();
     let units = build_units(segments, &existing)?;
     let active_units: Vec<Unit> = units.into_iter().filter(|unit| !unit.skip).collect();
@@ -879,11 +901,29 @@ pub async fn generate_all(
 
     let mut handles = Vec::with_capacity(total_units);
     for (unit_index, unit) in active_units.into_iter().enumerate() {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| e.to_string())?;
+        if is_cancel_requested(&cancel) {
+            abort_handles(handles).await;
+            return Err(String::from(CANCELLED_MESSAGE));
+        }
+        let semaphore_clone = semaphore.clone();
+        let cancel_watch = cancel.clone();
+        let permit = tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    if cancel_watch.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => {
+                abort_handles(handles).await;
+                return Err(String::from(CANCELLED_MESSAGE));
+            }
+            permit = semaphore_clone.acquire_owned() => {
+                permit.map_err(|e| e.to_string())?
+            }
+        };
         let backend = backend.clone();
         let params = params.clone();
         let records = records.clone();
@@ -964,10 +1004,31 @@ pub async fn generate_all(
         }));
     }
 
+    // Cancellation-aware join: abort in-flight provider requests promptly
+    // instead of waiting up to the request timeout. Only this worksheet's
+    // handles are aborted; other worksheets run in separate tasks.
+    loop {
+        if is_cancel_requested(&cancel) {
+            abort_handles(handles).await;
+            return Err(String::from(CANCELLED_MESSAGE));
+        }
+        if handles.iter().all(|handle| handle.is_finished()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
     for handle in handles {
-        handle
-            .await
-            .map_err(|e| format!("Generation task failed: {e}"))?;
+        handle.await.map_err(|e| {
+            if e.is_cancelled() {
+                String::from(CANCELLED_MESSAGE)
+            } else {
+                format!("Generation task failed: {e}")
+            }
+        })?;
+    }
+    if is_cancel_requested(&cancel) {
+        return Err(String::from(CANCELLED_MESSAGE));
     }
 
     let telemetry = *telemetry.lock().unwrap();
@@ -1028,15 +1089,8 @@ pub async fn generate_all(
     // hard failure, not an empty success: surface it so the worksheet is marked
     // `failed` rather than `done` with zero artifacts.
     if telemetry.backend_errors > 0 && telemetry.backend_errors == total_units {
-        let first = first_backend_error
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| String::from("unknown provider error"));
         return Err(format!(
-            "LLM generation failed: all {} generation request(s) could not reach \
-             the provider ({first}). Check that a provider is configured and reachable.",
-            telemetry.backend_errors
+            "Artifacts generation failed. Check that a provider is configured and reachable."
         ));
     }
 
@@ -1172,11 +1226,23 @@ mod tests {
     fn test_build_units_skips_degenerate_segments() {
         let segments = vec![
             segment(0, None, "[Page 2]"),
-            segment(1, Some("COLLEGE"), "OpenStax provides free, peer-reviewed, openly licensed \
-                 textbooks used by students and instructors across many institutions."),
-            segment(2, None, ". . . . . 227 8.1 Overview of Photosynthesis . . . . . . . . . ."),
-            segment(3, None, "Mitochondria produce ATP through respiration and the citric acid \
-                 cycle powers cellular work with the energy stored in its bonds."),
+            segment(
+                1,
+                Some("COLLEGE"),
+                "OpenStax provides free, peer-reviewed, openly licensed \
+                 textbooks used by students and instructors across many institutions.",
+            ),
+            segment(
+                2,
+                None,
+                ". . . . . 227 8.1 Overview of Photosynthesis . . . . . . . . . .",
+            ),
+            segment(
+                3,
+                None,
+                "Mitochondria produce ATP through respiration and the citric acid \
+                 cycle powers cellular work with the energy stored in its bonds.",
+            ),
         ];
 
         let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
@@ -1222,9 +1288,21 @@ mod tests {
         );
         assert!(is_non_teachable_segment(&colophon));
 
-        assert!(is_non_teachable_segment(&segment(1, Some("Table of Contents"), "Chapter 1 ...")));
-        assert!(is_non_teachable_segment(&segment(2, Some("Preface"), "This book introduces...")));
-        assert!(is_non_teachable_segment(&segment(3, None, "ISBN 978-0-000-00000-0")));
+        assert!(is_non_teachable_segment(&segment(
+            1,
+            Some("Table of Contents"),
+            "Chapter 1 ..."
+        )));
+        assert!(is_non_teachable_segment(&segment(
+            2,
+            Some("Preface"),
+            "This book introduces..."
+        )));
+        assert!(is_non_teachable_segment(&segment(
+            3,
+            None,
+            "ISBN 978-0-000-00000-0"
+        )));
 
         // Real teaching content must survive, even when a heading looks book-ish.
         let chapter = segment(
@@ -1241,27 +1319,50 @@ mod tests {
             "Metabolism converts nutrients into usable energy.".repeat(40),
             "See also".repeat(3)
         );
-        assert!(!is_non_teachable_segment(&segment(5, Some("Metabolism"), &long)));
+        assert!(!is_non_teachable_segment(&segment(
+            5,
+            Some("Metabolism"),
+            &long
+        )));
     }
 
     #[test]
     fn test_build_units_skips_front_matter_and_degenerate_segments() {
         let segments = vec![
             segment(0, None, "[Page 2]"),
-            segment(1, Some("COLLEGE"), "OpenStax provides free, peer-reviewed, openly licensed \
-                 textbooks used by students and instructors across many institutions."),
-            segment(2, None, ". . . . . 227 8.1 Overview of Photosynthesis . . . . . . . . . ."),
-            segment(3, None, "Mitochondria produce ATP through respiration and the citric acid \
-                 cycle powers cellular work with the energy stored in its bonds."),
-            segment(4, Some("Colophon"), "© Rice University. Licensed under a Creative Commons \
-                 Attribution license. Provide attribution on every page when redistributing."),
+            segment(
+                1,
+                Some("COLLEGE"),
+                "OpenStax provides free, peer-reviewed, openly licensed \
+                 textbooks used by students and instructors across many institutions.",
+            ),
+            segment(
+                2,
+                None,
+                ". . . . . 227 8.1 Overview of Photosynthesis . . . . . . . . . .",
+            ),
+            segment(
+                3,
+                None,
+                "Mitochondria produce ATP through respiration and the citric acid \
+                 cycle powers cellular work with the energy stored in its bonds.",
+            ),
+            segment(
+                4,
+                Some("Colophon"),
+                "© Rice University. Licensed under a Creative Commons \
+                 Attribution license. Provide attribution on every page when redistributing.",
+            ),
         ];
 
         let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
         let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
         let expected = ["seg-1", "seg-3"].repeat(ArtifactType::ALL.len());
         assert_eq!(used.len(), expected.len());
-        assert!(!used.contains(&"seg-4"), "front matter must never reach units");
+        assert!(
+            !used.contains(&"seg-4"),
+            "front matter must never reach units"
+        );
         assert!(!used.contains(&"seg-0") && !used.contains(&"seg-2"));
     }
 
@@ -1271,10 +1372,15 @@ mod tests {
             let prompt = user_prompt(artifact_type, "context");
             let lowered = prompt.to_lowercase();
             assert!(
-                !["exactly 2 questions", "exactly 3 questions", "exactly 4 questions",
-                  "exactly 5 questions", "exactly 6 questions"]
-                    .iter()
-                    .any(|phrase| lowered.contains(phrase)),
+                ![
+                    "exactly 2 questions",
+                    "exactly 3 questions",
+                    "exactly 4 questions",
+                    "exactly 5 questions",
+                    "exactly 6 questions"
+                ]
+                .iter()
+                .any(|phrase| lowered.contains(phrase)),
                 "prompt must not fix a question count: {prompt}"
             );
         }
@@ -1300,7 +1406,8 @@ mod tests {
 
     #[test]
     fn test_parse_json_anyhow_recovers_wrapped_json() {
-        let wrapped = "Sure — here is the response:\n```json\n{\"questions\":[]}\n```\nHope this helps.";
+        let wrapped =
+            "Sure — here is the response:\n```json\n{\"questions\":[]}\n```\nHope this helps.";
         assert_eq!(
             parse_json_anyhow(wrapped).unwrap(),
             serde_json::json!({ "questions": [] })
@@ -1317,7 +1424,10 @@ mod tests {
             &[],
         );
         assert!(validated.items.is_empty());
-        assert!(validated.rejection_reasons.is_empty(), "silent skip, not a rejection");
+        assert!(
+            validated.rejection_reasons.is_empty(),
+            "silent skip, not a rejection"
+        );
     }
 
     #[test]
@@ -1348,7 +1458,10 @@ mod tests {
 
         assert!(outcome.items.is_empty());
         assert_eq!(outcome.requests_made, 1, "no retry on a blank reply");
-        assert!(outcome.backend_error.is_none(), "blank reply is not a backend error");
+        assert!(
+            outcome.backend_error.is_none(),
+            "blank reply is not a backend error"
+        );
         assert_eq!(mock.request_count(), 1);
     }
 

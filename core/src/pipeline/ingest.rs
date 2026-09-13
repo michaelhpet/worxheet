@@ -22,6 +22,20 @@ use crate::schema::Segment;
 
 use super::segment::{self, Block, BlockKind, SegmentDraft};
 
+/// Future that resolves once the pipeline stop flag is set. With no flag it
+/// pends forever so `tokio::select!` callers simply wait on the other branch.
+async fn cancel_requested(cancel: &Option<Arc<std::sync::atomic::AtomicBool>>) {
+    match cancel {
+        Some(flag) => loop {
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        },
+        None => std::future::pending().await,
+    }
+}
+
 /// PDF and image inputs routed to liteparse (PDFs are extracted directly;
 /// photos/scans are converted to PDF in-process before OCR).
 const DOCUMENT_EXTENSIONS: &[&str] = &[
@@ -531,6 +545,7 @@ pub async fn reuse_chunks(
     Ok((remaining, position))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
@@ -539,10 +554,14 @@ pub async fn process_files(
     tokenizer: Arc<Tokenizer>,
     mut on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
     logs: Option<Arc<RunLogs>>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<Segment>, String> {
     let total_files = file_ids.len();
     if total_files == 0 {
         return Ok(Vec::new());
+    }
+    if super::is_cancel_requested(&cancel) {
+        return Err(String::from(super::CANCELLED_MESSAGE));
     }
 
     // Load metadata up front so parsing never touches the database.
@@ -700,21 +719,28 @@ pub async fn process_files(
         }
 
         while done < end {
-            match rx
-                .recv()
-                .await
-                .ok_or_else(|| String::from("Parse channel closed unexpectedly"))?
-            {
-                Msg::Progress(pages_done, pages_total) => {
-                    if let Some(on_progress) = on_progress.as_deref_mut() {
-                        on_progress(pages_done, pages_total);
+            tokio::select! {
+                biased;
+                _ = cancel_requested(&cancel) => {
+                    return Err(String::from(super::CANCELLED_MESSAGE));
+                }
+                msg = rx.recv() => {
+                    match msg.ok_or_else(|| String::from("Parse channel closed unexpectedly"))? {
+                        Msg::Progress(pages_done, pages_total) => {
+                            if let Some(on_progress) = on_progress.as_deref_mut() {
+                                on_progress(pages_done, pages_total);
+                            }
+                        }
+                        Msg::Done(index, result) => {
+                            segmented[index] = Some(result?);
+                            done += 1;
+                        }
                     }
                 }
-                Msg::Done(index, result) => {
-                    segmented[index] = Some(result?);
-                    done += 1;
-                }
             }
+        }
+        if super::is_cancel_requested(&cancel) {
+            return Err(String::from(super::CANCELLED_MESSAGE));
         }
         start = end;
     }

@@ -11,7 +11,7 @@ export interface TypeProgress {
 }
 
 export interface PipelineStatus {
-	status: "idle" | "running" | "done" | "failed";
+	status: "idle" | "running" | "done" | "failed" | "cancelled";
 	phase: "ingesting" | "generating" | null;
 	artifact_type: string | null;
 	done: number;
@@ -36,7 +36,7 @@ const POLL_INTERVAL_MS = 1200;
 /** Payload of the `pipeline-progress` Tauri event emitted by the Rust core. */
 export interface PipelineProgressEvent {
 	worksheet_id: string;
-	status: "idle" | "running" | "done" | "failed";
+	status: "idle" | "running" | "done" | "failed" | "cancelled";
 	phase: string | null;
 	artifact_type: string | null;
 	done: number;
@@ -74,7 +74,8 @@ export function usePipelineProgressListener() {
 
 /**
  * Polls `get_pipeline_status` for a worksheet while its pipeline is running.
- * Stops polling once the pipeline reaches a terminal state (`done`/`failed`).
+ * Stops polling once the pipeline reaches a terminal state
+ * (`done`/`failed`/`cancelled`).
  */
 export function usePipelineStatus(worksheetId: string) {
 	return useQuery({
@@ -92,6 +93,18 @@ export function useRetryPipeline(worksheetId: string) {
 
 	return useMutation({
 		mutationFn: () => invoke<void>("retry_pipeline", { worksheetId }),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, worksheetId] });
+			queryClient.invalidateQueries({ queryKey: [WORKSHEETS_QUERY_KEY] });
+		},
+	});
+}
+
+export function useStopPipeline(worksheetId: string) {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: () => invoke<boolean>("stop_pipeline", { worksheetId }),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, worksheetId] });
 			queryClient.invalidateQueries({ queryKey: [WORKSHEETS_QUERY_KEY] });

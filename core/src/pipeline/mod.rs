@@ -14,12 +14,25 @@ pub mod segment;
 pub mod validate;
 
 pub use generate::{generate_all, PendingArtifact};
-pub use jobs::{remove_job, resume_if_needed, resume_stale, start_job, PipelineJobs};
+pub use jobs::{remove_job, resume_if_needed, resume_stale, start_job, stop_job, PipelineJobs};
+
+/// Sentinel error marking a user-requested stop. Callers map it to the
+/// `cancelled` worksheet status instead of `failed`; finished artifacts stay
+/// persisted so a later retry resumes.
+pub const CANCELLED_MESSAGE: &str = "Pipeline cancelled by user.";
+
+pub(crate) fn is_cancel_requested(cancel: &Option<Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    cancel
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Parse, segment, and persist every file of a worksheet. Reports progress as
 /// each file completes through `on_progress`. `logs` (when given) receives
 /// per-file artifacts under `logs/file_reads`, `logs/tokenization`, and
-/// `logs/segmentation`.
+/// `logs/segmentation`. When `cancel` is set, parsing aborts promptly with
+/// [`CANCELLED_MESSAGE`].
+#[allow(clippy::too_many_arguments)]
 pub async fn process_files(
     pool: &SqlitePool,
     worksheet_id: &str,
@@ -28,6 +41,7 @@ pub async fn process_files(
     tokenizer: Arc<tokenizers::Tokenizer>,
     on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
     logs: Option<Arc<crate::logging::RunLogs>>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<Segment>, String> {
     ingest::process_files(
         pool,
@@ -37,6 +51,7 @@ pub async fn process_files(
         tokenizer,
         on_progress,
         logs,
+        cancel,
     )
     .await
 }
@@ -412,6 +427,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("generation should succeed");
@@ -479,6 +495,7 @@ mod tests {
             2,
             &segments,
             ExistingArtifacts::default(),
+            None,
             None,
             None,
             None,

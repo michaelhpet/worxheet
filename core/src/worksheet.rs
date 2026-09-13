@@ -13,7 +13,7 @@ pub struct Worksheet {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
-    /// One of `idle`/`running`/`done`/`failed`.
+    /// One of `idle`/`running`/`done`/`failed`/`cancelled`.
     pub pipeline_status: String,
     pub file_count: i64,
     /// Distinct, uppercased file extensions, e.g. `["PDF", "DOCX"]`.

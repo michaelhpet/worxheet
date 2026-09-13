@@ -32,7 +32,7 @@ import {
 	PaginationPrevious,
 } from "@/components/ui/pagination";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { useRetryPipeline, usePipelineProgressListener } from "@/data/pipeline";
+import { useRetryPipeline, useStopPipeline, usePipelineProgressListener } from "@/data/pipeline";
 import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
 import {
 	IconDotsVertical,
@@ -107,9 +107,7 @@ function Home() {
 							<EmptyDescription>Create your first worksheet to get started.</EmptyDescription>
 						</EmptyHeader>
 						<EmptyContent>
-							<Button variant="secondary" onClick={() => setCreateDialogOpen(true)}>
-								Create worksheet
-							</Button>
+							<Button onClick={() => setCreateDialogOpen(true)}>Create worksheet</Button>
 						</EmptyContent>
 					</Empty>
 				</main>
@@ -260,6 +258,7 @@ function formatDate(iso: string): string {
 function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 	const deleteWorksheet = useDeleteWorksheet();
 	const retryPipeline = useRetryPipeline(worksheet.id);
+	const stopPipeline = useStopPipeline(worksheet.id);
 	const navigate = useNavigate();
 	const [alertOpen, setAlertOpen] = useState(false);
 
@@ -282,7 +281,7 @@ function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 						<IconExternalLink />
 						Open
 					</DropdownMenuItem>
-					{worksheet.pipeline_status === "failed" && (
+					{(worksheet.pipeline_status === "failed" || worksheet.pipeline_status === "cancelled") && (
 						<DropdownMenuItem
 							disabled={retryPipeline.isPending}
 							onClick={(e) => {
@@ -295,8 +294,14 @@ function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 						</DropdownMenuItem>
 					)}
 					{worksheet.pipeline_status === "running" && (
-						<DropdownMenuItem onClick={(e) => e.stopPropagation()}>
-							<IconPlayerStop />
+						<DropdownMenuItem
+							disabled={stopPipeline.isPending}
+							onClick={(e) => {
+								e.stopPropagation();
+								stopPipeline.mutate();
+							}}
+						>
+							{stopPipeline.isPending ? <IconLoader className="animate-spin" /> : <IconPlayerStop />}
 							Stop
 						</DropdownMenuItem>
 					)}

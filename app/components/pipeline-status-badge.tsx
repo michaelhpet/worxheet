@@ -29,6 +29,14 @@ export function PipelineStatusBadge({
 		);
 	}
 
+	if (status === "cancelled") {
+		return (
+			<Badge variant="outline" className={className}>
+				Cancelled
+			</Badge>
+		);
+	}
+
 	if (status === "done") {
 		return (
 			<Badge variant="outline" className={className}>

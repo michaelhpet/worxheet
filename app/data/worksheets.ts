@@ -21,6 +21,10 @@ export function useWorksheets(page?: number, perPage?: number) {
 	return useQuery({
 		queryKey: [WORKSHEETS_QUERY_KEY, { page, perPage }],
 		queryFn: () => invoke<Paginated<Worksheet>>("get_worksheets", { page, perPage }),
+		refetchInterval: (query) => {
+			const anyRunning = query.state.data?.items.some((worksheet) => worksheet.pipeline_status === "running");
+			return anyRunning ? 1500 : false;
+		},
 	});
 }
 

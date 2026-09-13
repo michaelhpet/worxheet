@@ -1,3 +1,6 @@
+import { CreateWorksheetDialog } from "@/components/create-worksheet-dialog";
+import { Layout } from "@/components/layout";
+import { PipelineStatusBadge } from "@/components/pipeline-status-badge";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -9,30 +12,37 @@ import {
 	AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { CreateWorksheetDialog } from "@/components/create-worksheet-dialog";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
+	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
-import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/ui/item";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { PipelineStatusBadge } from "@/components/pipeline-status-badge";
-import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
-import { openSettings } from "@/lib/settings-bus";
+import { Field } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import {
-	IconChevronLeft,
-	IconChevronRight,
+	Pagination,
+	PaginationContent,
+	PaginationEllipsis,
+	PaginationItem,
+	PaginationLink,
+	PaginationNext,
+	PaginationPrevious,
+} from "@/components/ui/pagination";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useRetryPipeline, usePipelineProgressListener } from "@/data/pipeline";
+import { useDeleteWorksheet, useWorksheets, type Worksheet } from "@/data/worksheets";
+import {
 	IconDotsVertical,
+	IconExternalLink,
 	IconFile,
-	IconLayoutGrid,
-	IconList,
+	IconLoader,
 	IconPlus,
+	IconPlayerStop,
+	IconRotateClockwise,
 	IconSelector,
-	IconSettings,
-	IconTable,
 	IconTrash,
 } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
@@ -44,32 +54,29 @@ export const Route = createFileRoute("/")({
 
 const PER_PAGE = 20;
 
-type ViewMode = "table" | "grid" | "list";
+type PageItem = number | "ellipsis";
 
-const VIEW_MODE_KEY = "worksheet-view-mode";
-
-function getStoredViewMode(): ViewMode {
-	const stored = localStorage.getItem(VIEW_MODE_KEY);
-	if (stored === "table" || stored === "grid" || stored === "list") return stored;
-	return "table";
+function paginationItems(current: number, total: number): PageItem[] {
+	if (total <= 7) {
+		return Array.from({ length: total }, (_, i) => i + 1);
+	}
+	const items: PageItem[] = [1];
+	if (current > 3) items.push("ellipsis");
+	for (let p = Math.max(2, current - 1); p <= Math.min(total - 1, current + 1); p++) {
+		items.push(p);
+	}
+	if (current < total - 2) items.push("ellipsis");
+	items.push(total);
+	return items;
 }
-
-const viewModes: { mode: ViewMode; icon: typeof IconTable; label: string }[] = [
-	{ mode: "table", icon: IconTable, label: "Table" },
-	{ mode: "grid", icon: IconLayoutGrid, label: "Grid" },
-	{ mode: "list", icon: IconList, label: "List" },
-];
 
 function Home() {
 	const [page, setPage] = useState(1);
 	const { data, isLoading, error } = useWorksheets(page, PER_PAGE);
-	const [viewMode, setViewMode] = useState<ViewMode>(getStoredViewMode);
+	const navigate = useNavigate();
 	const [createDialogOpen, setCreateDialogOpen] = useState(false);
-
-	const changeView = (mode: ViewMode) => {
-		localStorage.setItem(VIEW_MODE_KEY, mode);
-		setViewMode(mode);
-	};
+	const [search, setSearch] = useState("");
+	usePipelineProgressListener();
 
 	if (isLoading) {
 		return (
@@ -111,64 +118,131 @@ function Home() {
 		);
 	}
 
+	const searchTerm = search.trim().toLowerCase();
+	const visible = searchTerm
+		? data.items.filter((worksheet) => worksheet.name.toLowerCase().includes(searchTerm))
+		: data.items;
+
 	return (
 		<>
-			<main className="w-screen h-screen flex flex-col">
-				<header className="flex items-center justify-between px-6 py-4 border-b">
-					<h1 className="text-xl font-semibold">Worksheets</h1>
-					<div className="flex items-center gap-3">
-						<Button
-							variant="ghost"
-							size="icon-sm"
-							aria-label="Preferences"
-							onClick={() => openSettings()}
-						>
-							<IconSettings />
-						</Button>
-						<div className="flex items-center gap-1 rounded-lg border p-0.5">
-							{viewModes.map(({ mode, icon: Icon, label }) => (
-								<Button
-									key={mode}
-									variant={viewMode === mode ? "default" : "ghost"}
-									size="icon-sm"
-									onClick={() => changeView(mode)}
-									aria-label={label}
-								>
-									<Icon />
-								</Button>
-							))}
-						</div>
-
-						<Button variant="default" onClick={() => setCreateDialogOpen(true)}>
+			<Layout
+				header={
+					<Field orientation="horizontal" className="w-max mx-auto">
+						<Input
+							type="search"
+							placeholder="Search worksheets..."
+							className="w-64"
+							value={search}
+							onChange={(e) => setSearch(e.target.value)}
+						/>
+						<Button type="button" onClick={() => setCreateDialogOpen(true)}>
 							<IconPlus />
 							New worksheet
 						</Button>
+					</Field>
+				}
+			>
+				<div className="w-full max-w-200 mx-auto flex flex-col gap-3 flex-1 min-h-0 pt-3">
+					<div className="border rounded-lg overflow-hidden">
+						<Table>
+							<TableHeader className="bg-muted">
+								<TableRow>
+									<TableHead className="flex items-center justify-center">
+										<IconSelector className="size-4" />
+									</TableHead>
+									<TableHead>Name</TableHead>
+									<TableHead>Materials</TableHead>
+									<TableHead>Artifacts</TableHead>
+									<TableHead>Created</TableHead>
+									<TableHead>Status</TableHead>
+									<TableHead className="w-12" />
+								</TableRow>
+							</TableHeader>
+							<TableBody>
+								{visible.length === 0 && (
+									<TableRow>
+										<TableCell colSpan={7} className="py-8 text-center text-muted-foreground">
+											No worksheets match &ldquo;{search}&rdquo;
+										</TableCell>
+									</TableRow>
+								)}
+								{visible.map((worksheet, index) => (
+									<TableRow
+										key={worksheet.id}
+										className="cursor-pointer"
+										onClick={() => navigate({ to: "/worksheets/$id", params: { id: worksheet.id } })}
+									>
+										<TableCell className="text-center text-muted-foreground">
+											{(page - 1) * PER_PAGE + index + 1}
+										</TableCell>
+										<TableCell className="font-medium">{worksheet.name}</TableCell>
+										<TableCell className="whitespace-nowrap">
+											<FilesCell worksheet={worksheet} />
+										</TableCell>
+										<TableCell className="whitespace-nowrap text-muted-foreground">
+											<QuizCounts worksheet={worksheet} />
+										</TableCell>
+										<TableCell>{formatDate(worksheet.created_at)}</TableCell>
+										<TableCell>
+											<PipelineStatusBadge worksheet={worksheet} />
+										</TableCell>
+										<TableCell onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
+											<WorksheetActions worksheet={worksheet} />
+										</TableCell>
+									</TableRow>
+								))}
+							</TableBody>
+						</Table>
 					</div>
-				</header>
-
-				<div className="flex-1 overflow-auto p-6">
-					{viewMode === "table" && <TableView worksheets={data.items} page={page} />}
-					{viewMode === "grid" && <GridView worksheets={data.items} />}
-					{viewMode === "list" && <ListView worksheets={data.items} />}
+					<footer className="flex items-center justify-between">
+						<p className="text-sm text-muted-foreground">
+							Showing {Math.min((page - 1) * PER_PAGE + 1, data.total)}
+							&ndash;{Math.min(page * PER_PAGE, data.total)} of {data.total}
+						</p>
+						<Pagination className="mx-0 w-auto">
+							<PaginationContent>
+								<PaginationItem>
+									<PaginationPrevious
+										aria-disabled={page <= 1}
+										onClick={(e) => {
+											e.preventDefault();
+											if (page > 1) setPage(page - 1);
+										}}
+									/>
+								</PaginationItem>
+								{paginationItems(page, data.total_pages).map((item, index) =>
+									item === "ellipsis" ? (
+										<PaginationItem key={`ellipsis-${index}`}>
+											<PaginationEllipsis />
+										</PaginationItem>
+									) : (
+										<PaginationItem key={item}>
+											<PaginationLink
+												isActive={item === page}
+												onClick={(e) => {
+													e.preventDefault();
+													setPage(item);
+												}}
+											>
+												{item}
+											</PaginationLink>
+										</PaginationItem>
+									),
+								)}
+								<PaginationItem>
+									<PaginationNext
+										aria-disabled={page >= data.total_pages}
+										onClick={(e) => {
+											e.preventDefault();
+											if (page < data.total_pages) setPage(page + 1);
+										}}
+									/>
+								</PaginationItem>
+							</PaginationContent>
+						</Pagination>
+					</footer>
 				</div>
-
-				<footer className="flex items-center justify-between px-6 py-4 border-t">
-					<p className="text-sm text-muted-foreground">
-						Showing {Math.min((page - 1) * PER_PAGE + 1, data.total)}
-						&ndash;{Math.min(page * PER_PAGE, data.total)} of {data.total}
-					</p>
-					<div className="flex items-center gap-2">
-						<Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(page - 1)}>
-							<IconChevronLeft />
-							Previous
-						</Button>
-						<Button variant="outline" size="sm" disabled={page >= data.total_pages} onClick={() => setPage(page + 1)}>
-							Next
-							<IconChevronRight />
-						</Button>
-					</div>
-				</footer>
-			</main>
+			</Layout>
 			<CreateWorksheetDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen} />
 		</>
 	);
@@ -185,19 +259,55 @@ function formatDate(iso: string): string {
 
 function WorksheetActions({ worksheet }: { worksheet: Worksheet }) {
 	const deleteWorksheet = useDeleteWorksheet();
+	const retryPipeline = useRetryPipeline(worksheet.id);
+	const navigate = useNavigate();
 	const [alertOpen, setAlertOpen] = useState(false);
 
 	return (
 		<>
 			<DropdownMenu>
 				<DropdownMenuTrigger
-					render={<Button variant="ghost" size="icon-xs" onClick={(e: React.MouseEvent) => e.stopPropagation()} />}
+					render={<Button variant="ghost" size="icon-sm" onClick={(e: React.MouseEvent) => e.stopPropagation()} />}
 				>
 					<IconDotsVertical />
 					<span className="sr-only">Actions</span>
 				</DropdownMenuTrigger>
-				<DropdownMenuContent align="end">
-					<DropdownMenuItem onClick={() => setAlertOpen(true)}>
+				<DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+					<DropdownMenuItem
+						onClick={(e) => {
+							e.stopPropagation();
+							navigate({ to: "/worksheets/$id", params: { id: worksheet.id } });
+						}}
+					>
+						<IconExternalLink />
+						Open
+					</DropdownMenuItem>
+					{worksheet.pipeline_status === "failed" && (
+						<DropdownMenuItem
+							disabled={retryPipeline.isPending}
+							onClick={(e) => {
+								e.stopPropagation();
+								retryPipeline.mutate();
+							}}
+						>
+							{retryPipeline.isPending ? <IconLoader className="animate-spin" /> : <IconRotateClockwise />}
+							Retry
+						</DropdownMenuItem>
+					)}
+					{worksheet.pipeline_status === "running" && (
+						<DropdownMenuItem onClick={(e) => e.stopPropagation()}>
+							<IconPlayerStop />
+							Stop
+						</DropdownMenuItem>
+					)}
+					<DropdownMenuSeparator />
+					<DropdownMenuItem
+						variant="destructive"
+						onClick={(e) => {
+							e.stopPropagation();
+							setAlertOpen(true);
+						}}
+					>
 						<IconTrash />
 						Delete
 					</DropdownMenuItem>
@@ -228,10 +338,10 @@ function FilesCell({ worksheet }: { worksheet: Worksheet }) {
 		<>
 			{worksheet.file_count} {worksheet.file_count === 1 ? "file" : "files"}
 			{worksheet.file_extensions.length > 0 && (
-				<span className="text-muted-foreground">
+				<>
 					{" · "}
-					{worksheet.file_extensions.join(", ")}
-				</span>
+					<span className="text-muted-foreground text-xs">{worksheet.file_extensions.join(", ")}</span>
+				</>
 			)}
 		</>
 	);
@@ -250,123 +360,4 @@ function QuizCounts({ worksheet }: { worksheet: Worksheet }) {
 	if (parts.length === 0) return <span className="text-muted-foreground">—</span>;
 
 	return <>{parts.join(" · ")}</>;
-}
-
-function TableView({ worksheets, page }: { worksheets: Worksheet[]; page: number }) {
-	const navigate = useNavigate();
-
-	return (
-		<Table>
-			<TableHeader>
-				<TableRow>
-					<TableHead className="w-12">
-						<IconSelector className="size-4" />
-					</TableHead>
-					<TableHead>Name</TableHead>
-					<TableHead>Files</TableHead>
-					<TableHead>Quiz content</TableHead>
-					<TableHead>Created</TableHead>
-					<TableHead>Status</TableHead>
-					<TableHead className="w-12" />
-				</TableRow>
-			</TableHeader>
-			<TableBody>
-				{worksheets.map((worksheet, index) => (
-					<TableRow
-						key={worksheet.id}
-						className="cursor-pointer"
-						onClick={() =>
-							navigate({
-								to: "/worksheets/$id",
-								params: { id: worksheet.id },
-							})
-						}
-					>
-						<TableCell className="text-muted-foreground">{(page - 1) * PER_PAGE + index + 1}</TableCell>
-						<TableCell className="font-medium">{worksheet.name}</TableCell>
-						<TableCell className="whitespace-nowrap">
-							<FilesCell worksheet={worksheet} />
-						</TableCell>
-						<TableCell className="whitespace-nowrap text-muted-foreground">
-							<QuizCounts worksheet={worksheet} />
-						</TableCell>
-						<TableCell>{formatDate(worksheet.created_at)}</TableCell>
-						<TableCell>
-							<PipelineStatusBadge worksheet={worksheet} />
-						</TableCell>
-						<TableCell>
-							<WorksheetActions worksheet={worksheet} />
-						</TableCell>
-					</TableRow>
-				))}
-			</TableBody>
-		</Table>
-	);
-}
-
-function GridView({ worksheets }: { worksheets: Worksheet[] }) {
-	const navigate = useNavigate();
-
-	return (
-		<div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-			{worksheets.map((worksheet) => (
-				<div
-					key={worksheet.id}
-					className="relative flex flex-col gap-2 rounded-xl border p-4 hover:bg-muted/50 transition-colors cursor-pointer"
-					onClick={() =>
-						navigate({
-							to: "/worksheets/$id",
-							params: { id: worksheet.id },
-						})
-					}
-				>
-					<div className="absolute top-2 right-2" onClick={(e) => e.stopPropagation()}>
-						<WorksheetActions worksheet={worksheet} />
-					</div>
-					<IconFile className="size-8 text-muted-foreground" />
-					<span className="font-medium truncate">{worksheet.name}</span>
-					<span className="text-sm text-muted-foreground">
-						{worksheet.file_count} {worksheet.file_count === 1 ? "file" : "files"} · Created{" "}
-						{formatDate(worksheet.created_at)}
-					</span>
-					<div className="flex">
-						<PipelineStatusBadge worksheet={worksheet} />
-					</div>
-				</div>
-			))}
-		</div>
-	);
-}
-
-function ListView({ worksheets }: { worksheets: Worksheet[] }) {
-	const navigate = useNavigate();
-
-	return (
-		<ul className="flex flex-col">
-			{worksheets.map((worksheet) => (
-				<Item
-					key={worksheet.id}
-					className="cursor-pointer border-b border-border last:border-b-0"
-					onClick={() =>
-						navigate({
-							to: "/worksheets/$id",
-							params: { id: worksheet.id },
-						})
-					}
-				>
-					<ItemContent>
-						<ItemTitle>{worksheet.name}</ItemTitle>
-						<ItemDescription>
-							{worksheet.file_count} {worksheet.file_count === 1 ? "file" : "files"} · Created{" "}
-							{formatDate(worksheet.created_at)}
-						</ItemDescription>
-					</ItemContent>
-					<ItemActions className="items-center gap-2">
-						<PipelineStatusBadge worksheet={worksheet} />
-						<WorksheetActions worksheet={worksheet} />
-					</ItemActions>
-				</Item>
-			))}
-		</ul>
-	);
 }

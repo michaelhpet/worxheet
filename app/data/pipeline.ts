@@ -1,5 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { useEffect } from "react";
+import { WORKSHEETS_QUERY_KEY } from "@/data/worksheets";
 
 export interface TypeProgress {
 	artifact_type: string;
@@ -30,6 +33,45 @@ export const PIPELINE_QUERY_KEY = "PIPELINE";
 
 const POLL_INTERVAL_MS = 1200;
 
+/** Payload of the `pipeline-progress` Tauri event emitted by the Rust core. */
+export interface PipelineProgressEvent {
+	worksheet_id: string;
+	status: "idle" | "running" | "done" | "failed";
+	phase: string | null;
+	artifact_type: string | null;
+	done: number;
+	total: number;
+	types: TypeProgress[];
+	types_done: number;
+	types_total: number;
+	requests_done?: number;
+	tokens_in?: number;
+	tokens_out?: number;
+	error: string | null;
+}
+
+/**
+ * Subscribes to the backend `pipeline-progress` events so queries can refresh
+ * when a pipeline reaches a terminal state. Progress ticks (`running`) are
+ * ignored: the persisted worksheet status only changes at completion.
+ */
+export function usePipelineProgressListener() {
+	const queryClient = useQueryClient();
+
+	useEffect(() => {
+		const unlisten = listen<PipelineProgressEvent>("pipeline-progress", (event) => {
+			if (event.payload.status === "running") {
+				return;
+			}
+			queryClient.invalidateQueries({ queryKey: [WORKSHEETS_QUERY_KEY] });
+			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, event.payload.worksheet_id] });
+		});
+		return () => {
+			unlisten.then((fn) => fn());
+		};
+	}, [queryClient]);
+}
+
 /**
  * Polls `get_pipeline_status` for a worksheet while its pipeline is running.
  * Stops polling once the pipeline reaches a terminal state (`done`/`failed`).
@@ -52,6 +94,7 @@ export function useRetryPipeline(worksheetId: string) {
 		mutationFn: () => invoke<void>("retry_pipeline", { worksheetId }),
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, worksheetId] });
+			queryClient.invalidateQueries({ queryKey: [WORKSHEETS_QUERY_KEY] });
 		},
 	});
 }

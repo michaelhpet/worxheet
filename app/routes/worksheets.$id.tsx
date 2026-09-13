@@ -8,7 +8,6 @@ import { usePipelineStatus, useRetryPipeline } from "@/data/pipeline";
 import { useWorksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES } from "@/lib/constants";
 import { toErrorMessage } from "@/lib/errors";
-import { openSettings } from "@/lib/settings-bus";
 import type { ArtifactType } from "@/lib/types";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
@@ -65,15 +64,7 @@ function WorksheetDetail() {
 								<AlertDescription key={message}>{message}</AlertDescription>
 							))}
 							{status?.status === "failed" && (
-								<AlertAction className="flex items-center gap-2">
-									<Button
-										variant="outline"
-										size="xs"
-										className="text-foreground"
-										onClick={() => openSettings("inference")}
-									>
-										Settings
-									</Button>
+								<AlertAction>
 									<Button variant="outline" size="xs" onClick={() => retryPipeline()} disabled={isRetryingPipeline}>
 										Retry
 									</Button>

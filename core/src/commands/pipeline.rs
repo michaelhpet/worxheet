@@ -35,3 +35,22 @@ pub async fn get_pipeline_status(
     )
     .await
 }
+
+/// Restart a worksheet's pipeline, e.g. after the user fixes the cause of a
+/// failure (missing provider config, etc.). Idempotent: if a job for the
+/// worksheet is already live, it is a no-op.
+#[tauri::command]
+pub async fn retry_pipeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    worksheet_id: String,
+) -> Result<(), String> {
+    pipeline::start_job(
+        app,
+        state.database.clone(),
+        state.settings.clone(),
+        state.jobs.clone(),
+        worksheet_id,
+    );
+    Ok(())
+}

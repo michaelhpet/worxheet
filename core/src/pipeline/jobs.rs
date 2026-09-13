@@ -208,15 +208,22 @@ pub async fn resume_if_needed(
         return get_status(pool, jobs, worksheet_id).await;
     }
 
-    // A live job may have been registered racing with this read; start_job is
-    // idempotent, so only the first caller actually launches the pipeline.
-    start_job(
-        app,
-        pool.clone(),
-        settings.clone(),
-        jobs.clone(),
-        worksheet_id.to_string(),
-    );
+    // Only auto-resume pipelines that are genuinely supposed to run: a stale
+    // `running` row left by a crash or a fresh `idle` worksheet. A `failed`
+    // worksheet is not restarted automatically (that would retry in a tight
+    // loop and mask the recorded error) — the UI surfaces the error and the
+    // user can deliberately retry via `retry_pipeline`.
+    if status == "running" || status == "idle" {
+        // A live job may have been registered racing with this read; start_job is
+        // idempotent, so only the first caller actually launches the pipeline.
+        start_job(
+            app,
+            pool.clone(),
+            settings.clone(),
+            jobs.clone(),
+            worksheet_id.to_string(),
+        );
+    }
     get_status(pool, jobs, worksheet_id).await
 }
 
@@ -272,17 +279,13 @@ fn resolve_backend(
     let config = provider.active_config();
     if !config.is_configured() {
         return Err(String::from(
-            "No LLM provider is configured. Open Settings and add a provider.",
+            "No inference provider is configured. Open Settings and add a provider.",
         ));
     }
     // Key presence is the only signal: absent key → no Authorization header.
     let api_key = provider::config::load_api_key(&provider.active)?.filter(|key| !key.is_empty());
     let backend = OpenAiClient::new(&config.base_url, api_key, &config.model)
-        .with_reasoning_effort(
-            config
-                .disable_thinking
-                .then(|| String::from("none")),
-        );
+        .with_reasoning_effort(config.disable_thinking.then(|| String::from("none")));
     Ok((Arc::new(backend), config.concurrency))
 }
 

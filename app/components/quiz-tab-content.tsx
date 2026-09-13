@@ -72,8 +72,8 @@ export function QuizTabContent({ worksheet, artifactType }: Props) {
 	});
 
 	return (
-		<TabsContent key={artifactType.value} value={artifactType.value} className="grow">
-			<div className="w-full h-full flex flex-col items-center gap-3 mt-40">
+		<TabsContent key={artifactType.value} value={artifactType.value} className="grow-0">
+			<div className="w-full h-full flex flex-col items-center gap-3 mt-[calc((100vh-436px)/4)]">
 				<artifactType.icon />
 				<p className="text-lg font-medium">
 					{artifactType.label}&nbsp;

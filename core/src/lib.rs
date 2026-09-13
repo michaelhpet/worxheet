@@ -62,6 +62,7 @@ pub fn run() {
             commands::worksheet::delete_worksheet,
             commands::pipeline::get_artifacts,
             commands::pipeline::get_pipeline_status,
+            commands::pipeline::retry_pipeline,
             commands::provider::get_provider_status,
             commands::provider::set_provider_config,
             commands::provider::list_provider_models,

@@ -172,7 +172,7 @@ export function QuizShell({ id, loading, items, renderAnswer, time }: QuizShellP
 			}
 		>
 			<form id="quiz-form" onSubmit={(event) => event.preventDefault()}>
-				<div className="mx-auto mt-40 flex w-full max-w-xl flex-col items-center">
+				<div className="mx-auto mt-[calc((100vh-436px)/4)] flex w-full max-w-xl flex-col items-center">
 					<p className={progressClasses}>{`Question ${step + 1} of ${items.length}`}</p>
 					<div className="mt-6 flex w-full min-w-0 flex-col gap-5">
 						{items.map((item, index) => (

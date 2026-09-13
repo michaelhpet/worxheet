@@ -122,7 +122,7 @@ export function SettingsDialog() {
 									<div>
 										<h2 className="text-base font-medium">Inference</h2>
 										<p className="mt-1 text-sm text-muted-foreground">
-											Connect an LLM provider used to generate artifacts.
+											Connect an inference provider used to generate artifacts.
 										</p>
 									</div>
 

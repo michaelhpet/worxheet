@@ -49,7 +49,7 @@ pub enum ProviderError {
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unconfigured => write!(f, "No LLM provider is configured"),
+            Self::Unconfigured => write!(f, "No inference provider is configured"),
             Self::RateLimited {
                 retry_after,
                 message,
@@ -72,7 +72,10 @@ impl fmt::Display for ProviderError {
 /// Anything that can turn prompts into schema-constrained JSON.
 #[async_trait]
 pub trait ArtifactBackend: Send + Sync {
-    async fn generate_json(&self, request: &GenerateRequest) -> Result<GenerateReply, ProviderError>;
+    async fn generate_json(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateReply, ProviderError>;
 
     /// Best-effort listing of model ids for settings UIs.
     async fn list_models(&self) -> Result<Vec<String>, ProviderError>;

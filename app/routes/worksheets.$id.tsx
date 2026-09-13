@@ -1,12 +1,14 @@
 import { Layout } from "@/components/layout";
 import { QuizTabContent } from "@/components/quiz-tab-content";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { usePipelineStatus } from "@/data/pipeline";
+import { usePipelineStatus, useRetryPipeline } from "@/data/pipeline";
 import { useWorksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES } from "@/lib/constants";
 import { toErrorMessage } from "@/lib/errors";
+import { openSettings } from "@/lib/settings-bus";
 import type { ArtifactType } from "@/lib/types";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
@@ -27,6 +29,7 @@ function WorksheetDetail() {
 	const navigate = useNavigate();
 	const { data: status } = usePipelineStatus(id);
 	const { data: worksheet, error } = useWorksheet(id, status?.status);
+	const { isPending: isRetryingPipeline, mutate: retryPipeline } = useRetryPipeline(id);
 	const [artifactType, setArtifactType] = useState<ArtifactType>("MultipleChoiceQuiz");
 
 	const exitWorksheet = () => {
@@ -54,26 +57,39 @@ function WorksheetDetail() {
 				}
 			>
 				{errors.length > 0 && (
-					<div className="px-4 pt-4">
+					<div className="w-143 mx-auto">
 						<Alert variant="destructive">
 							<IconAlertTriangle />
 							<AlertTitle>Something went wrong</AlertTitle>
 							{errors.map((message) => (
 								<AlertDescription key={message}>{message}</AlertDescription>
 							))}
+							{status?.status === "failed" && (
+								<AlertAction className="flex items-center gap-2">
+									<Button
+										variant="outline"
+										size="xs"
+										className="text-foreground"
+										onClick={() => openSettings("inference")}
+									>
+										Settings
+									</Button>
+									<Button variant="outline" size="xs" onClick={() => retryPipeline()} disabled={isRetryingPipeline}>
+										Retry
+									</Button>
+								</AlertAction>
+							)}
 						</Alert>
 					</div>
 				)}
 				{worksheet ? (
 					QUIZ_TYPES.map((type) => {
 						const quizType = ARTIFACT_TYPE_OPTIONS.find((option) => option.value === type);
-
 						if (!quizType) return null;
-
 						return <QuizTabContent key={type} worksheet={worksheet} artifactType={quizType} />;
 					})
 				) : (
-					<div className="grow flex flex-col items-center mt-40">
+					<div className="grow flex flex-col items-center mt-[calc((100vh-436px)/4)]">
 						<Spinner />
 						<p className="text-muted-foreground">Loading worksheet...</p>
 					</div>

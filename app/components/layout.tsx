@@ -9,7 +9,7 @@ interface Props extends PropsWithChildren {
 
 export function Layout({ header, children, onBack }: Props) {
 	return (
-		<main className="w-screen flex flex-col">
+		<main className="w-screen min-h-screen flex flex-col">
 			<header className="sticky top-0 w-full h-14 flex items-center justify-center gap-2 px-4 bg-background">
 				{!!onBack && (
 					<Button size="icon" variant="secondary" onClick={onBack} className="absolute left-3">

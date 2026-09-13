@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 
 export interface TypeProgress {
@@ -41,6 +41,17 @@ export function usePipelineStatus(worksheetId: string) {
 		refetchInterval: (query) => {
 			const status = query.state.data?.status;
 			return status === "running" ? POLL_INTERVAL_MS : false;
+		},
+	});
+}
+
+export function useRetryPipeline(worksheetId: string) {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: () => invoke<void>("retry_pipeline", { worksheetId }),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, worksheetId] });
 		},
 	});
 }

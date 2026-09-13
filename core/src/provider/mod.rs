@@ -27,10 +27,7 @@ pub struct GenerateRequest {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // reserved for settings gating paths
 pub enum ProviderError {
-    /// No provider is configured yet (missing key/model).
-    Unconfigured,
     /// The provider asked us to slow down.
     RateLimited {
         retry_after: Option<std::time::Duration>,
@@ -49,7 +46,6 @@ pub enum ProviderError {
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unconfigured => write!(f, "No inference provider is configured"),
             Self::RateLimited {
                 retry_after,
                 message,

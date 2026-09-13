@@ -1,43 +1,48 @@
-//! Provider configuration, presets, and keychain-backed API key storage.
+//! Provider presets and keychain-backed API key storage.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Well-known OpenAI-compatible endpoints. Any other deployment can be
-/// reached through the `custom` preset with a user-supplied base URL.
-pub const PRESETS: &[(&str, &str)] = &[
-    ("openai", "https://api.openai.com/v1"),
-    (
-        "gemini",
-        "https://generativelanguage.googleapis.com/v1beta/openai",
-    ),
-    ("ollama", "https://ollama.com/v1"),
-    ("lmstudio", "http://localhost:1234/v1"),
-];
+pub struct PresetDef {
+    pub name: &'static str,
+    pub base_url: &'static str,
+    pub default_model: &'static str,
+}
 
-pub const DEFAULT_MODEL_BY_PRESET: &[(&str, &str)] = &[
-    ("openai", "gpt-4o-mini"),
-    ("gemini", "gemini-2.0-flash"),
-    ("ollama", "llama3.1"),
-    ("lmstudio", ""),
+/// Well-known OpenAI-compatible endpoints (`custom` covers anything else).
+pub const PRESETS: &[PresetDef] = &[
+    PresetDef {
+        name: "openai",
+        base_url: "https://api.openai.com/v1",
+        default_model: "gpt-4o-mini",
+    },
+    PresetDef {
+        name: "gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model: "gemini-2.0-flash",
+    },
+    PresetDef {
+        name: "ollama",
+        base_url: "https://ollama.com/v1",
+        default_model: "llama3.1",
+    },
+    PresetDef {
+        name: "lmstudio",
+        base_url: "http://localhost:1234/v1",
+        default_model: "",
+    },
 ];
 
 const KEYRING_SERVICE: &str = "worxheet";
 
-/// Per-provider generation settings. The API key deliberately lives outside
-/// this struct: it is stored in the OS keychain and only joined at call time.
+/// The API key lives in the OS keychain, joined at call time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PerPresetConfig {
     pub base_url: String,
     pub model: String,
-    /// Parallel in-flight requests during bulk generation.
     pub concurrency: usize,
-    /// Send `reasoning_effort: "none"` so thinking models answer directly
-    /// instead of burning tokens on reasoning (and burying the answer in a
-    /// `reasoning` field some OpenAI-compatible deployments return empty).
-    /// Defaults to on: fast, direct answers are the norm; users opt into
-    /// thinking where a model benefits from it.
+    /// Thinking models answer directly instead of burning tokens on reasoning.
     pub disable_thinking: bool,
 }
 
@@ -58,10 +63,6 @@ impl PerPresetConfig {
     }
 }
 
-/// Full provider state: which preset is active plus the saved config for
-/// each configured preset. Switching presets loads that preset's saved
-/// settings; changes are persisted per-preset so the user's per-provider
-/// configuration survives across switches.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub active: String,
@@ -71,12 +72,12 @@ pub struct ProviderSettings {
 impl Default for ProviderSettings {
     fn default() -> Self {
         let mut presets = HashMap::new();
-        for &(name, url) in PRESETS {
+        for preset in PRESETS {
             presets.insert(
-                name.to_string(),
+                preset.name.to_string(),
                 PerPresetConfig {
-                    base_url: url.to_string(),
-                    model: default_model_for_preset(name).to_string(),
+                    base_url: preset.base_url.to_string(),
+                    model: preset.default_model.to_string(),
                     ..PerPresetConfig::default()
                 },
             );
@@ -89,33 +90,25 @@ impl Default for ProviderSettings {
 }
 
 impl ProviderSettings {
-    /// The active preset's config, falling back to defaults if the preset
-    /// was never explicitly configured.
     pub fn active_config(&self) -> PerPresetConfig {
-        self.presets
-            .get(&self.active)
-            .cloned()
-            .unwrap_or_default()
+        self.presets.get(&self.active).cloned().unwrap_or_default()
     }
 }
 
+fn preset_def(preset: &str) -> Option<&'static PresetDef> {
+    PRESETS.iter().find(|def| def.name == preset)
+}
+
 pub fn base_url_for_preset(preset: &str) -> Option<&'static str> {
-    PRESETS
-        .iter()
-        .find(|(name, _)| *name == preset)
-        .map(|(_, url)| *url)
+    preset_def(preset).map(|def| def.base_url)
 }
 
-pub fn default_model_for_preset(preset: &str) -> &'static str {
-    DEFAULT_MODEL_BY_PRESET
-        .iter()
-        .find(|(name, _)| *name == preset)
-        .map(|(_, model)| *model)
-        .unwrap_or("")
+/// Empty stored keys count as absent.
+pub fn active_key(preset: &str) -> Result<Option<String>, String> {
+    Ok(load_api_key(preset)?.filter(|key| !key.is_empty()))
 }
 
-/// Keychain account for a given provider preset. Each provider owns its own
-/// slot so a key can never be sent to a different provider.
+/// Per-preset slot so keys can never cross providers.
 fn keyring_account(preset: &str) -> String {
     format!("provider-api-key:{preset}")
 }
@@ -125,8 +118,7 @@ fn keyring_entry(preset: &str) -> Result<keyring::Entry, String> {
         .map_err(|e| format!("Keychain unavailable: {e}"))
 }
 
-/// Persist a provider's API key in the OS keychain. An empty string deletes
-/// that provider's entry.
+/// An empty string deletes the entry.
 pub fn store_api_key(preset: &str, key: &str) -> Result<(), String> {
     let entry = keyring_entry(preset)?;
     if key.is_empty() {
@@ -142,7 +134,6 @@ pub fn store_api_key(preset: &str, key: &str) -> Result<(), String> {
     }
 }
 
-/// Load the stored API key for a provider, if any.
 pub fn load_api_key(preset: &str) -> Result<Option<String>, String> {
     match keyring_entry(preset)?.get_password() {
         Ok(key) => Ok(Some(key)),
@@ -166,7 +157,10 @@ mod tests {
         let settings = ProviderSettings::default();
         for preset in ["openai", "gemini", "ollama", "lmstudio"] {
             let config = settings.presets.get(preset).unwrap();
-            assert!(config.disable_thinking, "preset {preset} should default thinking disabled");
+            assert!(
+                config.disable_thinking,
+                "preset {preset} should default thinking disabled"
+            );
         }
     }
 

@@ -15,9 +15,8 @@ pub struct ProviderStatus {
     pub api_key_set: bool,
 }
 
-#[tauri::command]
-pub async fn get_provider_status(state: State<'_, AppState>) -> Result<ProviderStatus, String> {
-    let provider = state.settings.get().provider;
+fn provider_status(settings: &crate::settings::SettingsState) -> Result<ProviderStatus, String> {
+    let provider = settings.get().provider;
     let config = provider.active_config();
     let api_key_set = config::load_api_key(&provider.active)?.is_some();
     Ok(ProviderStatus {
@@ -25,6 +24,11 @@ pub async fn get_provider_status(state: State<'_, AppState>) -> Result<ProviderS
         config,
         api_key_set,
     })
+}
+
+#[tauri::command]
+pub async fn get_provider_status(state: State<'_, AppState>) -> Result<ProviderStatus, String> {
+    provider_status(&state.settings)
 }
 
 /// Save provider settings. `api_key` of `Some("")` clears the stored key for
@@ -59,22 +63,14 @@ pub async fn set_provider_config(
             .map_err(|error| format!("Failed to store API key: {error}"))?;
     }
 
-    let provider = state.settings.get().provider;
-    let config = provider.active_config();
-    let api_key_set = config::load_api_key(&provider.active)?.is_some();
-    Ok(ProviderStatus {
-        preset: provider.active,
-        config,
-        api_key_set,
-    })
+    provider_status(&state.settings)
 }
 
 #[tauri::command]
 pub async fn list_provider_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let provider = state.settings.get().provider;
     let config = provider.active_config();
-    // Key presence is the only signal: absent key → no Authorization header.
-    let api_key = config::load_api_key(&provider.active)?.filter(|key| !key.is_empty());
+    let api_key = config::active_key(&provider.active)?;
     let client = OpenAiClient::new(&config.base_url, api_key, &config.model);
     client
         .list_models()

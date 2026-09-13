@@ -1,69 +1,108 @@
-//! Background pipeline job runner.
-//!
-//! Each worksheet pipeline runs on its own background task; progress reporting
-//! is keyed by worksheet so runs do not need to serialize. Provider resolution
-//! happens per run so settings changes apply immediately.
+//! Background pipeline job runner: one task per worksheet, provider resolved
+//! per run so settings changes apply immediately.
 
 use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 
 use sqlx::{Pool, Sqlite};
 use tauri::{AppHandle, Emitter};
 
-use super::CANCELLED_MESSAGE;
+use super::{PipelineError, PipelineResult, Stop};
 use crate::provider::{self, client::OpenAiClient, ArtifactBackend};
-use crate::schema::{ArtifactType, PipelineStatus, TypeProgress};
+use crate::schema::{ArtifactType, Phase, PipelineState, PipelineStatus, TypeProgress};
 use crate::settings::SettingsState;
 
 use super::segment;
 
-/// Live in-memory state of a running pipeline. The authoritative
-/// `running`/`done`/`failed`/`cancelled` marker lives on the worksheet row so
-/// it survives a restart; this carries the transient progress the UI shows.
 #[derive(Clone)]
-struct RunningJob {
-    phase: String,
-    artifact_type: Option<ArtifactType>,
-    done: usize,
-    total: usize,
-    /// Per-artifact-type unit progress in the current phase.
-    per_type: Vec<TypeProgress>,
-    types_done: usize,
-    types_total: usize,
-    requests_done: usize,
-    tokens_in: u64,
-    tokens_out: u64,
+pub(crate) struct RunningJob {
+    pub(crate) phase: Phase,
+    pub(crate) artifact_type: Option<ArtifactType>,
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    pub(crate) per_type: Vec<TypeProgress>,
+    pub(crate) types_done: usize,
+    pub(crate) stop: Stop,
 }
 
-/// Registry of in-memory running pipelines.
-///
-/// Each entry is keyed by worksheet id so stopping one worksheet never
-/// touches another worksheet's run: the cancel flag is per worksheet and the
-/// background task only observes its own flag.
+/// In-memory running pipelines keyed by worksheet id.
 pub struct PipelineJobs {
     jobs: Mutex<HashMap<String, RunningJob>>,
-    cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl Default for PipelineJobs {
     fn default() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
-            cancel: Mutex::new(HashMap::new()),
         }
     }
 }
 
-fn is_cancelled(cancel: &Arc<AtomicBool>) -> bool {
-    cancel.load(Ordering::Relaxed)
+struct RunCtx {
+    app: AppHandle,
+    pool: Pool<Sqlite>,
+    settings: Arc<SettingsState>,
+    jobs: Arc<PipelineJobs>,
+    worksheet_id: String,
+    stop: Stop,
 }
 
-/// Register the worksheet as running and start its pipeline in the background.
-/// Returns `false` (and does nothing) if a job for the worksheet is already
-/// live, so concurrent callers cannot start duplicate pipelines.
+impl RunCtx {
+    fn check_cancelled(&self) -> PipelineResult<()> {
+        self.stop.check()
+    }
+
+    fn update_progress(&self, update: impl FnOnce(&mut RunningJob)) {
+        apply_progress(&self.app, &self.jobs, &self.worksheet_id, update);
+    }
+
+    fn set_phase(&self, phase: Phase, artifact_type: Option<ArtifactType>) {
+        self.update_progress(|job| {
+            job.phase = phase;
+            job.artifact_type = artifact_type;
+            job.done = 0;
+            job.total = 0;
+        });
+    }
+
+    fn generate_sink(&self) -> super::generate::ProgressFn {
+        let (app, jobs, worksheet_id) = self.sink_parts();
+        Arc::new(move |tick| {
+            apply_progress(&app, &jobs, &worksheet_id, |job| {
+                job.artifact_type = tick.artifact_type;
+                job.done = tick.done;
+                job.total = tick.total;
+                job.per_type = tick.per_type;
+                job.types_done = tick.types_done;
+            });
+        })
+    }
+
+    fn sink_parts(&self) -> (AppHandle, Arc<PipelineJobs>, String) {
+        (
+            self.app.clone(),
+            self.jobs.clone(),
+            self.worksheet_id.clone(),
+        )
+    }
+}
+
+fn apply_progress(
+    app: &AppHandle,
+    jobs: &Arc<PipelineJobs>,
+    worksheet_id: &str,
+    update: impl FnOnce(&mut RunningJob),
+) {
+    {
+        let mut running = jobs.jobs.lock().unwrap();
+        if let Some(job) = running.get_mut(worksheet_id) {
+            update(job);
+        }
+    }
+    emit_progress(app, jobs, worksheet_id);
+}
+
+/// Returns `false` without doing anything if the worksheet already has a live job.
 pub fn start_job(
     app: AppHandle,
     pool: Pool<Sqlite>,
@@ -71,111 +110,109 @@ pub fn start_job(
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
 ) -> bool {
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let started = {
-        let mut running = jobs.jobs.lock().unwrap();
-        if running.contains_key(&worksheet_id) {
-            false
-        } else {
-            running.insert(
-                worksheet_id.clone(),
-                RunningJob {
-                    phase: String::from("ingesting"),
-                    artifact_type: None,
-                    done: 0,
-                    total: 0,
-                    per_type: Vec::new(),
-                    types_done: 0,
-                    types_total: ArtifactType::ALL.len(),
-                    requests_done: 0,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                },
-            );
-            jobs.cancel
-                .lock()
-                .unwrap()
-                .insert(worksheet_id.clone(), cancel_flag.clone());
-            true
-        }
+    let ctx = RunCtx {
+        app,
+        pool,
+        settings,
+        jobs,
+        worksheet_id,
+        stop: Stop::new(),
     };
-
-    if !started {
-        return false;
+    {
+        let mut running = ctx.jobs.jobs.lock().unwrap();
+        if running.contains_key(&ctx.worksheet_id) {
+            return false;
+        }
+        let stop = ctx.stop.clone();
+        running.insert(
+            ctx.worksheet_id.clone(),
+            RunningJob {
+                phase: Phase::Ingesting,
+                artifact_type: None,
+                done: 0,
+                total: 0,
+                per_type: Vec::new(),
+                types_done: 0,
+                stop,
+            },
+        );
     }
 
     tauri::async_runtime::spawn(async move {
-        run_job(&app, &pool, &settings, &jobs, &cancel_flag, &worksheet_id).await;
+        run_job(ctx).await;
     });
     true
 }
 
-/// Request cancellation of a worksheet's pipeline.
-///
-/// Per-worksheet isolation: only the flag for `worksheet_id` is set, so other
-/// running worksheets are unaffected. The running task observes the flag at
-/// its next checkpoint (and in-flight generation units are aborted inside
-/// `generate_all`), then exits without overwriting the `cancelled` row this
-/// function persists. Idempotent: returns `false` when nothing was running.
+/// Idempotent: returns `false` when nothing was running. The task exits without
+/// overwriting the `cancelled` row persisted here.
 pub async fn stop_job(
     app: &AppHandle,
     pool: &Pool<Sqlite>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
 ) -> bool {
-    let flag = jobs.cancel.lock().unwrap().get(worksheet_id).cloned();
-    let Some(flag) = flag else {
-        // No live task, but a stale `running` row (e.g. crash before resume)
-        // should still transition to `cancelled` so Stop never appears stuck.
-        let result = sqlx::query(
-            "UPDATE worksheets SET pipeline_status = 'cancelled', pipeline_error = NULL
-              WHERE id = ? AND pipeline_status IN ('running', 'idle')",
+    let live = jobs
+        .jobs
+        .lock()
+        .unwrap()
+        .get(worksheet_id)
+        .map(|job| job.stop.clone());
+
+    if let Some(stop) = live {
+        stop.stop();
+        // Drop the snapshot so polls see `cancelled` at once; the task holds its own Stop.
+        jobs.jobs.lock().unwrap().remove(worksheet_id);
+        // Report stopped even if the row already flipped: `run_job` lets a
+        // cancelled outcome win over a racing completion.
+        transition_status(
+            pool,
+            worksheet_id,
+            PipelineState::Cancelled,
+            None,
+            &[PipelineState::Running, PipelineState::Idle],
         )
-        .bind(worksheet_id)
-        .execute(pool)
-        .await;
-        let stopped = matches!(result, Ok(done) if done.rows_affected() > 0);
-        if stopped {
-            emit_terminal(app, worksheet_id, "cancelled", None);
-        }
-        return stopped;
-    };
+        .await
+        .ok();
+        emit_status(
+            app,
+            worksheet_id,
+            &PipelineStatus::terminal(PipelineState::Cancelled, None),
+        );
+        return true;
+    }
 
-    flag.store(true, Ordering::Relaxed);
-    // Drop the progress snapshot now so status polls immediately reflect the
-    // persisted `cancelled` row instead of a stale `running` snapshot. The
-    // flag entry stays until `run_job` cleans up so the task still sees it.
-    jobs.jobs.lock().unwrap().remove(worksheet_id);
-
-    let result = sqlx::query(
-        "UPDATE worksheets SET pipeline_status = 'cancelled', pipeline_error = NULL
-          WHERE id = ? AND pipeline_status IN ('running', 'idle')",
+    let flipped = transition_status(
+        pool,
+        worksheet_id,
+        PipelineState::Cancelled,
+        None,
+        &[PipelineState::Running, PipelineState::Idle],
     )
-    .bind(worksheet_id)
-    .execute(pool)
-    .await;
-    // A live task existed, so report stopped even if the row had already
-    // flipped (e.g. finished racing with this call — `run_job` preserves the
-    // cancelled outcome in that case, see below).
-    let _ = result;
-    emit_terminal(app, worksheet_id, "cancelled", None);
-    true
+    .await
+    .unwrap_or(false);
+    if flipped {
+        emit_status(
+            app,
+            worksheet_id,
+            &PipelineStatus::terminal(PipelineState::Cancelled, None),
+        );
+    }
+    flipped
 }
 
-/// Persist `running` for any worksheet left mid-flight by a previous session
-/// and restart its pipeline.
 pub async fn resume_stale(
     app: AppHandle,
     pool: Pool<Sqlite>,
     settings: Arc<SettingsState>,
     jobs: Arc<PipelineJobs>,
 ) {
-    let rows = sqlx::query_as::<_, (String,)>(
-        "SELECT id FROM worksheets WHERE pipeline_status = 'running'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    let rows =
+        sqlx::query_as::<_, (String,)>("SELECT id FROM worksheets WHERE pipeline_status = ?")
+            .bind(PipelineState::Running.as_db_str())
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
 
     for (worksheet_id,) in rows {
         start_job(
@@ -188,83 +225,86 @@ pub async fn resume_stale(
     }
 }
 
-/// Forget an in-memory job, e.g. when its worksheet is deleted.
-///
-/// Signals cancellation first so the orphaned task exits at its next
-/// checkpoint instead of continuing provider requests for a deleted row.
+/// Signals cancellation first so the orphaned task stops instead of
+/// continuing provider requests for a deleted row.
 pub fn remove_job(jobs: &Arc<PipelineJobs>, worksheet_id: &str) {
-    if let Some(flag) = jobs.cancel.lock().unwrap().get(worksheet_id).cloned() {
-        flag.store(true, Ordering::Relaxed);
+    let mut running = jobs.jobs.lock().unwrap();
+    if let Some(job) = running.get(worksheet_id) {
+        job.stop.stop();
     }
-    jobs.jobs.lock().unwrap().remove(worksheet_id);
+    running.remove(worksheet_id);
 }
 
-/// Merge live in-memory progress with the persisted worksheet status.
 pub async fn get_status(
     pool: &Pool<Sqlite>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
-) -> Result<PipelineStatus, String> {
+) -> PipelineResult<PipelineStatus> {
+    if let Some(running) = jobs.jobs.lock().unwrap().get(worksheet_id) {
+        return Ok(PipelineStatus::running(
+            running.phase,
+            running.artifact_type.clone(),
+            running.done,
+            running.total,
+            running.per_type.clone(),
+            running.types_done,
+        ));
+    }
+
     let (persisted, persisted_error): (String, Option<String>) =
         sqlx::query_as("SELECT pipeline_status, pipeline_error FROM worksheets WHERE id = ?")
             .bind(worksheet_id)
             .fetch_optional(pool)
-            .await
-            .map_err(|_| String::from("Failed to fetch pipeline status"))?
-            .ok_or_else(|| String::from("Worksheet not found"))?;
+            .await?
+            .ok_or_else(|| PipelineError::Failed(String::from("Worksheet not found")))?;
 
-    if let Some(running) = jobs.jobs.lock().unwrap().get(worksheet_id) {
-        return Ok(PipelineStatus {
-            status: String::from("running"),
-            phase: Some(running.phase.clone()),
-            artifact_type: running
-                .artifact_type
-                .as_ref()
-                .map(ArtifactType::to_db)
-                .map(String::from),
-            done: running.done,
-            total: running.total,
-            types: running.per_type.clone(),
-            types_done: running.types_done,
-            types_total: running.types_total,
-            requests_done: running.requests_done,
-            tokens_in: running.tokens_in,
-            tokens_out: running.tokens_out,
-            error: None,
-        });
-    }
-
-    Ok(PipelineStatus {
-        status: persisted.clone(),
-        phase: None,
-        artifact_type: None,
-        done: 0,
-        total: 0,
-        types: Vec::new(),
-        types_done: if persisted == "done" {
-            ArtifactType::ALL.len()
-        } else {
-            0
-        },
-        types_total: ArtifactType::ALL.len(),
-        requests_done: 0,
-        tokens_in: 0,
-        tokens_out: 0,
-        error: persisted_error,
-    })
+    let state = PipelineState::from_db_str(&persisted).unwrap_or(PipelineState::Failed);
+    Ok(PipelineStatus::terminal(state, persisted_error))
 }
 
-/// Ensure a worksheet's pipeline is running, resuming from unchunked or
-/// ungenerated parts. Safe to call on every status poll: if a live job exists
-/// or the worksheet is already `done`, it is a no-op. Returns the current
-/// status so callers can render immediately after a resume is triggered.
+async fn persist_status(
+    pool: &Pool<Sqlite>,
+    worksheet_id: &str,
+    state: PipelineState,
+    error: Option<&str>,
+) -> PipelineResult<()> {
+    transition_status(pool, worksheet_id, state, error, &[]).await?;
+    Ok(())
+}
+
+/// Unknown stored values never match, so conditional writes simply don't fire.
+async fn transition_status(
+    pool: &Pool<Sqlite>,
+    worksheet_id: &str,
+    state: PipelineState,
+    error: Option<&str>,
+    from: &[PipelineState],
+) -> PipelineResult<bool> {
+    let mut builder = sqlx::QueryBuilder::new("UPDATE worksheets SET pipeline_status = ");
+    builder.push_bind(state.as_db_str());
+    builder.push(", pipeline_error = ");
+    builder.push_bind(error);
+    builder.push(" WHERE id = ");
+    builder.push_bind(worksheet_id);
+    if !from.is_empty() {
+        builder.push(" AND pipeline_status IN (");
+        let mut separated = builder.separated(", ");
+        for state in from {
+            separated.push_bind(state.as_db_str());
+        }
+        separated.push_unseparated(")");
+    }
+    Ok(builder.build().execute(pool).await?.rows_affected() > 0)
+}
+
+/// Safe to call on every status poll.
 pub async fn resume_if_needed(
     app: AppHandle,
     pool: &Pool<Sqlite>,
     settings: &Arc<SettingsState>,
     jobs: &Arc<PipelineJobs>,
     worksheet_id: &str,
-) -> Result<PipelineStatus, String> {
+) -> PipelineResult<PipelineStatus> {
     let live = jobs.jobs.lock().unwrap().contains_key(worksheet_id);
     if live {
         return get_status(pool, jobs, worksheet_id).await;
@@ -274,204 +314,158 @@ pub async fn resume_if_needed(
         sqlx::query_as("SELECT pipeline_status FROM worksheets WHERE id = ?")
             .bind(worksheet_id)
             .fetch_optional(pool)
-            .await
-            .map_err(|_| String::from("Failed to fetch pipeline status"))?;
+            .await?;
 
     let Some((status,)) = persisted else {
-        return Err(String::from("Worksheet not found"));
+        return Err(PipelineError::Failed(String::from("Worksheet not found")));
     };
 
-    if status == "done" || status == "failed" || status == "cancelled" {
-        return get_status(pool, jobs, worksheet_id).await;
+    // Terminal states and unknown values surface as-is for a deliberate retry.
+    match PipelineState::from_db_str(&status) {
+        Some(state) if !state.is_terminal() => {
+            start_job(
+                app,
+                pool.clone(),
+                settings.clone(),
+                jobs.clone(),
+                worksheet_id.to_string(),
+            );
+            get_status(pool, jobs, worksheet_id).await
+        }
+        _ => get_status(pool, jobs, worksheet_id).await,
     }
-
-    // Only auto-resume pipelines that are genuinely supposed to run: a stale
-    // `running` row left by a crash or a fresh `idle` worksheet. A `failed`
-    // or `cancelled` worksheet is not restarted automatically (that would
-    // retry in a tight loop and mask the recorded outcome) — the UI surfaces
-    // the state and the user can deliberately retry via `retry_pipeline`.
-    if status == "running" || status == "idle" {
-        // A live job may have been registered racing with this read; start_job is
-        // idempotent, so only the first caller actually launches the pipeline.
-        start_job(
-            app,
-            pool.clone(),
-            settings.clone(),
-            jobs.clone(),
-            worksheet_id.to_string(),
-        );
-    }
-    get_status(pool, jobs, worksheet_id).await
 }
 
-async fn run_job(
-    app: &AppHandle,
-    pool: &Pool<Sqlite>,
-    settings: &Arc<SettingsState>,
-    jobs: &Arc<PipelineJobs>,
-    cancel: &Arc<AtomicBool>,
-    worksheet_id: &str,
-) {
-    let result = run_pipeline(app, pool, settings, jobs, cancel, worksheet_id).await;
+async fn run_job(ctx: RunCtx) {
+    let result = run_pipeline(&ctx).await;
+    let worksheet_id = ctx.worksheet_id.clone();
 
-    // A stop request wins over a racing completion: `stop_job` already
-    // persisted `cancelled`, so never overwrite it with `done`/`failed`.
-    // Already-finished per-item artifacts stay persisted; retry resumes the rest.
-    if is_cancelled(cancel) || matches!(&result, Err(message) if message == CANCELLED_MESSAGE) {
-        sqlx::query(
-            "UPDATE worksheets SET pipeline_status = 'cancelled', pipeline_error = NULL
-              WHERE id = ? AND pipeline_status = 'running'",
+    // A stop request wins over a racing completion.
+    if ctx.stop.is_stopped() || matches!(&result, Err(PipelineError::Cancelled)) {
+        transition_status(
+            &ctx.pool,
+            &worksheet_id,
+            PipelineState::Cancelled,
+            None,
+            &[PipelineState::Running],
         )
-        .bind(worksheet_id)
-        .execute(pool)
         .await
         .ok();
-        jobs.jobs.lock().unwrap().remove(worksheet_id);
-        jobs.cancel.lock().unwrap().remove(worksheet_id);
-        emit_terminal(app, worksheet_id, "cancelled", None);
+        finish_job(
+            &ctx,
+            &PipelineStatus::terminal(PipelineState::Cancelled, None),
+        );
         return;
     }
 
     let (status, error) = match result {
-        Ok(()) => (String::from("done"), None),
-        Err(message) => {
-            eprintln!("[pipeline] worksheet {worksheet_id} failed: {message}");
-            (String::from("failed"), Some(message))
+        Ok(()) => (PipelineState::Done, None),
+        Err(error) => {
+            eprintln!("[pipeline] worksheet {worksheet_id} failed: {error}");
+            (PipelineState::Failed, Some(error.to_string()))
         }
     };
 
-    sqlx::query("UPDATE worksheets SET pipeline_status = ?, pipeline_error = ? WHERE id = ?")
-        .bind(&status)
-        .bind(&error)
-        .bind(worksheet_id)
-        .execute(pool)
-        .await
-        .ok();
-
-    jobs.jobs.lock().unwrap().remove(worksheet_id);
-    jobs.cancel.lock().unwrap().remove(worksheet_id);
-
-    emit_terminal(app, worksheet_id, &status, error);
+    let _ = persist_status(&ctx.pool, &worksheet_id, status, error.as_deref()).await;
+    finish_job(&ctx, &PipelineStatus::terminal(status, error));
 }
 
-fn emit_terminal(app: &AppHandle, worksheet_id: &str, status: &str, error: Option<String>) {
-    let _ = app.emit(
-        "pipeline-progress",
-        serde_json::json!({
-            "worksheet_id": worksheet_id,
-            "status": status,
-            "phase": null,
-            "artifact_type": null,
-            "done": 0,
-            "total": 0,
-            "types": [],
-            "types_done": 0,
-            "types_total": ArtifactType::ALL.len(),
-            "error": error,
-        }),
-    );
+fn finish_job(ctx: &RunCtx, status: &PipelineStatus) {
+    ctx.jobs.jobs.lock().unwrap().remove(&ctx.worksheet_id);
+    emit_status(&ctx.app, &ctx.worksheet_id, status);
 }
 
-/// Build the generation backend from the current provider configuration.
+fn emit_status(app: &AppHandle, worksheet_id: &str, status: &PipelineStatus) {
+    let mut value = serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
+    value["worksheet_id"] = worksheet_id.into();
+    let _ = app.emit("pipeline-progress", value);
+}
+
+fn generation_params(settings: &Arc<SettingsState>) -> super::generate::GenerationParams {
+    let artifacts = &settings.get().artifacts;
+    super::generate::GenerationParams {
+        temperature: artifacts.temperature,
+        max_tokens: artifacts.max_tokens.min(i32::MAX as u32) as i32,
+        seed: match artifacts.seed {
+            Some(seed) => seed as u64,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos() as u64)
+                .unwrap_or(0),
+        },
+    }
+}
+
 fn resolve_backend(
     settings: &Arc<SettingsState>,
-) -> Result<(Arc<dyn ArtifactBackend>, usize), String> {
+) -> PipelineResult<(Arc<dyn ArtifactBackend>, usize)> {
     let provider = settings.get().provider;
     let config = provider.active_config();
     if !config.is_configured() {
-        return Err(String::from(
+        return Err(PipelineError::Failed(String::from(
             "No inference provider is configured. Open Settings and add a provider.",
-        ));
+        )));
     }
-    // Key presence is the only signal: absent key → no Authorization header.
-    let api_key = provider::config::load_api_key(&provider.active)?.filter(|key| !key.is_empty());
+    let api_key = provider::config::active_key(&provider.active).map_err(PipelineError::Failed)?;
     let backend = OpenAiClient::new(&config.base_url, api_key, &config.model)
         .with_reasoning_effort(config.disable_thinking.then(|| String::from("none")));
     Ok((Arc::new(backend), config.concurrency))
 }
 
-async fn run_pipeline(
-    app: &AppHandle,
-    pool: &Pool<Sqlite>,
-    settings: &Arc<SettingsState>,
-    jobs: &Arc<PipelineJobs>,
-    cancel: &Arc<AtomicBool>,
-    worksheet_id: &str,
-) -> Result<(), String> {
-    if is_cancelled(cancel) {
-        return Err(String::from(CANCELLED_MESSAGE));
-    }
-    sqlx::query(
-        "UPDATE worksheets SET pipeline_status = 'running', pipeline_error = NULL WHERE id = ?",
-    )
-    .bind(worksheet_id)
-    .execute(pool)
-    .await
-    .map_err(|_| String::from("Failed to mark worksheet as running"))?;
+async fn run_pipeline(ctx: &RunCtx) -> PipelineResult<()> {
+    ctx.check_cancelled()?;
+    persist_status(&ctx.pool, &ctx.worksheet_id, PipelineState::Running, None)
+        .await
+        .map_err(|_| PipelineError::Failed(String::from("Failed to mark worksheet as running")))?;
 
     let file_ids: Vec<String> =
         sqlx::query_scalar("SELECT id FROM files WHERE worksheet_id = ? ORDER BY created_at")
-            .bind(worksheet_id)
-            .fetch_all(pool)
+            .bind(&ctx.worksheet_id)
+            .fetch_all(&ctx.pool)
             .await
-            .map_err(|_| String::from("Failed to load files"))?;
+            .map_err(|e| PipelineError::Failed(format!("Failed to load files: {e}")))?;
 
     if file_ids.is_empty() {
-        return Err(String::from("Worksheet has no files to process."));
+        return Err(PipelineError::NoFiles);
     }
 
-    // Resume from unchunked parts: only ingest files that have no chunks yet.
-    let pending_files = super::unchunked_files(pool, worksheet_id, &file_ids).await?;
+    let pending_files = super::unchunked_files(&ctx.pool, &ctx.worksheet_id, &file_ids).await?;
 
-    // Resolve the cloud backend before doing any local work so a missing
-    // configuration fails fast with an actionable message.
-    let (backend, concurrency) = resolve_backend(settings)?;
+    // Fail fast on missing provider config before doing any local work.
+    let (backend, concurrency) = resolve_backend(&ctx.settings)?;
+    let generation = generation_params(&ctx.settings);
     let tokenizer = segment::bundled_tokenizer()?;
-    let logs = Arc::new(
-        crate::logging::RunLogs::new()
-            .ok_or_else(|| String::from("Failed to resolve log directory"))?,
-    );
+    let logs = Arc::new(crate::logging::RunLogs::new());
 
-    let on_ingest = progress_sink(app, jobs, worksheet_id);
-    let start_position = super::next_segment_position(pool, worksheet_id).await?;
-
-    // Reuse already-ingested chunks for any file whose content matches an
-    // existing source, rather than re-parsing/segmenting a duplicate.
+    let start_position = super::next_segment_position(&ctx.pool, &ctx.worksheet_id).await?;
     let (to_parse, start_position) =
-        super::reuse_chunks(pool, worksheet_id, &pending_files, start_position).await?;
+        super::reuse_chunks(&ctx.pool, &ctx.worksheet_id, &pending_files, start_position).await?;
 
-    if is_cancelled(cancel) {
-        return Err(String::from(CANCELLED_MESSAGE));
-    }
+    ctx.check_cancelled()?;
     let tokenizer = Arc::new(tokenizer);
     super::process_files(
-        pool,
-        worksheet_id,
+        &ctx.pool,
+        &ctx.worksheet_id,
         &to_parse,
         start_position,
         tokenizer,
-        Some(on_ingest),
         Some(logs.clone()),
-        Some(cancel.clone()),
+        ctx.stop.clone(),
     )
     .await?;
-    if is_cancelled(cancel) {
-        return Err(String::from(CANCELLED_MESSAGE));
-    }
+    ctx.check_cancelled()?;
 
-    set_phase(jobs, worksheet_id, "generating", None);
+    ctx.set_phase(Phase::Generating, None);
 
-    let segments = super::load_segments(pool, worksheet_id).await?;
-    let existing = super::load_existing_artifacts(pool, worksheet_id).await?;
-    let on_generate = generate_progress_sink(app, jobs, worksheet_id);
+    let segments = super::load_segments(&ctx.pool, &ctx.worksheet_id).await?;
+    let existing = super::load_existing_artifacts(&ctx.pool, &ctx.worksheet_id).await?;
     let started = std::time::Instant::now();
 
-    // Per-item quiz artifacts persist synchronously as each unit completes so
-    // an interruption keeps finished parts. Merged types (Summary/MindMap) are
-    // returned below and persisted once in `pending`.
+    // Per-item artifacts persist as each unit completes so an interruption
+    // keeps finished parts; merged types persist once below.
     let on_persist = {
-        let pool = pool.clone();
-        let worksheet_id = worksheet_id.to_string();
+        let pool = ctx.pool.clone();
+        let worksheet_id = ctx.worksheet_id.clone();
         Arc::new(move |artifacts: Vec<super::generate::PendingArtifact>| {
             let pool = pool.clone();
             let worksheet_id = worksheet_id.clone();
@@ -486,16 +480,14 @@ async fn run_pipeline(
         concurrency,
         &segments,
         existing,
-        None,
+        Some(generation),
         Some(on_persist),
-        Some(on_generate),
+        Some(ctx.generate_sink()),
         Some(logs.clone()),
-        Some(cancel.clone()),
+        ctx.stop.clone(),
     )
     .await?;
-    if is_cancelled(cancel) {
-        return Err(String::from(CANCELLED_MESSAGE));
-    }
+    ctx.check_cancelled()?;
     println!(
         "[{}] [pipeline] generated {} merged artifacts across {} requests (~{}k in / ~{}k out tokens) in {:?}",
         crate::logging::rfc3339_utc(),
@@ -506,67 +498,9 @@ async fn run_pipeline(
         started.elapsed()
     );
 
-    super::persist_artifacts(pool, worksheet_id, &pending).await?;
+    super::persist_artifacts(&ctx.pool, &ctx.worksheet_id, &pending).await?;
 
     Ok(())
-}
-
-fn progress_sink(
-    app: &AppHandle,
-    jobs: &Arc<PipelineJobs>,
-    worksheet_id: &str,
-) -> Box<dyn FnMut(usize, usize) + Send> {
-    let app = app.clone();
-    let jobs = jobs.clone();
-    let worksheet_id = worksheet_id.to_string();
-    Box::new(move |done, total| {
-        {
-            let mut running = jobs.jobs.lock().unwrap();
-            if let Some(job) = running.get_mut(&worksheet_id) {
-                job.done = done;
-                job.total = total;
-            }
-        }
-        emit_progress(&app, &jobs, &worksheet_id);
-    })
-}
-
-fn generate_progress_sink(
-    app: &AppHandle,
-    jobs: &Arc<PipelineJobs>,
-    worksheet_id: &str,
-) -> super::generate::ProgressFn {
-    let app = app.clone();
-    let jobs = jobs.clone();
-    let worksheet_id = worksheet_id.to_string();
-    Arc::new(move |tick| {
-        {
-            let mut running = jobs.jobs.lock().unwrap();
-            if let Some(job) = running.get_mut(&worksheet_id) {
-                job.artifact_type = tick.artifact_type;
-                job.done = tick.done;
-                job.total = tick.total;
-                job.per_type = tick.per_type;
-                job.types_done = tick.types_done;
-            }
-        }
-        emit_progress(&app, &jobs, &worksheet_id);
-    })
-}
-
-fn set_phase(
-    jobs: &Arc<PipelineJobs>,
-    worksheet_id: &str,
-    phase: &str,
-    artifact_type: Option<ArtifactType>,
-) {
-    let mut running = jobs.jobs.lock().unwrap();
-    if let Some(job) = running.get_mut(worksheet_id) {
-        job.phase = phase.to_string();
-        job.artifact_type = artifact_type;
-        job.done = 0;
-        job.total = 0;
-    }
 }
 
 fn emit_progress(app: &AppHandle, jobs: &Arc<PipelineJobs>, worksheet_id: &str) {
@@ -574,22 +508,16 @@ fn emit_progress(app: &AppHandle, jobs: &Arc<PipelineJobs>, worksheet_id: &str) 
     let Some(job) = snapshot else {
         return;
     };
-    let _ = app.emit(
-        "pipeline-progress",
-        serde_json::json!({
-            "worksheet_id": worksheet_id,
-            "status": "running",
-            "phase": job.phase,
-            "artifact_type": job.artifact_type.as_ref().map(ArtifactType::to_db),
-            "done": job.done,
-            "total": job.total,
-            "types": job.per_type,
-            "types_done": job.types_done,
-            "types_total": job.types_total,
-            "requests_done": job.requests_done,
-            "tokens_in": job.tokens_in,
-            "tokens_out": job.tokens_out,
-            "error": null,
-        }),
+    emit_status(
+        app,
+        worksheet_id,
+        &PipelineStatus::running(
+            job.phase,
+            job.artifact_type,
+            job.done,
+            job.total,
+            job.per_type,
+            job.types_done,
+        ),
     );
 }

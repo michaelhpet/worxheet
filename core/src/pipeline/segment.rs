@@ -1,24 +1,17 @@
-//! Turns parsed document blocks into contiguous, ordered generation units.
-//!
-//! Strategy: structure first (every heading starts a new candidate section,
-//! sections are packed up to [`TARGET_SEGMENT_TOKENS`]), then token-bounded
-//! sentence packing for any oversized structureless stretch. Every input token
-//! lands in exactly one segment: coverage is exhaustive by construction. The
-//! segmentation is purely structural — the vendored tokenizer (bundled into the
-//! binary) provides token-count semantics, so no external model is required.
+//! Turns parsed document blocks into contiguous, ordered generation units:
+//! structure first, then token-bounded sentence packing. Purely structural —
+//! no model required.
 
 use tokenizers::Tokenizer;
 
-/// Preferred size of one segment.
 pub const TARGET_SEGMENT_TOKENS: usize = 1_100;
-/// Hard ceiling before splitting kicks in.
+
 pub const MAX_SEGMENT_TOKENS: usize = 1_800;
-/// Below this, neighboring fragments are merged instead of standing alone.
+
 pub const MIN_SEGMENT_TOKENS: usize = 150;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
-    /// Heading with its level (1 = top).
     Heading(u8),
     Body,
 }
@@ -29,7 +22,6 @@ pub struct Block {
     pub text: String,
 }
 
-/// A finished segment before it is persisted.
 #[derive(Clone, Debug)]
 pub struct SegmentDraft {
     pub heading: Option<String>,
@@ -37,17 +29,13 @@ pub struct SegmentDraft {
     pub tokens: usize,
 }
 
-/// Load the tokenizer vendored into the binary. Parseable offline; used for
-/// token-count semantics in tests and ingest without any model download.
-pub fn bundled_tokenizer() -> Result<Tokenizer, String> {
+pub fn bundled_tokenizer() -> super::PipelineResult<Tokenizer> {
     const TOKENIZER_JSON: &str = include_str!("../../assets/tokenizer.json");
-    Tokenizer::from_bytes(TOKENIZER_JSON)
-        .map_err(|e| format!("Failed to parse bundled tokenizer: {e}"))
+    Tokenizer::from_bytes(TOKENIZER_JSON).map_err(|e| {
+        super::PipelineError::Failed(format!("Failed to parse bundled tokenizer: {e}"))
+    })
 }
 
-/// In-memory tokenization cost tally, accumulated during one file's
-/// segmentation and flushed to a log afterwards, so the hot tokenization loop
-/// never performs disk I/O.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TokenizeTrace {
     pub calls: usize,
@@ -66,10 +54,8 @@ fn token_count(tokenizer: &Tokenizer, text: &str, trace: Option<&mut TokenizeTra
     tokens
 }
 
-/// Parallel precompute of per-block token counts. The tokenizer is the
-/// dominant cost of packing, so bodies are encoded in parallel (disjoint
-/// blocks per thread); the caller-visible [`TokenizeTrace`] is never touched
-/// from worker threads — each returns a local tally that is summed afterwards.
+/// Parallel precompute of per-block token counts; workers return local tallies
+/// so the shared trace is never touched from worker threads.
 fn parallel_body_counts(blocks: &[Block], tokenizer: &Tokenizer) -> (Vec<usize>, TokenizeTrace) {
     let body_indices: Vec<usize> = blocks
         .iter()
@@ -121,10 +107,6 @@ fn parallel_body_counts(blocks: &[Block], tokenizer: &Tokenizer) -> (Vec<usize>,
     (counts, tallies)
 }
 
-/// Split raw text into sentences on terminal punctuation followed by
-/// whitespace or end-of-line. Decimal points ("3.14"), ellipses ("..." /
-/// "…"), and common abbreviations ("Dr.", "e.g.", "U.S.") never terminate a
-/// sentence.
 pub fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut carry = String::new();
@@ -142,19 +124,16 @@ pub fn split_sentences(text: &str) -> Vec<String> {
                     .chars()
                     .next()
                     .is_none_or(|c| c.is_ascii_whitespace());
-            // Don't split on decimal points: "3.14" → keep intact
             let prev_char = line[..position].chars().next_back();
             let next_char = line[position + ch.len_utf8()..].chars().next();
             let is_decimal = ch == '.'
                 && prev_char.is_some_and(|c| c.is_ascii_digit())
                 && next_char.is_some_and(|c| c.is_ascii_digit());
-            // Don't split on ellipses: "..." or "…" → keep intact
             let is_ellipsis = ch == '.'
                 && (prev_char == Some('.')
                     || next_char == Some('.')
                     || prev_char == Some('…')
                     || next_char == Some('…'));
-            // Don't split on common abbreviations: "e.g.", "Dr.", "vs." → keep intact
             let is_abbreviation = ch == '.' && is_known_abbreviation(&line[..=position]);
             if is_terminal && !is_decimal && !is_ellipsis && !is_abbreviation {
                 let piece = line[start..=position + ch.len_utf8() - 1].trim();
@@ -185,8 +164,6 @@ pub fn split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// True if the text ending at the given trailing period is a known
-/// abbreviation that must not terminate a sentence ("e.g.", "Dr.", "U.S.").
 fn is_known_abbreviation(token_end: &str) -> bool {
     const ABBREVIATIONS: &[&str] = &[
         "a.m.", "dr.", "e.g.", "etc.", "i.e.", "mr.", "mrs.", "ms.", "no.", "p.m.", "prof.",
@@ -196,8 +173,7 @@ fn is_known_abbreviation(token_end: &str) -> bool {
     if bytes.last() != Some(&b'.') {
         return false;
     }
-    // Walk back over letters and inner dots to capture the whole token
-    // ("e.g.", "U.S."), stopping at any other separator.
+
     let mut start = bytes.len() - 1;
     while start > 0 {
         let b = bytes[start - 1];
@@ -223,24 +199,17 @@ fn flush_draft(drafts: &mut Vec<SegmentDraft>, heading: Option<String>, text: &s
 }
 
 /// Group blocks into heading-scoped sections no larger than
-/// [`TARGET_SEGMENT_TOKENS`]. `on_progress` (when given) reports
-/// `(blocks_processed, total_blocks)` so ingestion can keep advancing its
-/// progress bar through the (CPU-heavy) tokenization of this stage.
+/// [`TARGET_SEGMENT_TOKENS`].
 pub fn pack_sections(
     blocks: &[Block],
     tokenizer: &Tokenizer,
-    mut on_progress: Option<&mut dyn FnMut(usize, usize)>,
     mut trace: Option<&mut TokenizeTrace>,
 ) -> Vec<SegmentDraft> {
     let mut drafts: Vec<SegmentDraft> = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
     let mut current_tokens = 0usize;
-    let total_blocks = blocks.len();
 
-    // Body token counts are the bulk of packing cost; encode them once, in
-    // parallel, then reuse the cached counts for the oversized check and for
-    // single-piece bodies (killing the previous double tokenization).
     let (block_tokens, parallel_trace) = parallel_body_counts(blocks, tokenizer);
     if let Some(trace) = trace.as_deref_mut() {
         trace.calls += parallel_trace.calls;
@@ -248,9 +217,6 @@ pub fn pack_sections(
     }
 
     for (block_index, block) in blocks.iter().enumerate() {
-        if let Some(on_progress) = on_progress.as_deref_mut() {
-            on_progress(block_index + 1, total_blocks);
-        }
         match block.kind {
             BlockKind::Heading(_) => {
                 flush_draft(
@@ -272,8 +238,6 @@ pub fn pack_sections(
                     continue;
                 }
                 let body_tokens = block_tokens[block_index];
-                // Oversized paragraphs are broken into sentences so packing
-                // can chunk them against the target size.
                 let sentence_pieces: Vec<String>;
                 let pieces: Vec<&str> = if body_tokens > TARGET_SEGMENT_TOKENS {
                     sentence_pieces = split_sentences(body);
@@ -282,8 +246,6 @@ pub fn pack_sections(
                     vec![body]
                 };
                 for piece in &pieces {
-                    // Single-piece bodies reuse the precomputed parallel count;
-                    // oversized bodies tokenize each sentence piece as before.
                     let tokens = if pieces.len() == 1 {
                         body_tokens
                     } else {
@@ -355,18 +317,12 @@ fn hard_windows_fallback(
         .collect()
 }
 
-/// Full segmentation pipeline for one file's parsed blocks. `on_progress`
-/// (when given) reports `(blocks_processed, total_blocks)` as sections are
-/// packed, advancing the ingest progress bar through tokenization. `trace`
-/// (when given) accumulates every tokenization call so callers can log the
-/// cost once per file.
 pub fn segment_blocks(
     blocks: Vec<Block>,
     tokenizer: &Tokenizer,
-    on_progress: Option<&mut dyn FnMut(usize, usize)>,
     mut trace: Option<&mut TokenizeTrace>,
 ) -> Vec<SegmentDraft> {
-    let sections = pack_sections(&blocks, tokenizer, on_progress, trace.as_deref_mut());
+    let sections = pack_sections(&blocks, tokenizer, trace.as_deref_mut());
     let mut drafts = Vec::with_capacity(sections.len());
     for section in sections {
         if section.tokens <= MAX_SEGMENT_TOKENS {
@@ -382,12 +338,8 @@ pub fn segment_blocks(
     merge_undersized(drafts, tokenizer)
 }
 
-/// Merge consecutive undersized drafts so tiny slivers never reach the LLM.
-/// Heading boundaries are respected only as a tie-breaker preference; any
-/// sub-`MIN_SEGMENT_TOKENS` fragment merges into a neighbor regardless of
-/// heading, otherwise a marker-like sliver between differently-headed sections
-/// (e.g. a bare page marker after a heading bump) survives as a standalone
-/// content-less segment.
+/// Sub-`MIN_SEGMENT_TOKENS` fragments always merge into a neighbor, even
+/// across heading boundaries, or marker slivers survive as content-less units.
 fn merge_undersized(mut drafts: Vec<SegmentDraft>, _tokenizer: &Tokenizer) -> Vec<SegmentDraft> {
     if drafts.len() <= 1 {
         return drafts;
@@ -422,8 +374,6 @@ fn merge_undersized(mut drafts: Vec<SegmentDraft>, _tokenizer: &Tokenizer) -> Ve
 mod tests {
     use super::*;
 
-    // The bundled production tokenizer keeps token-count semantics honest in
-    // tests without downloading any model artifact.
     fn test_tokenizer() -> Tokenizer {
         bundled_tokenizer().expect("bundled tokenizer should parse")
     }
@@ -445,7 +395,7 @@ mod tests {
             block(BlockKind::Body, "Beta body text."),
         ];
 
-        let drafts = pack_sections(&blocks, &tokenizer, None, None);
+        let drafts = pack_sections(&blocks, &tokenizer, None);
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts[0].heading.as_deref(), Some("Chapter 1"));
         assert_eq!(drafts[0].text, "Alpha body text.");
@@ -461,7 +411,7 @@ mod tests {
                 .repeat(150);
         let blocks = vec![block(BlockKind::Body, &long_body)];
 
-        let drafts = pack_sections(&blocks, &tokenizer, None, None);
+        let drafts = pack_sections(&blocks, &tokenizer, None);
         assert!(
             drafts.len() >= 2,
             "long body should be packed into multiple sections"
@@ -529,7 +479,7 @@ mod tests {
         let repeat = 200;
         let blocks = vec![block(BlockKind::Body, &sentence.repeat(repeat))];
 
-        let drafts = segment_blocks(blocks, &tokenizer, None, None);
+        let drafts = segment_blocks(blocks, &tokenizer, None);
         assert!(
             drafts.len() >= 2,
             "long body must be split into multiple segments"
@@ -577,9 +527,6 @@ mod tests {
 
     #[test]
     fn test_merge_undersized_merges_across_heading_boundaries() {
-        // A bare sliver (e.g. a leftover page marker) flush-stuck between
-        // differently-headed sections must not survive standalone: merge it
-        // into the real section that follows and keep that section's heading.
         let tokenizer = test_tokenizer();
         let drafts = vec![
             SegmentDraft {

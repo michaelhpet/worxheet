@@ -74,9 +74,7 @@ pub fn run() {
         .expect("Error while running application");
 }
 
-/// Native application menu. The macOS app-name submenu carries the
-/// conventional "Preferences…" item (⌘,); selecting it relays a
-/// `settings:open` event the frontend settings dialog listens for.
+/// Relays the native Preferences item as a `settings:open` event.
 fn setup_native_menu(handle: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let preferences = MenuItemBuilder::with_id("preferences", "Preferences…")
         .accelerator("CmdOrCtrl+Comma")

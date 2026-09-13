@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::schema::Paginated;
+use crate::schema::{ArtifactType, Paginated};
 
 #[derive(Serialize, Deserialize)]
 pub struct Worksheet {
@@ -13,12 +13,9 @@ pub struct Worksheet {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
-    /// One of `idle`/`running`/`done`/`failed`/`cancelled`.
     pub pipeline_status: String,
     pub file_count: i64,
-    /// Distinct, uppercased file extensions, e.g. `["PDF", "DOCX"]`.
     pub file_extensions: Vec<String>,
-    /// Counts for the quiz artifact types only.
     pub quiz_counts: HashMap<String, i64>,
 }
 
@@ -37,8 +34,6 @@ pub struct WorksheetDetail {
     pub artifact_counts: HashMap<String, i64>,
 }
 
-const QUIZ_ARTIFACT_TYPES: [&str; 3] = ["MultipleChoiceQuiz", "EssayQuiz", "CompletionQuiz"];
-
 impl Worksheet {
     pub fn new(name: &str) -> Self {
         Self {
@@ -54,33 +49,40 @@ impl Worksheet {
     }
 }
 
-/// For each worksheet id, its file count and distinct uppercased extensions.
 async fn aggregate_file_extensions(
     pool: &sqlx::SqlitePool,
-    ids: &[(String,)],
+    ids: &[String],
 ) -> Result<HashMap<String, (i64, Vec<String>)>, String> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT worksheet_id, extension FROM files")
-        .fetch_all(pool)
-        .await
-        .map_err(|_| String::from("Failed to query file extensions"))?;
-
-    let id_set: std::collections::HashSet<String> = ids.iter().map(|(id,)| id.clone()).collect();
-    let mut out: HashMap<String, (i64, Vec<String>)> = HashMap::new();
-    for (worksheet_id, extension) in rows {
-        if !id_set.contains(&worksheet_id) {
-            continue;
-        }
-        let entry = out.entry(worksheet_id).or_insert((0, Vec::new()));
-        entry.0 += 1;
-        let ext = extension.to_uppercase();
-        if !entry.1.contains(&ext) {
-            entry.1.push(ext);
-        }
+    let mut builder = sqlx::QueryBuilder::new(
+        "SELECT worksheet_id, COUNT(*), GROUP_CONCAT(DISTINCT UPPER(extension))
+         FROM files WHERE worksheet_id IN (",
+    );
+    let mut separated = builder.separated(", ");
+    for id in ids {
+        separated.push_bind(id);
     }
-    Ok(out)
+    separated.push_unseparated(") GROUP BY worksheet_id");
+
+    let rows: Vec<(String, i64, Option<String>)> =
+        builder
+            .build_query_as()
+            .fetch_all(pool)
+            .await
+            .map_err(|_| String::from("Failed to query file extensions"))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(worksheet_id, count, extensions)| {
+            let mut extensions: Vec<String> = extensions
+                .map(|list| list.split(',').map(String::from).collect())
+                .unwrap_or_default();
+            extensions.sort();
+            (worksheet_id, (count, extensions))
+        })
+        .collect())
 }
 
 pub async fn get_worksheets(
@@ -108,9 +110,9 @@ pub async fn get_worksheets(
     .await
     .map_err(|_| String::from("Could not fetch worksheets"))?;
 
-    let total_pages = (total.0 as f64 / per_page as f64).ceil() as i64;
+    let total_pages = (total.0 + per_page - 1) / per_page;
 
-    let page_ids: Vec<(String,)> = base.iter().map(|(id, ..)| (id.clone(),)).collect();
+    let page_ids: Vec<String> = base.iter().map(|(id, ..)| id.clone()).collect();
     let files = aggregate_file_extensions(pool, &page_ids).await?;
     let quiz_counts = aggregate_quiz_counts(pool, &page_ids).await?;
 
@@ -141,43 +143,36 @@ pub async fn get_worksheets(
     })
 }
 
-/// Quiz-artifact counts keyed by worksheet id.
 async fn aggregate_quiz_counts(
     pool: &sqlx::SqlitePool,
-    ids: &[(String,)],
+    ids: &[String],
 ) -> Result<HashMap<String, HashMap<String, i64>>, String> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let id_set: std::collections::HashSet<String> = ids.iter().map(|(id,)| id.clone()).collect();
-
-    let mut placeholders = Vec::new();
-    for i in 0..QUIZ_ARTIFACT_TYPES.len() {
-        placeholders.push(format!("?{}", i + 1));
-    }
-    let in_list = placeholders.join(", ");
-
-    let sql = format!(
+    let mut builder = sqlx::QueryBuilder::new(
         "SELECT worksheet_id, artifact_type, COUNT(*)
-         FROM artifacts
-         WHERE artifact_type IN ({in_list})
-         GROUP BY worksheet_id, artifact_type"
+         FROM artifacts WHERE artifact_type IN (",
     );
-
-    let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
-    for art_type in QUIZ_ARTIFACT_TYPES {
-        query = query.bind(art_type);
+    let mut separated = builder.separated(", ");
+    for quiz_type in ArtifactType::QUIZ {
+        separated.push_bind(quiz_type.to_db());
     }
-    let rows = query
+    separated.push_unseparated(") AND worksheet_id IN (");
+    let mut separated = builder.separated(", ");
+    for id in ids {
+        separated.push_bind(id);
+    }
+    separated.push_unseparated(") GROUP BY worksheet_id, artifact_type");
+
+    let rows: Vec<(String, String, i64)> = builder
+        .build_query_as()
         .fetch_all(pool)
         .await
         .map_err(|_| String::from("Failed to query quiz counts"))?;
 
     let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
     for (worksheet_id, artifact_type, count) in rows {
-        if !id_set.contains(&worksheet_id) {
-            continue;
-        }
         out.entry(worksheet_id)
             .or_default()
             .insert(artifact_type, count);
@@ -211,10 +206,11 @@ pub async fn get_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<Workshee
 
     let artifact_counts = rows.into_iter().collect();
 
-    let (file_count, file_extensions) = aggregate_file_extensions(pool, &[(id.to_string(),)])
-        .await?
-        .remove(id)
-        .unwrap_or((0, Vec::new()));
+    let (file_count, file_extensions) =
+        aggregate_file_extensions(pool, std::slice::from_ref(&id.to_string()))
+            .await?
+            .remove(id)
+            .unwrap_or((0, Vec::new()));
 
     Ok(WorksheetDetail {
         id: id.to_string(),
@@ -258,18 +254,8 @@ pub async fn create_worksheet(
         .map_err(|_| String::from("Failed to create new worksheet"))?;
 
     for file_path in &files {
-        let path = std::path::Path::new(file_path);
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| format!("Invalid file path: {}", file_path))?
-            .to_string_lossy()
-            .to_string();
-        let extension = path
-            .extension()
-            .ok_or_else(|| format!("File has no extension: {}", file_path))?
-            .to_string_lossy()
-            .to_string();
-        let (identity, size) = file_identity_key(file_path)?;
+        let parts = file_parts(file_path)?;
+        let identity = identity_key(file_path, &parts);
 
         let file_id = Ulid::new().to_string();
 
@@ -279,9 +265,9 @@ pub async fn create_worksheet(
         .bind(&file_id)
         .bind(&worksheet.id)
         .bind(file_path)
-        .bind(&file_name)
-        .bind(&extension)
-        .bind(size as i64)
+        .bind(&parts.name)
+        .bind(&parts.extension)
+        .bind(parts.size as i64)
         .bind(&identity)
         .execute(&mut *transaction)
         .await
@@ -303,46 +289,52 @@ pub struct FileMetadata {
     size: u64,
 }
 
-/// Source-file identity key: absolute path + size + modified time. Used to
-/// detect an already-ingested copy of the same file so its chunks can be
-/// reused without re-parsing. Path+size+mtime never collide for distinct,
-/// unchanged files, and an edited file bumps mtime (usually size too), forcing
-/// a fresh parse. Returns the key and the size for the `files.size` column.
-pub fn file_identity_key(path: &str) -> Result<(String, u64), String> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("Failed to read metadata for '{}': {}", path, e))?;
-    let size = metadata.len();
-    let modified = metadata
-        .modified()
-        .map_err(|e| format!("Failed to read modified time for '{}': {}", path, e))?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("Failed to read modified time for '{}': {}", path, e))?
-        .as_nanos();
-    Ok((format!("{path}\u{1f}{size}\u{1f}{modified}"), size))
+struct FileParts {
+    name: String,
+    extension: String,
+    size: u64,
+    modified_nanos: u128,
 }
 
-pub fn get_file_metadata(path: &str) -> Result<FileMetadata, String> {
-    let path_data = std::path::Path::new(path);
-
-    let name = match path_data.file_name() {
-        None => return Err(String::from("Failed to get file name")),
-        Some(name) => name.to_string_lossy().to_string(),
-    };
-
-    let extension = match path_data.extension() {
-        None => return Err(String::from("Failed to get file extension")),
-        Some(extension) => extension.to_string_lossy().to_string(),
-    };
-
-    let metadata = match path_data.metadata() {
-        Err(error) => return Err(error.to_string()),
-        Ok(metadata) => metadata,
-    };
-
-    Ok(FileMetadata {
+fn file_parts(path: &str) -> Result<FileParts, String> {
+    let parsed = std::path::Path::new(path);
+    let name = parsed
+        .file_name()
+        .ok_or_else(|| format!("Invalid file path: {path}"))?
+        .to_string_lossy()
+        .to_string();
+    let extension = parsed
+        .extension()
+        .ok_or_else(|| format!("File has no extension: {path}"))?
+        .to_string_lossy()
+        .to_string();
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read metadata for '{path}': {e}"))?;
+    let modified_nanos = metadata
+        .modified()
+        .map_err(|e| format!("Failed to read modified time for '{path}': {e}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Failed to read modified time for '{path}': {e}"))?
+        .as_nanos();
+    Ok(FileParts {
         name,
         extension,
         size: metadata.len(),
+        modified_nanos,
+    })
+}
+
+/// Absolute path + size + mtime; an edited file bumps mtime, forcing a re-parse.
+fn identity_key(path: &str, parts: &FileParts) -> String {
+    format!("{path}\u{1f}{}\u{1f}{}", parts.size, parts.modified_nanos)
+}
+
+pub fn get_file_metadata(path: &str) -> Result<FileMetadata, String> {
+    let parts = file_parts(path)?;
+    Ok(FileMetadata {
+        name: parts.name,
+        extension: parts.extension,
+        size: parts.size,
     })
 }
 
@@ -351,6 +343,92 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    async fn setup_db() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations");
+        pool
+    }
+
+    async fn seed_worksheet(pool: &sqlx::SqlitePool, id: &str) {
+        sqlx::query("INSERT INTO worksheets (id, name) VALUES (?, ?)")
+            .bind(id)
+            .bind("test")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn seed_file(pool: &sqlx::SqlitePool, worksheet_id: &str, extension: &str) {
+        sqlx::query(
+            "INSERT INTO files (id, worksheet_id, path, name, extension, size, sha256)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ulid::Ulid::new().to_string())
+        .bind(worksheet_id)
+        .bind("/tmp/x")
+        .bind("x")
+        .bind(extension)
+        .bind(1i64)
+        .bind("k")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_artifact(pool: &sqlx::SqlitePool, worksheet_id: &str, artifact_type: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(ulid::Ulid::new().to_string())
+        .bind(worksheet_id)
+        .bind(artifact_type)
+        .bind("src")
+        .bind("{}")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_aggregates_scope_to_requested_worksheets() {
+        let pool = setup_db().await;
+        seed_worksheet(&pool, "ws-1").await;
+        seed_worksheet(&pool, "ws-2").await;
+        seed_file(&pool, "ws-1", "pdf").await;
+        seed_file(&pool, "ws-1", "PDF").await;
+        seed_file(&pool, "ws-1", "docx").await;
+        seed_file(&pool, "ws-2", "png").await;
+        seed_artifact(&pool, "ws-1", "MultipleChoiceQuiz").await;
+        seed_artifact(&pool, "ws-1", "MultipleChoiceQuiz").await;
+        seed_artifact(&pool, "ws-2", "EssayQuiz").await;
+
+        let files = aggregate_file_extensions(&pool, &["ws-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files["ws-1"],
+            (3, vec!["DOCX".to_string(), "PDF".to_string()])
+        );
+
+        let counts = aggregate_quiz_counts(&pool, &["ws-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts["ws-1"]["MultipleChoiceQuiz"], 2);
+
+        assert!(aggregate_file_extensions(&pool, &[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     fn temp_path(name: &str) -> String {
         let dir = std::env::temp_dir().join("worxheet-test");
@@ -398,14 +476,19 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    fn identity_of(path: &str) -> (String, u64) {
+        let parts = file_parts(path).unwrap();
+        (identity_key(path, &parts), parts.size)
+    }
+
     #[test]
     fn test_file_identity_key_stable_for_unchanged_file() {
         let path = temp_path("identity_a.txt");
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"hello").unwrap();
 
-        let (key1, size1) = file_identity_key(&path).unwrap();
-        let (key2, size2) = file_identity_key(&path).unwrap();
+        let (key1, size1) = identity_of(&path);
+        let (key2, size2) = identity_of(&path);
         assert_eq!(size1, 5);
         assert_eq!(size2, 5);
         assert_eq!(key1, key2, "unchanged file must keep its identity key");
@@ -413,7 +496,7 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
 
-        let missing = file_identity_key(&path);
+        let missing = file_parts(&path);
         assert!(missing.is_err(), "missing file must error");
     }
 
@@ -421,12 +504,15 @@ mod tests {
     fn test_file_identity_key_changes_when_file_rewritten() {
         let path = temp_path("identity_b.txt");
         fs::write(&path, b"hello").unwrap();
-        let (before, _) = file_identity_key(&path).unwrap();
+        let (before, _) = identity_of(&path);
 
         fs::write(&path, b"hello world!").unwrap();
-        let (after, size_after) = file_identity_key(&path).unwrap();
+        let (after, size_after) = identity_of(&path);
 
-        assert_ne!(before, after, "rewriting the file must change its identity key");
+        assert_ne!(
+            before, after,
+            "rewriting the file must change its identity key"
+        );
         assert_eq!(size_after, 12);
         fs::remove_file(&path).unwrap();
     }

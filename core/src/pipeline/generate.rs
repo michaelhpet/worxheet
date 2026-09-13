@@ -1,16 +1,10 @@
-//! Cloud-hosted artifact generation.
-//!
-//! Every segment feeds one request per artifact type; requests run under a
-//! semaphore so bulk generation stays inside provider rate limits. Each unit
-//! gets exactly one model turn — a failed turn (empty reply, malformed or
-//! hallucinated output) drops that segment's items rather than retrying.
-//! Summary and MindMap are assembled deterministically from per-segment
-//! sections, so coverage is exhaustive.
+//! Cloud-hosted artifact generation: one model turn per unit, no retries;
+//! merged types assemble deterministically from per-segment sections.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::{is_cancel_requested, CANCELLED_MESSAGE};
+use super::{PipelineError, PipelineResult, Stop};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +12,8 @@ use crate::logging::{self, RunLogs};
 use crate::provider::{ArtifactBackend, GenerateRequest};
 use crate::schema::{ArtifactType, Segment, TypeProgress};
 
-use super::validate::{self, references_missing_media, similarity, ItemVerdict};
+use super::validate::{self, ItemVerdict};
 
-/// Sampling parameters applied to every generation request unless overridden.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GenerationParams {
     pub temperature: f32,
@@ -38,58 +31,115 @@ impl Default for GenerationParams {
     }
 }
 
-/// Quiz types stay at their configured temperature; summarization benefits
-/// from cooler sampling regardless of global settings.
-fn temperature_for(artifact_type: &ArtifactType, params: &GenerationParams) -> f32 {
-    let _ = params;
+struct ArtifactSpec {
+    task: &'static str,
+    example: Option<&'static str>,
+    temperature: Option<f32>,
+    max_tokens: Option<i32>,
+    items_field: Option<&'static str>,
+    schema: fn() -> serde_json::Value,
+}
+
+fn spec(artifact_type: &ArtifactType) -> &'static ArtifactSpec {
+    static MCQ: ArtifactSpec = ArtifactSpec {
+        task: "Write multiple-choice questions testing analysis, application, or evaluation \
+               of the material below. Write as many as the material genuinely supports — \
+               cover its key ideas, and never pad with shallow or near-identical questions. \
+               For every question:\n\
+               - Exactly 4 answer options in plain text: no lettering, numbering, or bullet marks.\n\
+               - Options must be mutually exclusive, comparable in length, plausible but clearly\n\
+               wrong to someone who knows the material.\n\
+               - Exactly one correct answer, written verbatim as one of the options.\n\
+               - Vary the position of the correct answer across questions.\n\
+               - One-sentence explanation citing the supporting fact.\n\
+               - Do not repeat near-identical questions.",
+        example: Some(MCQ_EXAMPLE),
+        temperature: None,
+        max_tokens: None,
+        items_field: Some("questions"),
+        schema: mcq_schema,
+    };
+    static ESSAY: ArtifactSpec = ArtifactSpec {
+        task: "Write essay questions that require students to explain, compare, or evaluate \
+               ideas from the material below. Write as many as the material genuinely supports. \
+               Each needs clear instructions and a concise suggested answer grounded in the material.",
+        example: None,
+        temperature: None,
+        max_tokens: None,
+        items_field: Some("questions"),
+        schema: essay_schema,
+    };
+    static COMPLETION: ArtifactSpec = ArtifactSpec {
+        task: "Write fill-in-the-blank statements drawn from the material below. Mark each blank \
+               with ____________. Write as many as the material genuinely supports. The expected \
+               answer must appear word-for-word in the material. Add a short hint per statement.",
+        example: None,
+        temperature: None,
+        max_tokens: None,
+        items_field: Some("items"),
+        schema: completion_schema,
+    };
+    static SUMMARY: ArtifactSpec = ArtifactSpec {
+        task: "Summarize this slice of the material: a short title, a focused paragraph capturing \
+               its main ideas.",
+        example: None,
+        temperature: Some(0.3),
+        max_tokens: Some(700),
+        items_field: None,
+        schema: summary_schema,
+    };
+    static MINDMAP: ArtifactSpec = ArtifactSpec {
+        task: "Extract the topic of this slice of the material and its major branches, each with short child concepts drawn from the material.",
+        example: None,
+        temperature: Some(0.4),
+        max_tokens: Some(900),
+        items_field: None,
+        schema: mindmap_schema,
+    };
     match artifact_type {
-        ArtifactType::Summary => 0.3,
-        ArtifactType::MindMap => 0.4,
-        _ => params.temperature,
+        ArtifactType::MultipleChoiceQuiz => &MCQ,
+        ArtifactType::EssayQuiz => &ESSAY,
+        ArtifactType::CompletionQuiz => &COMPLETION,
+        ArtifactType::Summary => &SUMMARY,
+        ArtifactType::MindMap => &MINDMAP,
     }
+}
+
+fn temperature_for(artifact_type: &ArtifactType, params: &GenerationParams) -> f32 {
+    spec(artifact_type)
+        .temperature
+        .unwrap_or(params.temperature)
 }
 
 fn max_tokens_for(artifact_type: &ArtifactType, params: &GenerationParams) -> i32 {
-    match artifact_type {
-        ArtifactType::Summary => params.max_tokens.min(700),
-        ArtifactType::MindMap => params.max_tokens.min(900),
-        _ => params.max_tokens,
+    match spec(artifact_type).max_tokens {
+        Some(cap) => params.max_tokens.min(cap),
+        None => params.max_tokens,
     }
 }
 
-/// Safety valve: beyond this many segments per type, sample evenly instead of
-/// fanning out unbounded request counts.
+/// Beyond this many segments per type, sample evenly instead of fanning out.
 const MAX_UNITS_PER_TYPE: usize = 48;
 
-/// Progress tick emitted as units complete.
 #[derive(Clone, Debug)]
 pub struct GenerationTick {
-    /// The artifact type whose unit most recently completed. `None` before the
-    /// first unit finishes (and during the ingesting phase).
     pub artifact_type: Option<ArtifactType>,
-    /// Units completed in the current phase, across all artifact types.
     pub done: usize,
-    /// Total units in the current phase, across all artifact types.
     pub total: usize,
-    /// Per-artifact-type progress for the current phase.
     pub per_type: Vec<TypeProgress>,
-    /// Fully completed artifact type count.
     pub types_done: usize,
 }
 
-/// Progress callback fires after every unit attempt.
 pub type ProgressFn = Arc<dyn Fn(GenerationTick) + Send + Sync>;
 
-/// Persistence hook. When provided, artifacts are routed here as each unit
-/// completes (incremental, so interruptions keep finished parts); when `None`,
-/// all artifacts are returned as `pending` for the caller to persist.
+/// When `Some`, artifacts route here as each unit completes and nothing is
+/// returned; when `None`, all artifacts return as `pending`.
 pub type PersistFn = Arc<
     dyn Fn(Vec<PendingArtifact>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
 
-/// Build a per-artifact-type progress snapshot from the completed-unit counters.
 fn per_type_progress(
     completed_per_type: &[AtomicUsize],
     totals_per_type: &[usize; ArtifactType::ALL.len()],
@@ -98,51 +148,30 @@ fn per_type_progress(
         .iter()
         .enumerate()
         .map(|(index, ty)| TypeProgress {
-            artifact_type: ty.to_db().to_string(),
+            artifact_type: ty.clone(),
             done: completed_per_type[index].load(Ordering::Relaxed),
             total: totals_per_type[index],
         })
         .collect()
 }
 
-/// Abort pending unit tasks and drain them. Only the handles of the
-/// cancelled worksheet are touched.
-async fn abort_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
-    for handle in &handles {
-        handle.abort();
-    }
-    for handle in handles {
-        let _ = handle.await;
-    }
-}
-
-/// An artifact ready to be persisted.
 pub struct PendingArtifact {
     pub artifact_type: ArtifactType,
     pub source: String,
     pub content: String,
 }
 
-/// Aggregate telemetry for one generation run.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RunTelemetry {
     pub requests: usize,
     pub tokens_in: u64,
     pub tokens_out: u64,
-    /// Number of units that failed to reach the provider (transport/LLM
-    /// errors), as opposed to being dropped at validation time.
     pub backend_errors: usize,
 }
 
-/// Aggregates which artifacts already exist for a worksheet, so a resumed run
-/// can skip already-generated parts. Per-item quiz units are keyed by
-/// `(artifact_type, source)` where `source` is the originating segment id;
-/// merged types (Summary/MindMap) are treated as atomic per artifact type.
 #[derive(Clone, Debug, Default)]
 pub struct ExistingArtifacts {
-    /// Persisted per-item units: `(artifact_type db string, source)`.
     pub done_items: std::collections::HashSet<(String, String)>,
-    /// Persisted merged artifact types: `artifact_type` db string.
     pub done_merged: std::collections::HashSet<String>,
 }
 
@@ -158,69 +187,57 @@ impl ExistingArtifacts {
 }
 
 struct Unit {
-    /// Position within [`ArtifactType::ALL`].
     type_index: usize,
     artifact_type: ArtifactType,
     segment_id: String,
     context: String,
-    /// Deterministic per-unit seed derivation input (document position).
     seed_offset: u64,
-    /// Whether this unit's artifact already exists and should be skipped.
     skip: bool,
 }
 
-fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> Result<Vec<Unit>, String> {
+fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> PipelineResult<Vec<Unit>> {
     if segments.is_empty() {
-        return Err(String::from(
-            "No segments found for this worksheet. Run ingestion first.",
-        ));
+        return Err(PipelineError::NoSegments);
     }
 
-    // Guard generation against content-less units. Segmentation guarantees
-    // real segments for freshly ingested files, but stale or reused chunks can
-    // still carry empty slivers — page/number markers, dot leaders, boilerplate
-    // — whose near-empty context makes the model reply with nothing, which
-    // fails validation. Sampling from the remaining ordered pool keeps coverage
-    // while never emitting an empty context.
     let usable: Vec<&Segment> = segments
         .iter()
         .filter(|segment| !is_degenerate_segment(segment) && !is_non_teachable_segment(segment))
         .collect();
     if usable.is_empty() {
-        return Err(String::from(
-            "No usable segments found for this worksheet. Re-ingest the source files.",
-        ));
+        return Err(PipelineError::NoUsableSegments);
     }
 
-    let mut units = Vec::new();
-    for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
-        let indices = pick_indices(usable.len(), MAX_UNITS_PER_TYPE);
-        for segment_index in indices {
+    let indices = pick_indices(usable.len(), MAX_UNITS_PER_TYPE);
+    let contexts: Vec<(String, String, u64)> = indices
+        .iter()
+        .map(|&segment_index| {
             let segment = usable[segment_index];
             let context = match &segment.heading {
                 Some(heading) => format!("[Section: {heading}]\n{}", segment.text),
                 None => segment.text.clone(),
             };
+            (segment.id.clone(), context, segment.position as u64 + 17)
+        })
+        .collect();
+
+    let mut units = Vec::new();
+    for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
+        for (segment_id, context, seed_offset) in &contexts {
             units.push(Unit {
                 type_index,
                 artifact_type: artifact_type.clone(),
-                segment_id: segment.id.clone(),
-                context,
-                seed_offset: segment.position as u64 + 17,
-                skip: existing.unit_done(artifact_type, &segment.id),
+                segment_id: segment_id.clone(),
+                context: context.clone(),
+                seed_offset: *seed_offset,
+                skip: existing.unit_done(artifact_type, segment_id),
             });
         }
     }
     Ok(units)
 }
 
-/// True when a segment carries no usable source material and must never be
-/// sent to the model. Deliberately content-based and format-agnostic: it does
-/// not assume any particular marker, numbering scheme, or material shape.
-/// Leaves that are indistinguishable from noise — empty text, page/number
-/// markers, dot leaders, numeral runs, spot boilerplate — share one trait:
-/// almost none of their tokens are real words. Rejecting those keeps
-/// legitimately short but prose-bearing segments.
+/// Content-based and format-agnostic: noise leaves share almost no real words.
 fn is_degenerate_segment(segment: &Segment) -> bool {
     fn meaningful_words(text: &str) -> usize {
         text.split_whitespace()
@@ -232,14 +249,10 @@ fn is_degenerate_segment(segment: &Segment) -> bool {
     text.is_empty() || meaningful_words(text) < MIN_CONTENT_WORDS
 }
 
-/// A unit's source context needs enough real prose to ground an answer; a
-/// couple of full sentences is the smallest plausible source.
 const MIN_CONTENT_WORDS: usize = 10;
 
-/// Generic, publisher-agnostic book-furniture headings: title pages, tables of
-/// contents, prefaces, and the like carry no teachable material. Matched on
-/// the segment heading only; no publisher names or other variable tokens are
-/// encoded so the filter stays valid across publishers and material types.
+/// Book-furniture headings carry no teachable material. Heading-only match with
+/// no publisher names keeps the filter valid across publishers.
 const FRONT_MATTER_HEADING_MARKERS: &[&str] = &[
     "table of contents",
     "contents",
@@ -255,9 +268,7 @@ const FRONT_MATTER_HEADING_MARKERS: &[&str] = &[
     "colophon",
 ];
 
-/// Licensing / copyright indicators in the opening text of a segment, used to
-/// catch filing pages that carry their own headings (e.g. the publisher's
-/// imprint page). Kept generic — no publisher or product names.
+/// Licensing indicators in a segment's opening text; kept publisher-generic.
 const FRONT_MATTER_TEXT_MARKERS: &[&str] = &[
     "copyright",
     "©",
@@ -268,10 +279,8 @@ const FRONT_MATTER_TEXT_MARKERS: &[&str] = &[
     "isbn",
 ];
 
-/// Front matter (title/imprint/TOC/preface pages, licensing boilerplate) holds
-/// no educational content and would otherwise make the model reply to nothing
-/// or, worse, fake an answer. These segments stay in the worksheet (searchable
-/// history) but never reach generation.
+/// Front matter would make the model reply to nothing or fake an answer, so it
+/// stays in the worksheet but never reaches generation.
 fn is_non_teachable_segment(segment: &Segment) -> bool {
     if let Some(heading) = &segment.heading {
         let heading = heading.to_lowercase();
@@ -282,8 +291,7 @@ fn is_non_teachable_segment(segment: &Segment) -> bool {
             return true;
         }
     }
-    // Only the opening slice is inspected so a chapter that mentions "index"
-    // or "copyright" deep in its body is not flagged.
+    // Only the opening slice is inspected.
     let lead: String = segment
         .text
         .chars()
@@ -295,7 +303,6 @@ fn is_non_teachable_segment(segment: &Segment) -> bool {
         .any(|marker| lead.contains(marker))
 }
 
-/// Evenly sample `cap` indices when there are more than `cap`, else all.
 fn pick_indices(total: usize, cap: usize) -> Vec<usize> {
     if total <= cap {
         return (0..total).collect();
@@ -306,7 +313,6 @@ fn pick_indices(total: usize, cap: usize) -> Vec<usize> {
         .collect()
 }
 
-/// System contract shared by every request.
 fn system_prompt() -> &'static str {
     "You create study materials strictly grounded in supplied source material.\n\
      Non-negotiable rules:\n\
@@ -329,175 +335,140 @@ const MCQ_EXAMPLE: &str = r#"Example question object:
  "explanation":"The cycle runs in the matrix, producing NADH for oxidative phosphorylation."}"#;
 
 fn user_prompt(artifact_type: &ArtifactType, context: &str) -> String {
-    let task = match artifact_type {
-        ArtifactType::MultipleChoiceQuiz => format!(
-            "Write multiple-choice questions testing analysis, application, or evaluation \
-             of the material below. Write as many as the material genuinely supports — \
-             cover its key ideas, and never pad with shallow or near-identical questions. \
-             For every question:\n\
-             - Exactly 4 answer options in plain text: no lettering, numbering, or bullet marks.\n\
-             - Options must be mutually exclusive, comparable in length, plausible but clearly\n\
-             wrong to someone who knows the material. Never offer options like \"all of the above\".\n\
-             - Exactly one correct answer, written verbatim as one of the options.\n\
-             - Vary the position of the correct answer across questions.\n\
-             - One-sentence explanation citing the supporting fact.\n\
-             - Do not repeat near-identical questions.\n{MCQ_EXAMPLE}"
-        ),
-        ArtifactType::EssayQuiz => String::from(
-            "Write essay questions that require students to explain, compare, or evaluate \
-             ideas from the material below. Write as many as the material genuinely supports. \
-             Each needs clear instructions and a concise model answer grounded in the material.",
-        ),
-        ArtifactType::CompletionQuiz => String::from(
-            "Write fill-in-the-blank statements drawn from the material below. Mark each blank \
-             with ____________. Write as many as the material genuinely supports. The expected \
-             answer must appear word-for-word in the material. Add a short hint per statement.",
-        ),
-        ArtifactType::Summary => String::from(
-            "Summarize this slice of the material: a short title, a focused paragraph capturing \
-             its main ideas, and three to five key points.",
-        ),
-        ArtifactType::MindMap => String::from(
-            "Extract the topic of this slice of the material and its major branches. Up to six \
-             branches, each with up to six short child concepts drawn from the material.",
-        ),
-    };
-    format!("{task}\n\nSource material:\n\"\"\"\n{context}\n\"\"\"")
+    let task = spec(artifact_type);
+    let mut prompt = String::from(task.task);
+    if let Some(example) = task.example {
+        prompt.push('\n');
+        prompt.push_str(example);
+    }
+    format!("{prompt}\n\nSource material:\n\"\"\"\n{context}\n\"\"\"")
 }
 
-// --- Schemas (strict-mode friendly: every property listed in `required`,
-// `additionalProperties: false` everywhere) ---
+fn str_field() -> serde_json::Value {
+    serde_json::json!({ "type": "string" })
+}
 
 fn string_array(min_items: usize, max_items: usize) -> serde_json::Value {
     serde_json::json!({
         "type": "array",
-        "items": { "type": "string" },
+        "items": str_field(),
         "minItems": min_items,
         "maxItems": max_items,
     })
 }
 
-pub fn schema_for(artifact_type: &ArtifactType) -> serde_json::Value {
-    match artifact_type {
-        ArtifactType::MultipleChoiceQuiz => serde_json::json!({
-            "type": "object",
-            "properties": { "questions": mcq_questions_schema() },
-            "required": ["questions"],
-            "additionalProperties": false,
-        }),
-        ArtifactType::EssayQuiz => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": { "type": "string" },
-                            "instructions": { "type": "string" },
-                            "model_answer": { "type": "string" },
-                        },
-                        "required": ["question", "instructions", "model_answer"],
-                        "additionalProperties": false,
-                    },
-                },
-            },
-            "required": ["questions"],
-            "additionalProperties": false,
-        }),
-        ArtifactType::CompletionQuiz => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "sentence": { "type": "string" },
-                            "answer": { "type": "string" },
-                            "hint": { "type": "string" },
-                        },
-                        "required": ["sentence", "answer", "hint"],
-                        "additionalProperties": false,
-                    },
-                },
-            },
-            "required": ["items"],
-            "additionalProperties": false,
-        }),
-        ArtifactType::Summary => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "title": { "type": "string" },
-                "summary": { "type": "string" },
-                "key_points": string_array(3, 5),
-            },
-            "required": ["title", "summary", "key_points"],
-            "additionalProperties": false,
-        }),
-        ArtifactType::MindMap => serde_json::json!({
-            "type": "object",
-            "properties": {
-                "topic": { "type": "string" },
-                "branches": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 6,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": { "type": "string" },
-                            "children": string_array(1, 6),
-                        },
-                        "required": ["label", "children"],
-                        "additionalProperties": false,
-                    },
-                },
-            },
-            "required": ["topic", "branches"],
-            "additionalProperties": false,
-        }),
-    }
-}
-
-fn mcq_questions_schema() -> serde_json::Value {
+fn object_schema(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     serde_json::json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {
-                "question": { "type": "string" },
-                "options": {
-                    "type": "array",
-                    "minItems": 4,
-                    "maxItems": 4,
-                    "items": { "type": "string" },
-                },
-                "answer": { "type": "string" },
-                "explanation": { "type": "string" },
-            },
-            "required": ["question", "options", "answer", "explanation"],
-            "additionalProperties": false,
-        },
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
     })
 }
 
-fn items_field(artifact_type: &ArtifactType) -> Option<&'static str> {
-    match artifact_type {
-        ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz => Some("questions"),
-        ArtifactType::CompletionQuiz => Some("items"),
-        ArtifactType::Summary | ArtifactType::MindMap => None,
-    }
+fn array_schema(items: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "type": "array", "items": items })
 }
 
-const MIN_MCQ_GROUNDING: f32 = 0.15;
-const MIN_COMPLETION_GROUNDING: f32 = 0.5;
-const DUPLICATE_QUESTION_SIMILARITY: f32 = 0.75;
+fn mcq_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({ "questions": array_schema(mcq_question_schema()) }),
+        &["questions"],
+    )
+}
 
-/// Parse the model reply, tolerating prose/markdown around the JSON object
-/// some servers emit beyond what the client's fence stripping removes: fall
-/// back to the substring between the first `{` and the last `}`.
-fn parse_json_anyhow(raw: &str) -> Result<serde_json::Value, String> {
+fn essay_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "questions": array_schema(object_schema(
+                serde_json::json!({
+                    "question": str_field(),
+                    "instructions": str_field(),
+                    "model_answer": str_field(),
+                }),
+                &["question", "instructions", "model_answer"],
+            ))
+        }),
+        &["questions"],
+    )
+}
+
+fn completion_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "items": array_schema(object_schema(
+                serde_json::json!({
+                    "sentence": str_field(),
+                    "answer": str_field(),
+                    "hint": str_field(),
+                }),
+                &["sentence", "answer", "hint"],
+            ))
+        }),
+        &["items"],
+    )
+}
+
+fn summary_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "title": str_field(),
+            "summary": str_field(),
+            "key_points": string_array(3, 5),
+        }),
+        &["title", "summary", "key_points"],
+    )
+}
+
+fn mindmap_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "topic": str_field(),
+            "branches": serde_json::json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": object_schema(
+                    serde_json::json!({
+                        "label": str_field(),
+                        "children": string_array(1, 6),
+                    }),
+                    &["label", "children"],
+                ),
+            }),
+        }),
+        &["topic", "branches"],
+    )
+}
+
+fn mcq_question_schema() -> serde_json::Value {
+    object_schema(
+        serde_json::json!({
+            "question": str_field(),
+            "options": serde_json::json!({
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": str_field(),
+            }),
+            "answer": str_field(),
+            "explanation": str_field(),
+        }),
+        &["question", "options", "answer", "explanation"],
+    )
+}
+
+pub fn schema_for(artifact_type: &ArtifactType) -> serde_json::Value {
+    (spec(artifact_type).schema)()
+}
+
+fn items_field(artifact_type: &ArtifactType) -> Option<&'static str> {
+    spec(artifact_type).items_field
+}
+
+/// Tolerates prose around the JSON object: falls back to the first-`{` to
+/// last-`}` substring.
+fn parse_json_anyhow(raw: &str) -> PipelineResult<serde_json::Value> {
     let trimmed = raw.trim();
     match serde_json::from_str(trimmed) {
         Ok(value) => Ok(value),
@@ -506,17 +477,18 @@ fn parse_json_anyhow(raw: &str) -> Result<serde_json::Value, String> {
                 if open < close {
                     let slice = &trimmed[open..=close];
                     return serde_json::from_str(slice).map_err(|second| {
-                        format!("{first}; also failed on the extracted object: {second}")
+                        PipelineError::Failed(format!(
+                            "{first}; also failed on the extracted object: {second}"
+                        ))
                     });
                 }
             }
-            Err(first.to_string())
+            Err(PipelineError::Failed(first.to_string()))
         }
     }
 }
 
 struct ValidatedOutput {
-    /// Serialized item objects (or whole section objects).
     items: Vec<String>,
     rejection_reasons: Vec<String>,
 }
@@ -525,7 +497,6 @@ fn validate_unit_output(
     artifact_type: &ArtifactType,
     raw: &str,
     source_segment: &str,
-    seen_questions: &[String],
 ) -> ValidatedOutput {
     fn rejected(reasons: &mut Vec<String>, message: String) -> ValidatedOutput {
         reasons.push(message);
@@ -546,12 +517,6 @@ fn validate_unit_output(
         }
     };
 
-    if references_missing_media(raw) {
-        rejection_reasons.push(String::from(
-            "output references figures/media absent from the source",
-        ));
-    }
-
     match items_field(artifact_type) {
         Some(field) => {
             let Some(entries) = value.get(field).and_then(serde_json::Value::as_array) else {
@@ -561,38 +526,13 @@ fn validate_unit_output(
             let mut items = Vec::new();
             for entry in entries {
                 let verdict = match artifact_type {
-                    ArtifactType::MultipleChoiceQuiz => {
-                        validate::validate_mcq_item(entry, source_segment, MIN_MCQ_GROUNDING)
-                    }
+                    ArtifactType::MultipleChoiceQuiz => validate::validate_mcq_item(entry),
                     ArtifactType::EssayQuiz => validate::validate_essay_item(entry),
-                    _ => validate::validate_completion_item(
-                        entry,
-                        source_segment,
-                        MIN_COMPLETION_GROUNDING,
-                    ),
+                    _ => validate::validate_completion_item(entry, source_segment),
                 };
 
                 match verdict {
-                    ItemVerdict::Accepted(mut accepted) => {
-                        // Cross-unit near-duplicate suppression.
-                        if matches!(
-                            artifact_type,
-                            ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz
-                        ) {
-                            let question = accepted["question"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            let duplicate = seen_questions.iter().any(|seen| {
-                                similarity(seen, &question) >= DUPLICATE_QUESTION_SIMILARITY
-                            });
-                            if duplicate {
-                                continue;
-                            }
-                            accepted["question"] = serde_json::Value::String(question);
-                        }
-                        items.push(accepted.to_string());
-                    }
+                    ItemVerdict::Accepted(accepted) => items.push(accepted.to_string()),
                     ItemVerdict::Rejected(reason) => rejection_reasons.push(reason),
                 }
             }
@@ -602,8 +542,6 @@ fn validate_unit_output(
             }
         }
         None => {
-            // Whole-worksheet section objects get structural checks only;
-            // deterministic merging downstream guarantees coverage.
             let shape_ok = match artifact_type {
                 ArtifactType::Summary => {
                     value
@@ -642,8 +580,6 @@ fn approximate_tokens(text: &str) -> u64 {
     (text.len() as u64 / 4).max(1)
 }
 
-/// Human label for a unit's outcome: delivered items, rejected on content, or
-/// deliberately skipped (front matter / empty reply).
 fn outcome_verdict(validated: &ValidatedOutput) -> &'static str {
     if validated.items.is_empty() && validated.rejection_reasons.is_empty() {
         "skipped"
@@ -654,81 +590,81 @@ fn outcome_verdict(validated: &ValidatedOutput) -> &'static str {
     }
 }
 
-/// What one unit produced.
 struct UnitOutcome {
-    /// `(item_json, …)` serialized outputs ready for assembly.
     items: Vec<String>,
     requests_made: usize,
     tokens_in: u64,
     tokens_out: u64,
-    /// Set when the request could not reach / be completed by the provider
-    /// (connection, auth, rate-limit, etc.) rather than being a content-level
-    /// rejection. Used to distinguish a provider outage from dropped items.
     backend_error: Option<String>,
+}
+
+fn log_request(logs: Option<&RunLogs>, unit: &Unit, attempt: usize, request: &GenerateRequest) {
+    if let Some(logs) = logs {
+        let record = serde_json::json!({
+            "timestamp": logging::rfc3339_utc(),
+            "unit_type": unit.artifact_type.to_db(),
+            "segment_id": unit.segment_id,
+            "attempt": attempt,
+            "seed": request.seed,
+            "system": request.system,
+            "user": request.user,
+            "schema_name": request.schema_name,
+            "schema": request.schema,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+        });
+        let label = format!(
+            "{}_seed{}_attempt{}",
+            logging::sanitize_label(&request.schema_name),
+            request.seed,
+            attempt
+        );
+        logs.write_json("generation", &label, &record);
+    }
+}
+
+fn log_response(
+    logs: Option<&RunLogs>,
+    unit: &Unit,
+    attempt: usize,
+    seed: u64,
+    record: &serde_json::Value,
+) {
+    if let Some(logs) = logs {
+        let label = format!(
+            "{}_seed{}_attempt{}_response",
+            logging::sanitize_label(unit.artifact_type.to_db()),
+            seed,
+            attempt
+        );
+        logs.write_json("generation", &label, record);
+    }
 }
 
 async fn run_unit(
     backend: &Arc<dyn ArtifactBackend>,
     unit: &Unit,
     params: &GenerationParams,
-    seen_questions: &Mutex<Vec<String>>,
     logs: Option<&RunLogs>,
 ) -> UnitOutcome {
     let mut requests_made = 0usize;
     let mut tokens_in = 0u64;
     let mut tokens_out = 0u64;
-    let backend_error: Option<String> = None;
 
     let system = system_prompt().to_string();
     let schema_name = unit.artifact_type.to_db().to_string();
-    let schema = schema_for(&unit.artifact_type);
-    let base_seed = params.seed.wrapping_add(unit.seed_offset);
-    let base_user = user_prompt(&unit.artifact_type, &unit.context);
-
-    let unit_type = unit.artifact_type.to_db();
-    let schema_label = logging::sanitize_label(&schema_name);
-
-    let make_request = |seed: u64, user: String| GenerateRequest {
+    let seed = params.seed.wrapping_add(unit.seed_offset);
+    let request = GenerateRequest {
         system: system.clone(),
-        user,
+        user: user_prompt(&unit.artifact_type, &unit.context),
         schema_name: schema_name.clone(),
-        schema: schema.clone(),
+        schema: schema_for(&unit.artifact_type),
         temperature: temperature_for(&unit.artifact_type, params),
         max_tokens: max_tokens_for(&unit.artifact_type, params),
         seed,
     };
 
-    // Best-effort generation trace: one request artifact per attempt, one
-    // response artifact per call, all under logs/generation/.
-    let log_request = |attempt: usize, request: &GenerateRequest| {
-        if let Some(logs) = logs {
-            let record = serde_json::json!({
-                "timestamp": logging::rfc3339_utc(),
-                "unit_type": unit_type,
-                "segment_id": unit.segment_id,
-                "attempt": attempt,
-                "seed": request.seed,
-                "system": request.system,
-                "user": request.user,
-                "schema_name": request.schema_name,
-                "schema": request.schema,
-                "temperature": request.temperature,
-                "max_tokens": request.max_tokens,
-            });
-            let label = format!("{}_seed{}_attempt{}", schema_label, request.seed, attempt);
-            logs.write_json("generation", &label, &record);
-        }
-    };
-
-    let log_response = |attempt: usize, seed: u64, record: &serde_json::Value| {
-        if let Some(logs) = logs {
-            let label = format!("{}_seed{}_attempt{}_response", schema_label, seed, attempt);
-            logs.write_json("generation", &label, record);
-        }
-    };
-
-    let request = make_request(base_seed, base_user.clone());
-    log_request(0, &request);
+    log_request(logs, unit, 0, &request);
     let started = std::time::Instant::now();
     let reply = match backend.generate_json(&request).await {
         Ok(reply) => {
@@ -739,11 +675,13 @@ async fn run_unit(
         }
         Err(error) => {
             log_response(
+                logs,
+                unit,
                 0,
-                base_seed,
+                seed,
                 &serde_json::json!({
                     "timestamp": logging::rfc3339_utc(),
-                    "unit_type": unit_type,
+                    "unit_type": unit.artifact_type.to_db(),
                     "segment_id": unit.segment_id,
                     "attempt": 0,
                     "elapsed_ms": started.elapsed().as_millis(),
@@ -765,31 +703,23 @@ async fn run_unit(
         }
     };
 
-    // One turn per unit: no retries. A failed turn (empty reply, invalid JSON,
-    // low grounding) simply drops that segment's items.
+    // One turn per unit, no retries; an empty reply is a clean skip, not an error.
     let validated = if reply.text.trim().is_empty() {
-        // The provider returned nothing: the model declining front matter or an
-        // anomalous empty generation. Either way a clean skip — one turn was
-        // spent, nothing is fabricated, and finish_reason/refusal below explain
-        // the emptiness. Not a backend error and not retried.
         ValidatedOutput {
             items: Vec::new(),
             rejection_reasons: Vec::new(),
         }
     } else {
-        validate_unit_output(
-            &unit.artifact_type,
-            &reply.text,
-            &unit.context,
-            &seen_questions.lock().unwrap(),
-        )
+        validate_unit_output(&unit.artifact_type, &reply.text, &unit.context)
     };
     log_response(
+        logs,
+        unit,
         0,
-        base_seed,
+        seed,
         &serde_json::json!({
             "timestamp": logging::rfc3339_utc(),
-            "unit_type": unit_type,
+            "unit_type": unit.artifact_type.to_db(),
             "segment_id": unit.segment_id,
             "attempt": 0,
             "elapsed_ms": started.elapsed().as_millis(),
@@ -802,23 +732,6 @@ async fn run_unit(
             "rejection_reasons": validated.rejection_reasons.clone(),
         }),
     );
-
-    // Register surviving questions for cross-unit duplicate detection.
-    if !validated.items.is_empty()
-        && matches!(
-            unit.artifact_type,
-            ArtifactType::MultipleChoiceQuiz | ArtifactType::EssayQuiz
-        )
-    {
-        let mut seen = seen_questions.lock().unwrap();
-        for item in &validated.items {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(item) {
-                if let Some(question) = value.get("question").and_then(serde_json::Value::as_str) {
-                    seen.push(question.to_string());
-                }
-            }
-        }
-    }
 
     if validated.items.is_empty() && !validated.rejection_reasons.is_empty() {
         eprintln!(
@@ -833,23 +746,16 @@ async fn run_unit(
         requests_made,
         tokens_in,
         tokens_out,
-        backend_error,
+        backend_error: None,
     }
 }
 
-/// Output recorded per finished unit.
 struct UnitRecord {
     type_index: usize,
     segment_id: String,
     items: Vec<String>,
 }
 
-/// Generate artifacts for every type across all segments under a concurrency
-/// limit. Already-completed units (per `existing`) are skipped and not counted
-/// in progress or telemetry. When `on_persist` is provided, artifacts are
-/// routed to it as each unit completes (incremental persistence) and nothing
-/// is returned; otherwise all artifacts are returned for the caller to persist.
-/// Returns pending artifacts plus aggregate telemetry.
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_all(
     backend: Arc<dyn ArtifactBackend>,
@@ -860,11 +766,9 @@ pub async fn generate_all(
     on_persist: Option<PersistFn>,
     on_progress: Option<ProgressFn>,
     logs: Option<Arc<RunLogs>>,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<(Vec<PendingArtifact>, RunTelemetry), String> {
-    if is_cancel_requested(&cancel) {
-        return Err(String::from(CANCELLED_MESSAGE));
-    }
+    stop: Stop,
+) -> PipelineResult<(Vec<PendingArtifact>, RunTelemetry)> {
+    stop.check()?;
     let params = params.unwrap_or_default();
     let units = build_units(segments, &existing)?;
     let active_units: Vec<Unit> = units.into_iter().filter(|unit| !unit.skip).collect();
@@ -879,7 +783,6 @@ pub async fn generate_all(
             .map(|_| AtomicUsize::new(0))
             .collect(),
     );
-    let completed_types = Arc::new(AtomicUsize::new(0));
 
     if let Some(on_progress) = &on_progress {
         on_progress(GenerationTick {
@@ -893,53 +796,38 @@ pub async fn generate_all(
 
     let records: Arc<Mutex<Vec<Option<UnitRecord>>>> =
         Arc::new(Mutex::new((0..total_units).map(|_| None).collect()));
-    let seen_questions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32)));
     let telemetry = Arc::new(Mutex::new(RunTelemetry::default()));
     let first_backend_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let done_counter = Arc::new(AtomicUsize::new(0));
 
-    let mut handles = Vec::with_capacity(total_units);
+    let mut tasks = tokio::task::JoinSet::new();
     for (unit_index, unit) in active_units.into_iter().enumerate() {
-        if is_cancel_requested(&cancel) {
-            abort_handles(handles).await;
-            return Err(String::from(CANCELLED_MESSAGE));
-        }
         let semaphore_clone = semaphore.clone();
-        let cancel_watch = cancel.clone();
+        let stop_watch = stop.clone();
         let permit = tokio::select! {
             biased;
-            _ = async {
-                loop {
-                    if cancel_watch.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                        return;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            } => {
-                abort_handles(handles).await;
-                return Err(String::from(CANCELLED_MESSAGE));
+            _ = stop_watch.stopped() => {
+                tasks.abort_all();
+                return Err(PipelineError::Cancelled);
             }
             permit = semaphore_clone.acquire_owned() => {
-                permit.map_err(|e| e.to_string())?
+                permit.map_err(|e| PipelineError::Failed(e.to_string()))?
             }
         };
         let backend = backend.clone();
         let params = params.clone();
         let records = records.clone();
-        let seen_questions = seen_questions.clone();
         let telemetry = telemetry.clone();
         let first_backend_error = first_backend_error.clone();
         let done_counter = done_counter.clone();
         let completed_per_type = completed_per_type.clone();
-        let completed_types = completed_types.clone();
         let on_progress = on_progress.clone();
         let on_persist = on_persist.clone();
         let logs = logs.clone();
 
-        handles.push(tokio::spawn(async move {
-            let outcome =
-                run_unit(&backend, &unit, &params, &seen_questions, logs.as_deref()).await;
+        tasks.spawn(async move {
+            let outcome = run_unit(&backend, &unit, &params, logs.as_deref()).await;
 
             {
                 let mut stats = telemetry.lock().unwrap();
@@ -959,8 +847,6 @@ pub async fn generate_all(
 
             let is_item_type = items_field(&unit.artifact_type).is_some();
             if is_item_type {
-                // Per-item units are persisted immediately so a mid-run kill
-                // keeps the finished quiz items.
                 let artifacts = build_item_artifacts(&unit, &outcome.items);
                 if let Some(on_persist) = &on_persist {
                     if !artifacts.is_empty() {
@@ -974,8 +860,6 @@ pub async fn generate_all(
                     });
                 }
             } else {
-                // Merged types accumulate per-segment sections and are
-                // assembled once the type completes below.
                 records.lock().unwrap()[unit_index] = Some(UnitRecord {
                     type_index: unit.type_index,
                     segment_id: unit.segment_id.clone(),
@@ -984,58 +868,60 @@ pub async fn generate_all(
             }
 
             let finished = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            let completed = completed_per_type[unit.type_index].fetch_add(1, Ordering::Relaxed) + 1;
-            let mut types_done = 0usize;
-            if completed == totals_per_type[unit.type_index] {
-                types_done = completed_types.fetch_add(1, Ordering::Relaxed) + 1;
-            }
+            completed_per_type[unit.type_index].fetch_add(1, Ordering::Relaxed);
+            let per_type = per_type_progress(&completed_per_type, &totals_per_type);
+            let types_done = per_type
+                .iter()
+                .filter(|progress| progress.total > 0 && progress.done == progress.total)
+                .count();
 
             if let Some(on_progress) = &on_progress {
                 on_progress(GenerationTick {
                     artifact_type: Some(unit.artifact_type.clone()),
                     done: finished,
                     total: total_units,
-                    per_type: per_type_progress(&completed_per_type, &totals_per_type),
+                    per_type,
                     types_done,
                 });
             }
 
             drop(permit);
-        }));
+        });
     }
 
-    // Cancellation-aware join: abort in-flight provider requests promptly
-    // instead of waiting up to the request timeout. Only this worksheet's
-    // handles are aborted; other worksheets run in separate tasks.
+    // Abort in-flight requests promptly instead of waiting out the timeout.
     loop {
-        if is_cancel_requested(&cancel) {
-            abort_handles(handles).await;
-            return Err(String::from(CANCELLED_MESSAGE));
-        }
-        if handles.iter().all(|handle| handle.is_finished()) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-
-    for handle in handles {
-        handle.await.map_err(|e| {
-            if e.is_cancelled() {
-                String::from(CANCELLED_MESSAGE)
-            } else {
-                format!("Generation task failed: {e}")
+        tokio::select! {
+            biased;
+            _ = stop.stopped() => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(PipelineError::Cancelled);
             }
-        })?;
+            result = tasks.join_next() => {
+                match result {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                        return Err(if error.is_cancelled() {
+                            PipelineError::Cancelled
+                        } else {
+                            PipelineError::Failed(format!(
+                                "Generation task failed: {error}"
+                            ))
+                        });
+                    }
+                    None => break,
+                }
+            }
+        }
     }
-    if is_cancel_requested(&cancel) {
-        return Err(String::from(CANCELLED_MESSAGE));
-    }
+    stop.check()?;
 
     let telemetry = *telemetry.lock().unwrap();
     let records: Vec<Option<UnitRecord>> = records.lock().unwrap().drain(..).collect();
 
-    // Streamed persistence leaves only merged artifacts to be returned; in the
-    // non-streaming (test/legacy) path, per-item artifacts come from records.
     let mut pending = Vec::new();
     for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
         let sections: Vec<(String, serde_json::Value)> = records
@@ -1085,19 +971,16 @@ pub async fn generate_all(
         }
     }
 
-    // A provider outage (connection/auth/rate-limit) that hits every unit is a
-    // hard failure, not an empty success: surface it so the worksheet is marked
-    // `failed` rather than `done` with zero artifacts.
+    // Every unit failing to reach the provider is an outage, not empty success.
     if telemetry.backend_errors > 0 && telemetry.backend_errors == total_units {
-        return Err(format!(
-            "Artifacts generation failed. Check that a provider is configured and reachable."
-        ));
+        return Err(PipelineError::Failed(String::from(
+            "Artifacts generation failed. Check that a provider is configured and reachable.",
+        )));
     }
 
     Ok((pending, telemetry))
 }
 
-/// One artifact per generated item for per-item quiz types, keyed by unit.
 fn build_item_artifacts(unit: &Unit, items: &[String]) -> Vec<PendingArtifact> {
     items
         .iter()
@@ -1110,56 +993,59 @@ fn build_item_artifacts(unit: &Unit, items: &[String]) -> Vec<PendingArtifact> {
         .collect()
 }
 
+fn first_text(sections: &[(String, serde_json::Value)], field: &str, fallback: &str) -> String {
+    sections
+        .iter()
+        .find_map(|(_, value)| value.get(field).and_then(serde_json::Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn collect_texts(
+    sections: &[(String, serde_json::Value)],
+    field: &str,
+    cap: usize,
+    dedupe: bool,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (_, value) in sections {
+        let texts = match value.get(field) {
+            Some(serde_json::Value::String(text)) => vec![text.as_str()],
+            Some(serde_json::Value::Array(items)) => {
+                items.iter().filter_map(serde_json::Value::as_str).collect()
+            }
+            _ => Vec::new(),
+        };
+        for text in texts {
+            let trimmed = text.trim();
+            if trimmed.is_empty() || (dedupe && !seen.insert(trimmed.to_string())) {
+                continue;
+            }
+            out.push(trimmed.to_string());
+            if out.len() >= cap {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 fn merge_sections(
     artifact_type: &ArtifactType,
     sections: &[(String, serde_json::Value)],
 ) -> Option<String> {
     match artifact_type {
-        ArtifactType::Summary => {
-            let title = sections
-                .iter()
-                .find_map(|(_, value)| value.get("title").and_then(serde_json::Value::as_str))
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or("Worksheet summary");
-
-            let mut paragraphs = Vec::new();
-            let mut key_points: Vec<String> = Vec::new();
-            for (_, value) in sections {
-                if let Some(summary) = value.get("summary").and_then(serde_json::Value::as_str) {
-                    let trimmed = summary.trim();
-                    if !trimmed.is_empty() {
-                        paragraphs.push(trimmed.to_string());
-                    }
-                }
-                if let Some(points) = value
-                    .get("key_points")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for point in points.iter().filter_map(serde_json::Value::as_str) {
-                        if !key_points.contains(&point.to_string()) {
-                            key_points.push(point.to_string());
-                        }
-                    }
-                }
-            }
-            key_points.truncate(12);
-
-            Some(
-                serde_json::json!({
-                    "title": title,
-                    "summary": paragraphs.join("\n\n"),
-                    "key_points": key_points,
-                })
-                .to_string(),
-            )
-        }
+        ArtifactType::Summary => Some(
+            serde_json::json!({
+                "title": first_text(sections, "title", "Worksheet summary"),
+                "summary": collect_texts(sections, "summary", usize::MAX, false).join("\n\n"),
+                "key_points": collect_texts(sections, "key_points", 12, true),
+            })
+            .to_string(),
+        ),
         ArtifactType::MindMap => {
-            let topic = sections
-                .iter()
-                .find_map(|(_, value)| value.get("topic").and_then(serde_json::Value::as_str))
-                .filter(|topic| !topic.trim().is_empty())
-                .unwrap_or("Overview");
-
             let mut branches: Vec<serde_json::Value> = Vec::new();
             for (_, value) in sections {
                 if let Some(section_branches) =
@@ -1172,7 +1058,7 @@ fn merge_sections(
 
             Some(
                 serde_json::json!({
-                    "topic": topic,
+                    "topic": first_text(sections, "topic", "Overview"),
                     "branches": branches,
                 })
                 .to_string(),
@@ -1199,8 +1085,6 @@ mod tests {
 
     #[test]
     fn test_is_degenerate_segment_rejects_noise_not_short_prose() {
-        // Reason a robust, format-agnostic check matters: none of these
-        // reproduce a specific marker string, yet all are content-less noise.
         for noise in [
             "[Page 2]",
             "[Slide 3]",
@@ -1214,7 +1098,6 @@ mod tests {
             );
         }
 
-        // Legitimately short real prose must survive.
         let short = "The mitochondrion is the powerhouse of the cell and respiration produces ATP.";
         assert!(!is_degenerate_segment(&segment(0, None, short)));
         let long = "OpenStax provides free, peer-reviewed, openly licensed textbooks. \
@@ -1274,7 +1157,7 @@ mod tests {
             Ok(_) => panic!("expected all-degenerate segments to error"),
             Err(error) => error,
         };
-        assert!(error.contains("No usable segments"));
+        assert!(error.to_string().contains("No usable segments"));
     }
 
     #[test]
@@ -1304,7 +1187,6 @@ mod tests {
             "ISBN 978-0-000-00000-0"
         )));
 
-        // Real teaching content must survive, even when a heading looks book-ish.
         let chapter = segment(
             4,
             Some("The Cell"),
@@ -1312,8 +1194,7 @@ mod tests {
              that carry out the processes of life.",
         );
         assert!(!is_non_teachable_segment(&chapter));
-        // A word like "index" deep in a chapter body (beyond the scanned lead)
-        // must not trip the filter.
+
         let long = format!(
             "{} The full body of this chapter goes on at length. {} index",
             "Metabolism converts nutrients into usable energy.".repeat(40),
@@ -1421,7 +1302,6 @@ mod tests {
             &ArtifactType::MultipleChoiceQuiz,
             r#"{"questions":[]}"#,
             "source words here",
-            &[],
         );
         assert!(validated.items.is_empty());
         assert!(
@@ -1446,13 +1326,11 @@ mod tests {
             seed_offset: 0,
             skip: false,
         };
-        let seen_questions = Mutex::new(Vec::<String>::new());
 
         let outcome = tauri::async_runtime::block_on(run_unit(
             &backend,
             &unit,
             &GenerationParams::default(),
-            &seen_questions,
             None,
         ));
 
@@ -1487,13 +1365,11 @@ mod tests {
             seed_offset: 0,
             skip: false,
         };
-        let seen_questions = Mutex::new(Vec::<String>::new());
 
         let outcome = tauri::async_runtime::block_on(run_unit(
             &backend,
             &unit,
             &GenerationParams::default(),
-            &seen_questions,
             None,
         ));
 

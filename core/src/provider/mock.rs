@@ -1,20 +1,23 @@
 //! Deterministic in-memory backend for tests: scripted responses, recorded
 //! requests, no network.
 
+#[cfg(test)]
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::sync::Mutex;
 
+#[cfg(test)]
 use async_trait::async_trait;
 
+#[cfg(test)]
 use super::{ArtifactBackend, GenerateReply, GenerateRequest, ProviderError};
 
 /// Deterministic in-memory backend for tests: no network.
-#[allow(dead_code)] // test support
-///
 /// Two modes:
 /// - scripted (`new`): each call pops the next result; dry script echoes `{}`;
 /// - routed (`with_responder`): the request itself decides the response,
 ///   immune to task-scheduling order under concurrency.
+#[cfg(test)]
 pub struct MockBackend {
     responses: Mutex<VecDeque<Result<String, ProviderError>>>,
     #[allow(clippy::type_complexity)]
@@ -23,6 +26,7 @@ pub struct MockBackend {
 }
 
 /// Wrap scripted strings into a reply sourced from `content`.
+#[cfg(test)]
 fn reply(text: &str) -> GenerateReply {
     GenerateReply {
         text: text.to_string(),
@@ -32,7 +36,7 @@ fn reply(text: &str) -> GenerateReply {
     }
 }
 
-#[allow(dead_code)] // test support
+#[cfg(test)]
 impl MockBackend {
     pub fn new(responses: Vec<Result<String, ProviderError>>) -> Self {
         Self {
@@ -57,9 +61,13 @@ impl MockBackend {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ArtifactBackend for MockBackend {
-    async fn generate_json(&self, request: &GenerateRequest) -> Result<GenerateReply, ProviderError> {
+    async fn generate_json(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateReply, ProviderError> {
         self.requests.lock().unwrap().push(request.clone());
         if let Some(responder) = &self.responder {
             return responder(request).map(|text| reply(&text));

@@ -1,6 +1,4 @@
 //! Pipeline orchestration: parse → segment → store → generate → persist.
-//! Generation is cloud-hosted through an [`ArtifactBackend`]; every other
-//! stage is fully local.
 
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -16,76 +14,115 @@ pub mod validate;
 pub use generate::{generate_all, PendingArtifact};
 pub use jobs::{remove_job, resume_if_needed, resume_stale, start_job, stop_job, PipelineJobs};
 
-/// Sentinel error marking a user-requested stop. Callers map it to the
-/// `cancelled` worksheet status instead of `failed`; finished artifacts stay
-/// persisted so a later retry resumes.
-pub const CANCELLED_MESSAGE: &str = "Pipeline cancelled by user.";
-
-pub(crate) fn is_cancel_requested(cancel: &Option<Arc<std::sync::atomic::AtomicBool>>) -> bool {
-    cancel
-        .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    #[error("Pipeline cancelled by user.")]
+    Cancelled,
+    #[error("Worksheet has no files to process.")]
+    NoFiles,
+    #[error("No segments found for this worksheet. Run ingestion first.")]
+    NoSegments,
+    #[error("No usable segments found for this worksheet. Re-ingest the source files.")]
+    NoUsableSegments,
+    #[error("{0}")]
+    Failed(String),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
 }
 
-/// Parse, segment, and persist every file of a worksheet. Reports progress as
-/// each file completes through `on_progress`. `logs` (when given) receives
-/// per-file artifacts under `logs/file_reads`, `logs/tokenization`, and
-/// `logs/segmentation`. When `cancel` is set, parsing aborts promptly with
-/// [`CANCELLED_MESSAGE`].
-#[allow(clippy::too_many_arguments)]
+pub type PipelineResult<T> = Result<T, PipelineError>;
+
+#[derive(Clone, Debug)]
+pub struct Stop {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Stop {
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(false.into()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn never() -> Self {
+        Self::new()
+    }
+
+    pub fn stop(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn stopped(&self) {
+        // Create the waiter before checking the flag: a stop landing between
+        // the two still wakes us; an earlier stop takes the early return.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        if self.is_stopped() {
+            return;
+        }
+        notified.await;
+    }
+
+    pub fn check(&self) -> PipelineResult<()> {
+        if self.is_stopped() {
+            Err(PipelineError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub async fn process_files(
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     start_position: i32,
     tokenizer: Arc<tokenizers::Tokenizer>,
-    on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
     logs: Option<Arc<crate::logging::RunLogs>>,
-    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<Vec<Segment>, String> {
+    stop: Stop,
+) -> PipelineResult<Vec<Segment>> {
     ingest::process_files(
         pool,
         worksheet_id,
         file_ids,
         start_position,
         tokenizer,
-        on_progress,
         logs,
-        cancel,
+        stop,
     )
     .await
 }
 
-/// The files of a worksheet that do not yet have any persisted chunks. Used to
-/// resume ingestion from unchunked parts only.
 pub async fn unchunked_files(
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
-) -> Result<Vec<String>, String> {
+) -> PipelineResult<Vec<String>> {
     ingest::unchunked_files(pool, worksheet_id, file_ids).await
 }
 
-/// The next `position` value to assign a new chunk, continuing after the
-/// highest position already persisted for the worksheet.
-pub async fn next_segment_position(pool: &SqlitePool, worksheet_id: &str) -> Result<i32, String> {
+pub async fn next_segment_position(pool: &SqlitePool, worksheet_id: &str) -> PipelineResult<i32> {
     ingest::next_segment_position(pool, worksheet_id).await
 }
 
-/// Copy chunks from an existing file with the same content hash for any of
-/// `file_ids`, returning the files that still need a real parse and the next
-/// position to continue from.
 pub async fn reuse_chunks(
     pool: &SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     start_position: i32,
-) -> Result<(Vec<String>, i32), String> {
+) -> PipelineResult<(Vec<String>, i32)> {
     ingest::reuse_chunks(pool, worksheet_id, file_ids, start_position).await
 }
 
-/// Load a worksheet's stored segments in document order.
-pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<Segment>, String> {
+pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> PipelineResult<Vec<Segment>> {
     let rows = sqlx::query_as::<_, (String, String, i32, Option<String>, String)>(
         "SELECT id, file_id, position, heading, text
          FROM chunks
@@ -94,8 +131,7 @@ pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<
     )
     .bind(worksheet_id)
     .fetch_all(pool)
-    .await
-    .map_err(|_| String::from("Failed to query segments"))?;
+    .await?;
 
     Ok(rows
         .into_iter()
@@ -110,18 +146,15 @@ pub async fn load_segments(pool: &SqlitePool, worksheet_id: &str) -> Result<Vec<
         .collect())
 }
 
-/// Load the set of already-persisted artifacts for a worksheet so a resumed
-/// generation run can skip them.
 pub async fn load_existing_artifacts(
     pool: &SqlitePool,
     worksheet_id: &str,
-) -> Result<generate::ExistingArtifacts, String> {
+) -> PipelineResult<generate::ExistingArtifacts> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT artifact_type, source FROM artifacts WHERE worksheet_id = ?")
             .bind(worksheet_id)
             .fetch_all(pool)
-            .await
-            .map_err(|_| String::from("Failed to query existing artifacts"))?;
+            .await?;
 
     let mut existing = generate::ExistingArtifacts::default();
     for (artifact_type, source) in rows {
@@ -138,22 +171,16 @@ pub async fn load_existing_artifacts(
     Ok(existing)
 }
 
-/// Whether an artifact type is a worksheet-wide merged type rather than a
-/// per-segment item type.
 fn items_field_is_merged(artifact_type: &ArtifactType) -> bool {
     matches!(artifact_type, ArtifactType::Summary | ArtifactType::MindMap)
 }
 
-/// Persist pending artifacts in one transaction.
 pub async fn persist_artifacts(
     pool: &SqlitePool,
     worksheet_id: &str,
     pending: &[PendingArtifact],
-) -> Result<Vec<Artifact>, String> {
-    let mut transaction = pool
-        .begin()
-        .await
-        .map_err(|_| String::from("Failed to begin artifact transaction"))?;
+) -> PipelineResult<Vec<Artifact>> {
+    let mut transaction = pool.begin().await?;
 
     let mut artifacts = Vec::with_capacity(pending.len());
     for item in pending {
@@ -174,27 +201,21 @@ pub async fn persist_artifacts(
         .bind(&artifact.source)
         .bind(&artifact.content)
         .execute(&mut *transaction)
-        .await
-        .map_err(|_| String::from("Failed to persist artifact"))?;
+        .await?;
         artifacts.push(artifact);
     }
 
-    transaction
-        .commit()
-        .await
-        .map_err(|_| String::from("Failed to commit generated artifacts"))?;
+    transaction.commit().await?;
 
     Ok(artifacts)
 }
 
-/// List the persisted artifacts of a worksheet for one artifact type,
-/// optionally capped at `count` randomly-selected items.
 pub async fn get_artifacts(
     pool: &SqlitePool,
     worksheet_id: &str,
     artifact_type: &ArtifactType,
     count: Option<i64>,
-) -> Result<Vec<Artifact>, String> {
+) -> PipelineResult<Vec<Artifact>> {
     let limit = count.map(|c| c.max(1)).unwrap_or(-1);
     let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
         "SELECT id, worksheet_id, artifact_type, source, content
@@ -207,15 +228,15 @@ pub async fn get_artifacts(
     .bind(artifact_type.to_db())
     .bind(limit)
     .fetch_all(pool)
-    .await
-    .map_err(|_| String::from("Failed to fetch artifacts"))?;
+    .await?;
 
     rows.into_iter()
         .map(|(id, worksheet_id, artifact_type, source, content)| {
             Ok(Artifact {
                 id,
                 worksheet_id,
-                artifact_type: ArtifactType::from_db(&artifact_type)?,
+                artifact_type: ArtifactType::from_db(&artifact_type)
+                    .map_err(PipelineError::Failed)?,
                 source,
                 content,
             })
@@ -271,19 +292,6 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-    }
-
-    #[allow(dead_code)] // exercised through the routed mock
-    fn mcq_output(question: &str, answer: &str, distractor: &str) -> String {
-        json!({
-            "questions": [{
-                "question": question,
-                "options": [answer, distractor, "Ribosomes", "Nucleus"],
-                "answer": answer,
-                "explanation": "The source states this directly."
-            }]
-        })
-        .to_string()
     }
 
     fn test_segments(count: usize) -> Vec<Segment> {
@@ -348,9 +356,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_all_produces_and_validates_with_mock_backend() {
-        // Two segments x five types = ten units, one turn each (no retries).
-        // Routing keys off request content so scheduling order cannot change
-        // the outcome.
         let backend = Arc::new(MockBackend::with_responder(move |request| {
             let source_has_mitochondria = request.user.contains("mitochondrion");
             match request.schema_name.as_str() {
@@ -427,12 +432,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Stop::never(),
         )
         .await
         .expect("generation should succeed");
 
-        // Ten units, exactly one turn each.
         assert_eq!(telemetry.requests, 10);
 
         for artifact in &pending {
@@ -454,11 +458,9 @@ mod tests {
                 .filter(|a| a.artifact_type.to_db() == kind)
                 .count()
         };
-        // One artifact per generated item for quiz types.
         assert_eq!(count_of("MultipleChoiceQuiz"), 2);
         assert_eq!(count_of("EssayQuiz"), 2);
         assert_eq!(count_of("CompletionQuiz"), 2);
-        // Single merged worksheet-wide artifacts covering both segments.
         assert_eq!(count_of("Summary"), 1);
         assert_eq!(count_of("MindMap"), 1);
 
@@ -499,7 +501,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Stop::never(),
         )
         .await
         .unwrap();
@@ -525,12 +527,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_all_stopped_before_start_cancels() {
+        let mock = Arc::new(MockBackend::new(vec![]));
+        let backend: Arc<dyn ArtifactBackend> = mock.clone();
+        let stop = Stop::new();
+        stop.stop();
+        let result = generate_all(
+            backend,
+            2,
+            &test_segments(1),
+            ExistingArtifacts::default(),
+            None,
+            None,
+            None,
+            None,
+            stop,
+        )
+        .await;
+        assert!(matches!(result, Err(PipelineError::Cancelled)));
+        assert_eq!(mock.request_count(), 0, "no units may spawn once stopped");
+    }
+
+    #[tokio::test]
     async fn test_load_existing_artifacts_classifies_items_and_merged() {
         let pool = setup_db().await;
         let worksheet_id = seed_worksheet(&pool).await;
 
-        // Two per-item quiz artifacts (one per segment source) plus one merged
-        // Summary artifact.
         sqlx::query(
             "INSERT INTO artifacts (id, worksheet_id, artifact_type, source, content)
              VALUES (?, ?, ?, ?, ?)",
@@ -559,7 +581,6 @@ mod tests {
 
         let existing = load_existing_artifacts(&pool, &worksheet_id).await.unwrap();
 
-        // Per-item quiz units are keyed by (type, source).
         assert!(existing
             .done_items
             .contains(&("MultipleChoiceQuiz".to_string(), "seg-0".to_string())));
@@ -570,7 +591,6 @@ mod tests {
             .done_items
             .contains(&("MultipleChoiceQuiz".to_string(), "seg-2".to_string())));
 
-        // Merged types are tracked by artifact type alone.
         assert!(existing.done_merged.contains("Summary"));
         assert!(!existing.done_merged.contains("MindMap"));
         assert_eq!(existing.done_items.len(), 2);

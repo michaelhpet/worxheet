@@ -1,8 +1,4 @@
-//! App-wide settings persisted as JSON in the app data directory.
-//!
-//! One in-memory source of truth ([`SettingsState`]) backs all settings reads
-//! and every write goes through the same write lock, then is flushed
-//! atomically (temp file + rename) so a crash cannot corrupt the file.
+//! App-wide settings persisted as JSON; writes flush atomically (temp + rename).
 
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -11,44 +7,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::config::{PerPresetConfig, ProviderSettings};
 
-/// Light/dark/system theme preference.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreference {
     Light,
     Dark,
+    #[default]
     System,
 }
 
-impl Default for ThemePreference {
-    fn default() -> Self {
-        Self::System
-    }
-}
-
-/// Appearance preferences.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppearanceSettings {
     pub theme: ThemePreference,
 }
 
-impl Default for AppearanceSettings {
-    fn default() -> Self {
-        Self {
-            theme: ThemePreference::default(),
-        }
-    }
-}
-
-/// Generation tuning. Not consumed by the pipeline yet — persisted now so the
-/// settings survive restarts ahead of wiring into generation requests.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactSettings {
-    /// Creativity, 0..=2.
     pub temperature: f32,
-    /// Ceiling on a single generation's output tokens.
     pub max_tokens: u32,
-    /// Optional reproducibility seed; `None` varies each run.
     pub seed: Option<i64>,
 }
 
@@ -62,33 +38,19 @@ impl Default for ArtifactSettings {
     }
 }
 
-/// The full persisted settings document.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     pub appearance: AppearanceSettings,
     pub provider: ProviderSettings,
     pub artifacts: ArtifactSettings,
 }
 
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            appearance: AppearanceSettings::default(),
-            provider: ProviderSettings::default(),
-            artifacts: ArtifactSettings::default(),
-        }
-    }
-}
-
-/// Optional fields to merge into [`AppSettings::appearance`].
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AppearanceSettingsPatch {
     pub theme: Option<ThemePreference>,
 }
 
-/// Optional fields to merge into [`AppSettings::artifacts`]. A `seed` of
-/// `Some(None)` explicitly clears the saved seed; a missing field leaves it
-/// untouched.
+/// `seed: Some(None)` clears the saved seed; a missing field leaves it.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ArtifactSettingsPatch {
     pub temperature: Option<f32>,
@@ -96,33 +58,36 @@ pub struct ArtifactSettingsPatch {
     pub seed: Option<Option<i64>>,
 }
 
-/// Partial settings update. Provider configuration is deliberately not part of
-/// the patch: it flows through `set_provider_config` so the preset-pinning and
-/// keychain behavior stays in one place.
+/// Provider configuration is deliberately excluded: it flows through
+/// `set_provider_config` instead.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AppSettingsPatch {
     pub appearance: Option<AppearanceSettingsPatch>,
     pub artifacts: Option<ArtifactSettingsPatch>,
 }
 
-/// Process-wide holder of [`AppSettings`] with atomic JSON persistence.
 pub struct SettingsState {
     storage: RwLock<AppSettings>,
     path: PathBuf,
 }
 
 impl SettingsState {
-    /// Load settings from `path`, falling back to defaults if the file does
-    /// not exist yet. The parent directory is created on demand.
+    /// Falls back to defaults when the file does not exist yet.
     pub fn load(path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create settings dir: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create settings dir: {e}"))?;
         }
         let storage = match std::fs::read_to_string(&path) {
             Ok(contents) => serde_json::from_str(&contents)
                 .map_err(|e| format!("Failed to parse settings at {}: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppSettings::default(),
-            Err(e) => return Err(format!("Failed to read settings at {}: {e}", path.display())),
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read settings at {}: {e}",
+                    path.display()
+                ))
+            }
         };
         Ok(Self {
             storage: RwLock::new(storage),
@@ -130,14 +95,11 @@ impl SettingsState {
         })
     }
 
-    /// The current settings.
     pub fn get(&self) -> AppSettings {
         self.storage.read().unwrap().clone()
     }
 
-    /// Merge an optional patch and persist the result. The merge and write
-    /// happen under the write lock so concurrent updates cannot drop each
-    /// other's fields.
+    /// Merge a patch and persist; the write lock keeps concurrent updates whole.
     pub fn update(&self, patch: &AppSettingsPatch) -> Result<AppSettings, String> {
         let mut settings = self.storage.write().unwrap();
         if let Some(appearance) = &patch.appearance {
@@ -147,8 +109,12 @@ impl SettingsState {
         }
         if let Some(artifacts) = &patch.artifacts {
             settings.artifacts = ArtifactSettings {
-                temperature: artifacts.temperature.unwrap_or(settings.artifacts.temperature),
-                max_tokens: artifacts.max_tokens.unwrap_or(settings.artifacts.max_tokens),
+                temperature: artifacts
+                    .temperature
+                    .unwrap_or(settings.artifacts.temperature),
+                max_tokens: artifacts
+                    .max_tokens
+                    .unwrap_or(settings.artifacts.max_tokens),
                 seed: artifacts.seed.unwrap_or(settings.artifacts.seed),
             };
         }
@@ -156,9 +122,7 @@ impl SettingsState {
         Ok(settings.clone())
     }
 
-    /// Update a single preset's config and set it as active. The read-modify-write
-    /// happens under the write lock so concurrent callers cannot drop each
-    /// other's changes.
+    /// Update one preset's config and set it active.
     pub fn update_provider_preset(
         &self,
         preset: &str,
@@ -171,13 +135,13 @@ impl SettingsState {
         Ok(settings.clone())
     }
 
-    /// Atomically replace the settings file (temp write + rename).
     fn persist_locked(&self, settings: &AppSettings) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(settings)
             .map_err(|e| format!("Failed to serialize settings: {e}"))?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes).map_err(|e| format!("Failed to write settings: {e}"))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| format!("Failed to replace settings: {e}"))?;
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| format!("Failed to replace settings: {e}"))?;
         Ok(())
     }
 }
@@ -243,7 +207,10 @@ mod tests {
                 }),
             })
             .unwrap();
-        assert_eq!(SettingsState::load(path).unwrap().get().artifacts.seed, None);
+        assert_eq!(
+            SettingsState::load(path).unwrap().get().artifacts.seed,
+            None
+        );
     }
 
     #[test]
@@ -256,7 +223,9 @@ mod tests {
             concurrency: 4,
             disable_thinking: true,
         };
-        state.update_provider_preset("ollama", config.clone()).unwrap();
+        state
+            .update_provider_preset("ollama", config.clone())
+            .unwrap();
 
         let reloaded = SettingsState::load(path).unwrap().get();
         assert_eq!(reloaded.provider.active, "ollama");
@@ -264,7 +233,6 @@ mod tests {
         assert_eq!(ollama.base_url, config.base_url);
         assert_eq!(ollama.model, config.model);
         assert_eq!(ollama.concurrency, 4);
-        // openai defaults are still there
         assert!(reloaded.provider.presets.contains_key("openai"));
     }
 

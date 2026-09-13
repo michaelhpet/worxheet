@@ -1,5 +1,4 @@
-//! OpenAI-compatible chat-completions client with retry/backoff and a
-//! graceful fallback when a server rejects structured outputs.
+//! OpenAI-compatible chat-completions client with retry/backoff.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -11,7 +10,6 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180)
 const MAX_ATTEMPTS: usize = 4;
 
 fn backoff_delay(attempt: usize) -> std::time::Duration {
-    // 700ms, 1.6s, 3.2s …
     std::time::Duration::from_millis(700 * (1 << attempt.min(3)) / 2 + 200)
 }
 
@@ -30,22 +28,17 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessage {
     content: Option<String>,
-    /// Some deployments (Ollama's thinking models) place the generated text
-    /// here and leave `content` empty.
+    /// Alternate text location on thinking-model deployments.
     #[serde(default)]
     reasoning: Option<String>,
-    /// OpenAI-style name for the same reasoning payload.
     #[serde(default)]
     reasoning_content: Option<String>,
-    /// Populated when the model declines to answer (content filters, refusals).
     #[serde(default)]
     refusal: Option<String>,
 }
 
 impl ChatMessage {
-    /// Best available text: ordinary content first, then reasoning fields so a
-    /// thinking-model reply that ships in `reasoning` is not mistaken for an
-    /// empty generation. Returns the source field for diagnosis.
+    /// Ordinary content first, then reasoning fallbacks.
     fn effective_text(&self) -> (&str, &'static str) {
         for (field, name) in [
             (self.content.as_deref(), "content"),
@@ -72,14 +65,11 @@ struct ModelEntry {
     id: String,
 }
 
-/// Client for any OpenAI-compatible `/chat/completions` deployment.
 pub struct OpenAiClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
     model: String,
-    /// `Some("none")` disables model thinking when set; `None` omits the field
-    /// entirely so providers that reject unknown params keep working.
     reasoning_effort: Option<String>,
 }
 
@@ -97,8 +87,6 @@ impl OpenAiClient {
         }
     }
 
-    /// Set the `reasoning_effort` sent with every request (`Some("none")` for
-    /// fast, direct answers from thinking models).
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.reasoning_effort = reasoning_effort;
         self
@@ -118,7 +106,10 @@ impl OpenAiClient {
 
 #[async_trait]
 impl ArtifactBackend for OpenAiClient {
-    async fn generate_json(&self, request: &GenerateRequest) -> Result<GenerateReply, ProviderError> {
+    async fn generate_json(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateReply, ProviderError> {
         let mut body = json!({
             "model": self.model,
             "messages": [
@@ -201,8 +192,7 @@ impl ArtifactBackend for OpenAiClient {
 
             if status.is_client_error() {
                 let text = response.text().await.unwrap_or_default();
-                // Older deployments reject `response_format` outright; fall
-                // back to prompt-only JSON once before giving up.
+                // Fall back to prompt-only JSON when structured outputs are rejected.
                 if structured && mentions_unsupported_schema(&text) {
                     structured = false;
                     continue;
@@ -274,7 +264,6 @@ fn mentions_unsupported_schema(text: &str) -> bool {
         || lowered.contains("structured output")
 }
 
-/// Remove markdown code fences some servers wrap JSON in.
 fn strip_code_fence(content: &str) -> String {
     let trimmed = content.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
@@ -288,7 +277,11 @@ fn strip_code_fence(content: &str) -> String {
 mod tests {
     use super::*;
 
-    fn message(content: Option<&str>, reasoning: Option<&str>, reasoning_content: Option<&str>) -> ChatMessage {
+    fn message(
+        content: Option<&str>,
+        reasoning: Option<&str>,
+        reasoning_content: Option<&str>,
+    ) -> ChatMessage {
         ChatMessage {
             content: content.map(String::from),
             reasoning: reasoning.map(String::from),
@@ -305,7 +298,6 @@ mod tests {
 
     #[test]
     fn test_effective_text_falls_back_to_reasoning_when_content_empty() {
-        // Ollama thinking models: text lands in `reasoning`, content stays empty.
         let msg = message(None, Some(r#"[answer]"#), None);
         assert_eq!(msg.effective_text(), ("[answer]", "reasoning"));
         let msg = message(Some(""), Some("[answer]"), Some("[also]"));
@@ -326,10 +318,7 @@ mod tests {
 
     #[test]
     fn test_strip_code_fence() {
-        assert_eq!(
-            strip_code_fence("```json\n{\"a\":1}\n```"),
-            "{\"a\":1}"
-        );
+        assert_eq!(strip_code_fence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
         assert_eq!(strip_code_fence("plain"), "plain");
     }
 }

@@ -1,19 +1,11 @@
 //! File parsing + segmentation + persistence.
-//!
-//! Parsers emit typed [`Block`]s (headings vs body) so the segmenter can
-//! exploit document structure. Files are parsed on parallel worker threads;
-//! resulting segments are stored in one transaction via batched multi-row
-//! inserts.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use liteparse::layout::{LayoutBlock, LayoutCell};
 use liteparse::ocr_merge::{ComplexityReason, PageComplexityStats};
 use liteparse::types::PdfInput;
-use liteparse::{
-    LiteParse, LiteParseConfig, OutputFormat, ParsedPage, DEFAULT_PAGE_BATCH_SIZE,
-};
+use liteparse::{LiteParse, LiteParseConfig, OutputFormat, ParsedPage, DEFAULT_PAGE_BATCH_SIZE};
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
@@ -21,76 +13,39 @@ use crate::logging::{self, RunLogs};
 use crate::schema::Segment;
 
 use super::segment::{self, Block, BlockKind, SegmentDraft};
+use super::{PipelineError, PipelineResult};
 
-/// Future that resolves once the pipeline stop flag is set. With no flag it
-/// pends forever so `tokio::select!` callers simply wait on the other branch.
-async fn cancel_requested(cancel: &Option<Arc<std::sync::atomic::AtomicBool>>) {
-    match cancel {
-        Some(flag) => loop {
-            if flag.load(Ordering::Relaxed) {
-                return;
-            }
-            tokio::task::yield_now().await;
-        },
-        None => std::future::pending().await,
-    }
-}
-
-/// PDF and image inputs routed to liteparse (PDFs are extracted directly;
-/// photos/scans are converted to PDF in-process before OCR).
 const DOCUMENT_EXTENSIONS: &[&str] = &[
     "pdf", "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg",
 ];
-/// iPhone/HEIF photos cannot be read by liteparse, so they are converted to
-/// JPEG first with macOS's bundled `sips` tool.
+/// HEIF photos go through macOS `sips` since liteparse cannot read them.
 const HEIC_EXTENSIONS: &[&str] = &["heic", "heif"];
 
-/// OCR (raster render + Tesseract recognition) is by far the dominant parse
-/// cost. For PDFs it is enabled only when at least this share of pages
-/// genuinely lack a usable native text layer (scanned/photographed pages);
-/// born-digital books parse without OCR even when figure-heavy.
+/// OCR dominates parse cost, so PDFs only enable it past this share of
+/// genuinely text-less pages.
 const OCR_NEEDED_PAGE_FRACTION: f32 = 0.5;
 
-/// Parse a file into ordered typed blocks. `on_page` (when given) reports
-/// `(pages_done, pages_total)` as parsing progresses so ingestion can surface a
-/// live progress bar even for a single large file. It is invoked from the parse
-/// worker thread, so it must be `Sync` (thread-safe to call).
-pub fn parse_blocks(
-    path: &str,
-    extension: &str,
-    on_page: Option<&(dyn Fn(usize, usize) + Sync)>,
-) -> Result<Vec<Block>, String> {
+/// Parse a file into ordered typed blocks.
+pub fn parse_blocks(path: &str, extension: &str) -> PipelineResult<Vec<Block>> {
     let ext = extension.to_lowercase();
     if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
-        return liteparse_blocks(path, ext == "pdf", on_page);
+        return liteparse_blocks(path, ext == "pdf");
     }
     if HEIC_EXTENSIONS.contains(&ext.as_str()) {
         let jpeg = heic_to_jpeg(path)?;
-        return liteparse_blocks(&jpeg, false, on_page);
+        return liteparse_blocks(&jpeg, false);
     }
     match ext.as_str() {
         "pptx" | "docx" | "ppt" | "doc" => parse_office_blocks(path),
-        _ => Err(format!("Unsupported file extension: {}", extension)),
+        _ => Err(PipelineError::Failed(format!(
+            "Unsupported file extension: {extension}"
+        ))),
     }
 }
 
-/// Parse PDFs and images via liteparse. Text PDFs use its layout classifier;
-/// scanned/handwritten pages go through OCR (bundled Tesseract by default, or
-/// a configured `ocr_server_url` when one is set). OCR is gated per PDF (see
-/// [`ocr_enabled_for_pdf`]) so a born-digital book with figures — whose pages
-/// get flagged for OCR just for containing images — does not pay for a full
-/// raster+recognition pass over its entire text layer. Images always take OCR
-/// (single pages, no native text). Pages are processed in bounded batches so a
-/// large document never holds every rendered page in memory; `on_page` advances
-/// once per finished batch.
-fn liteparse_blocks(
-    path: &str,
-    pdf: bool,
-    on_page: Option<&(dyn Fn(usize, usize) + Sync)>,
-) -> Result<Vec<Block>, String> {
-    // OCR runs on bundled Tesseract unless `WORXHEET_OCR_SERVER_URL` points at
-    // an EasyOCR/PaddleOCR HTTP sidecar (the higher-quality path for cursive
-    // handwriting). Exposing the rest of the liteparse knobs is TBD work.
+/// Pages stream in bounded batches so a large document never sits fully in memory.
+fn liteparse_blocks(path: &str, pdf: bool) -> PipelineResult<Vec<Block>> {
+    // Bundled Tesseract unless `WORXHEET_OCR_SERVER_URL` points at an OCR sidecar.
     let ocr_server_url = std::env::var("WORXHEET_OCR_SERVER_URL")
         .ok()
         .filter(|url| !url.trim().is_empty());
@@ -117,39 +72,24 @@ fn liteparse_blocks(
         ..config
     });
 
-    let mut session = tauri::async_runtime::block_on(parser.open_batch_session(
-        PdfInput::Path(path.to_string()),
-        DEFAULT_PAGE_BATCH_SIZE,
-    ))
-    .map_err(|e| format!("Failed to open document {path}: {e}"))?;
-
-    // Pages are now known: emit a start tick so progress + logs move instantly.
-    let total_pages = session.total_pages() as usize;
-    if let Some(on_page) = on_page {
-        on_page(0, total_pages);
-    }
+    let mut session = tauri::async_runtime::block_on(
+        parser.open_batch_session(PdfInput::Path(path.to_string()), DEFAULT_PAGE_BATCH_SIZE),
+    )
+    .map_err(|e| PipelineError::Failed(format!("Failed to open document {path}: {e}")))?;
 
     let mut blocks = Vec::new();
     while let Some(batch) = tauri::async_runtime::block_on(session.next_batch())
-        .map_err(|e| format!("Failed to parse document {path}: {e}"))?
+        .map_err(|e| PipelineError::Failed(format!("Failed to parse document {path}: {e}")))?
     {
         for page in &batch.result.pages {
             blocks.extend(blocks_from_page(page));
-        }
-        if let Some(on_page) = on_page {
-            on_page(batch.end_page as usize, total_pages);
         }
     }
     Ok(blocks)
 }
 
-/// A page genuinely needs OCR when its native text layer is missing or
-/// unusable. Pages flagged only because they *contain* an inline raster
-/// (`EmbeddedImages`) — and pages whose text is thin but readable
-/// (`SparseText`) — still yield usable text from the native layer, so they
-/// must not count: figure-heavy born-digital books would otherwise re-enable
-/// OCR over a complete text layer, the exact pathology behind the multi-minute
-/// parses.
+/// Image-only flags (`EmbeddedImages`) and thin-but-readable text
+/// (`SparseText`) still yield native text, so they must not count toward OCR.
 fn page_needs_ocr(stats: &PageComplexityStats) -> bool {
     stats.reasons.iter().any(|reason| {
         matches!(
@@ -162,7 +102,6 @@ fn page_needs_ocr(stats: &PageComplexityStats) -> bool {
     })
 }
 
-/// Fraction of pages whose native text layer genuinely needs OCR recovery.
 fn ocr_needed_page_fraction(stats: &[PageComplexityStats]) -> f32 {
     if stats.is_empty() {
         return 0.0;
@@ -170,26 +109,16 @@ fn ocr_needed_page_fraction(stats: &[PageComplexityStats]) -> f32 {
     stats.iter().filter(|s| page_needs_ocr(s)).count() as f32 / stats.len() as f32
 }
 
-/// Decide whether a PDF should run OCR: only when at least
-/// [`OCR_NEEDED_PAGE_FRACTION`] of its pages genuinely lack usable native text
-/// (scanned/photographed documents). Uses liteparse's cheap pre-OCR pass —
-/// a native-text + page-object walk, no rendering — so it costs seconds even
-/// for a 1600-page book. Falls back to OCR-enabled on any failure so nothing
-/// silently loses content.
+/// Cheap pre-OCR pass, no rendering. Fails open so nothing silently loses content.
 fn ocr_enabled_for_pdf(parser: &LiteParse, path: &str) -> bool {
-    let stats = tauri::async_runtime::block_on(parser.is_complex(PdfInput::Path(
-        path.to_string(),
-    )));
+    let stats = tauri::async_runtime::block_on(parser.is_complex(PdfInput::Path(path.to_string())));
     match stats {
         Ok(stats) => ocr_needed_page_fraction(&stats) >= OCR_NEEDED_PAGE_FRACTION,
         Err(_) => true,
     }
 }
 
-/// Convert one parsed page into typed blocks. The layout classifier is
-/// preferred: its `heading`/`paragraph`/… blocks carry reading order and
-/// heading levels. OCR-only (scanned/handwritten) pages have no layout
-/// decomposition, so we fall back to the markdown emitter, then to raw text.
+/// Layout first, then markdown, then raw text.
 fn blocks_from_page(page: &ParsedPage) -> Vec<Block> {
     if let Some(layout) = &page.blocks {
         let blocks: Vec<Block> = layout.iter().filter_map(layout_block_to_block).collect();
@@ -212,7 +141,6 @@ fn blocks_from_page(page: &ParsedPage) -> Vec<Block> {
 
 fn layout_block_to_block(block: &LayoutBlock) -> Option<Block> {
     match block.kind {
-        // Floaters (figures, rules) contribute no text blocks of their own.
         "figure" | "rule" => None,
         "heading" => {
             let text = block.text.as_deref().unwrap_or_default().trim().to_string();
@@ -238,9 +166,7 @@ fn layout_block_to_block(block: &LayoutBlock) -> Option<Block> {
     }
 }
 
-/// Render a non-heading layout block as flat body text (tables are laid out
-/// one row per line, cells tab-separated, so they survive downstream
-/// tokenization).
+/// Tables render one row per line, cells tab-separated.
 fn layout_block_text(block: &LayoutBlock) -> String {
     match block.kind {
         "table" => {
@@ -280,9 +206,7 @@ fn render_cells(cells: &[LayoutCell]) -> String {
         .join("\t")
 }
 
-/// Split markdown into blocks on `#` headings. Shared by the office parser
-/// (which gets markdown from `office_oxide`) and the fallback for liteparse
-/// pages without a layout decomposition.
+/// Split markdown into blocks on `#` headings.
 fn markdown_blocks(markdown: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut pending_body = String::new();
@@ -326,10 +250,9 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
     blocks
 }
 
-/// Convert a HEIC/HEIF photo to JPEG with macOS's bundled `sips` tool and
-/// return the temporary output path (kept alive for the duration of the parse;
-/// the OS temp dir is cleaned up periodically).
-fn heic_to_jpeg(path: &str) -> Result<String, String> {
+/// Convert a HEIC/HEIF photo to JPEG with macOS `sips`; the temp output lives
+/// for the duration of the parse.
+fn heic_to_jpeg(path: &str) -> PipelineResult<String> {
     let out = std::env::temp_dir()
         .join(format!("worxheet_{}.jpg", ulid::Ulid::new()))
         .to_string_lossy()
@@ -345,26 +268,28 @@ fn heic_to_jpeg(path: &str) -> Result<String, String> {
         .arg("--out")
         .arg(&out)
         .status()
-        .map_err(|e| format!("Failed to run sips (HEIC photos require macOS): {e}"))?;
+        .map_err(|e| {
+            PipelineError::Failed(format!(
+                "Failed to run sips (HEIC photos require macOS): {e}"
+            ))
+        })?;
     if !status.success() {
-        return Err(format!("sips failed to convert HEIC photo: {path}"));
+        return Err(PipelineError::Failed(format!(
+            "sips failed to convert HEIC photo: {path}"
+        )));
     }
     Ok(out)
 }
 
-/// Office formats: markdown export preserves headings (`#`) and slide titles;
-/// split on those markers into structured blocks.
-fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
-    let markdown =
-        office_oxide::to_markdown(path).map_err(|e| format!("Failed to extract text: {e}"))?;
+fn parse_office_blocks(path: &str) -> PipelineResult<Vec<Block>> {
+    let markdown = office_oxide::to_markdown(path)
+        .map_err(|e| PipelineError::Failed(format!("Failed to export office markdown: {e}")))?;
 
     let mut blocks = markdown_blocks(&markdown);
 
     if blocks.is_empty() {
-        // Structure-free fallback: whole document as one body block; drift
-        // segmentation will carve it up.
-        let plain =
-            office_oxide::extract_text(path).map_err(|e| format!("Failed to extract text: {e}"))?;
+        let plain = office_oxide::extract_text(path)
+            .map_err(|e| PipelineError::Failed(format!("Failed to extract office text: {e}")))?;
         if !plain.trim().is_empty() {
             blocks.push(Block {
                 kind: BlockKind::Body,
@@ -376,13 +301,11 @@ fn parse_office_blocks(path: &str) -> Result<Vec<Block>, String> {
     Ok(blocks)
 }
 
-/// Parse every file, segment it, and persist the segments in source order.
-/// Reports progress as each file completes.
 pub async fn unchunked_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
-) -> Result<Vec<String>, String> {
+) -> PipelineResult<Vec<String>> {
     if file_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -391,8 +314,7 @@ pub async fn unchunked_files(
         sqlx::query_scalar("SELECT DISTINCT file_id FROM chunks WHERE worksheet_id = ?")
             .bind(worksheet_id)
             .fetch_all(pool)
-            .await
-            .map_err(|_| String::from("Failed to query existing chunks"))?;
+            .await?;
 
     let chunked_set: std::collections::HashSet<&str> = chunked.iter().map(String::as_str).collect();
     Ok(file_ids
@@ -405,34 +327,28 @@ pub async fn unchunked_files(
 pub async fn next_segment_position(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
-) -> Result<i32, String> {
+) -> PipelineResult<i32> {
     let (max_position,): (Option<i32>,) =
         sqlx::query_as("SELECT MAX(position) FROM chunks WHERE worksheet_id = ?")
             .bind(worksheet_id)
             .fetch_one(pool)
-            .await
-            .map_err(|_| String::from("Failed to query segment position"))?;
+            .await?;
 
     Ok(max_position.unwrap_or(-1) + 1)
 }
 
-/// Copy chunks from an existing file that shares the same content hash as one
-/// of `file_ids`, so a duplicate source is not re-parsed/segmented per
-/// worksheet. Chunks are copied in their original order and assigned fresh
-/// ids/positions for this worksheet. Returns the file ids that still need a
-/// real parse (no hash, or no matching chunked source) and the next position
-/// to continue from.
+/// Copy chunks from same-content files in other worksheets instead of
+/// re-parsing duplicates. Returns files still needing a real parse.
 pub async fn reuse_chunks(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     start_position: i32,
-) -> Result<(Vec<String>, i32), String> {
+) -> PipelineResult<(Vec<String>, i32)> {
     if file_ids.is_empty() {
         return Ok((Vec::new(), start_position));
     }
 
-    // Bulk-load all file identity keys in one query.
     let ids_csv: String = file_ids
         .iter()
         .map(|id| format!("'{id}'"))
@@ -443,8 +359,7 @@ pub async fn reuse_chunks(
     ))
     .bind(worksheet_id)
     .fetch_all(pool)
-    .await
-    .map_err(|_| String::from("Failed to query file identity keys"))?;
+    .await?;
 
     let identity_map: std::collections::HashMap<String, Option<String>> =
         identity_rows.into_iter().collect();
@@ -460,8 +375,6 @@ pub async fn reuse_chunks(
             continue;
         };
 
-        // Find an already-chunked file with the same identity key in another
-        // worksheet.
         let source: Option<(String,)> = sqlx::query_as(
             "SELECT c.file_id
              FROM chunks c
@@ -474,8 +387,7 @@ pub async fn reuse_chunks(
         .bind(&identity)
         .bind(worksheet_id)
         .fetch_optional(pool)
-        .await
-        .map_err(|_| String::from("Failed to look up reusable chunks"))?;
+        .await?;
 
         let Some((source_file_id,)) = source else {
             remaining.push(file_id.clone());
@@ -489,8 +401,7 @@ pub async fn reuse_chunks(
         )
         .bind(&source_file_id)
         .fetch_all(pool)
-        .await
-        .map_err(|_| String::from("Failed to load reusable chunks"))?;
+        .await?;
 
         for (heading, text) in rows {
             all_insert_rows.push((
@@ -505,10 +416,7 @@ pub async fn reuse_chunks(
     }
 
     if !all_insert_rows.is_empty() {
-        let mut transaction = pool
-            .begin()
-            .await
-            .map_err(|_| String::from("Failed to begin reuse transaction"))?;
+        let mut transaction = pool.begin().await?;
 
         let batch_size = 400;
         for chunk in all_insert_rows.chunks(batch_size) {
@@ -523,48 +431,35 @@ pub async fn reuse_chunks(
                     .push_bind(heading)
                     .push_bind(text);
             });
-            builder
-                .build()
-                .execute(&mut *transaction)
-                .await
-                .map_err(|_| String::from("Failed to batch insert reused chunks"))?;
+            builder.build().execute(&mut *transaction).await?;
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|_| String::from("Failed to commit reused chunks"))?;
+        transaction.commit().await?;
     }
 
     sqlx::query("UPDATE worksheets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(worksheet_id)
         .execute(pool)
-        .await
-        .map_err(|_| String::from("Failed to update worksheet"))?;
+        .await?;
 
     Ok((remaining, position))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn process_files(
     pool: &sqlx::SqlitePool,
     worksheet_id: &str,
     file_ids: &[String],
     start_position: i32,
     tokenizer: Arc<Tokenizer>,
-    mut on_progress: Option<Box<dyn FnMut(usize, usize) + Send>>,
     logs: Option<Arc<RunLogs>>,
-    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Result<Vec<Segment>, String> {
+    stop: super::Stop,
+) -> PipelineResult<Vec<Segment>> {
     let total_files = file_ids.len();
     if total_files == 0 {
         return Ok(Vec::new());
     }
-    if super::is_cancel_requested(&cancel) {
-        return Err(String::from(super::CANCELLED_MESSAGE));
-    }
+    stop.check()?;
 
-    // Load metadata up front so parsing never touches the database.
     let mut metadata = Vec::with_capacity(total_files);
     for file_id in file_ids {
         let row = sqlx::query_as::<_, (String, String)>(
@@ -574,8 +469,8 @@ pub async fn process_files(
         .bind(worksheet_id)
         .fetch_optional(pool)
         .await
-        .map_err(|_| format!("Failed to query file {file_id}"))?
-        .ok_or_else(|| format!("File not found: {file_id}"))?;
+        .map_err(|e| PipelineError::Failed(format!("Failed to query file {file_id}: {e}")))?
+        .ok_or_else(|| PipelineError::Failed(format!("File not found: {file_id}")))?;
         metadata.push((file_id.clone(), row.0, row.1));
     }
 
@@ -587,14 +482,8 @@ pub async fn process_files(
 
     let mut segmented: Vec<Option<Vec<SegmentDraft>>> = vec![None; total_files];
 
-    // Single channel carrying both live page progress and file completions so
-    // the async side can report progress while workers parse.
-    enum Msg {
-        Progress(usize, usize),
-        Done(usize, Result<Vec<SegmentDraft>, String>),
-    }
-    let capacity = total_files.max(1) * 4096;
-    let (tx, mut rx) = mpsc::channel::<Msg>(capacity);
+    let (tx, mut rx) =
+        mpsc::channel::<(usize, PipelineResult<Vec<SegmentDraft>>)>(total_files.max(1));
 
     let mut done = 0usize;
     let mut start = 0;
@@ -610,8 +499,7 @@ pub async fn process_files(
             let file_id = file_id.clone();
             let worksheet_id = worksheet_id.to_string();
             tauri::async_runtime::spawn_blocking(move || {
-                let result = (|| -> Result<Vec<SegmentDraft>, String> {
-                    // File reads: parse and log the extracted shape.
+                let result = (|| -> PipelineResult<Vec<SegmentDraft>> {
                     if let Some(logs) = &logs {
                         let started_record = serde_json::json!({
                             "timestamp": logging::rfc3339_utc(),
@@ -623,23 +511,12 @@ pub async fn process_files(
                         });
                         logs.write_json(
                             "file_reads",
-                            &format!(
-                                "parse_started_{}",
-                                logging::sanitize_label(&file_id)
-                            ),
+                            &format!("parse_started_{}", logging::sanitize_label(&file_id)),
                             &started_record,
                         );
                     }
                     let parse_started = std::time::Instant::now();
-                    let pages = AtomicUsize::new(0usize);
-                    let page_sender = tx.clone();
-                    // `on_page` fires from the parse worker thread, so it must
-                    // be Sync: an atomic page count + a channel sender suffice.
-                    let on_parse = |done: usize, total: usize| {
-                        pages.store(total, Ordering::SeqCst);
-                        let _ = page_sender.blocking_send(Msg::Progress(done, total));
-                    };
-                    let blocks = parse_blocks(&path, &extension, Some(&on_parse))?;
+                    let blocks = parse_blocks(&path, &extension)?;
                     if let Some(logs) = &logs {
                         let mut by_kind = std::collections::BTreeMap::new();
                         for block in &blocks {
@@ -656,24 +533,14 @@ pub async fn process_files(
                             "path": path,
                             "extension": extension,
                             "blocks": by_kind,
-                            "pages": pages.load(Ordering::SeqCst),
                             "duration_ms": parse_started.elapsed().as_millis(),
                         });
                         logs.write_json("file_reads", &logging::sanitize_label(&file_id), &record);
                     }
 
-                    // Segmentation: tokenize once per file and log the cost.
                     let seg_started = std::time::Instant::now();
                     let mut trace = segment::TokenizeTrace::default();
-                    let tx_seg = tx.clone();
-                    let drafts = segment::segment_blocks(
-                        blocks,
-                        &tokenizer,
-                        Some(&mut move |bd, bt| {
-                            let _ = tx_seg.blocking_send(Msg::Progress(bd, bt));
-                        }),
-                        Some(&mut trace),
-                    );
+                    let drafts = segment::segment_blocks(blocks, &tokenizer, Some(&mut trace));
                     if let Some(logs) = &logs {
                         let token_record = serde_json::json!({
                             "timestamp": logging::rfc3339_utc(),
@@ -687,24 +554,10 @@ pub async fn process_files(
                             &token_record,
                         );
 
-                        let segments: Vec<_> = drafts
-                            .iter()
-                            .enumerate()
-                            .map(|(position, draft)| {
-                                serde_json::json!({
-                                    "timestamp": logging::rfc3339_utc(),
-                                    "position": position,
-                                    "heading": draft.heading,
-                                    "tokens": draft.tokens,
-                                    "chars": draft.text.chars().count(),
-                                })
-                            })
-                            .collect();
                         let segment_record = serde_json::json!({
                             "timestamp": logging::rfc3339_utc(),
-                            "count": segments.len(),
+                            "count": drafts.len(),
                             "total_tokens": drafts.iter().map(|d| d.tokens).sum::<usize>(),
-                            "segments": segments,
                         });
                         logs.write_json(
                             "segmentation",
@@ -714,38 +567,31 @@ pub async fn process_files(
                     }
                     Ok(drafts)
                 })();
-                let _ = tx.blocking_send(Msg::Done(index, result));
+                let _ = tx.blocking_send((index, result));
             });
         }
 
+        let stop_watch = stop.clone();
         while done < end {
             tokio::select! {
                 biased;
-                _ = cancel_requested(&cancel) => {
-                    return Err(String::from(super::CANCELLED_MESSAGE));
+                _ = stop_watch.stopped() => {
+                    return Err(PipelineError::Cancelled);
                 }
                 msg = rx.recv() => {
-                    match msg.ok_or_else(|| String::from("Parse channel closed unexpectedly"))? {
-                        Msg::Progress(pages_done, pages_total) => {
-                            if let Some(on_progress) = on_progress.as_deref_mut() {
-                                on_progress(pages_done, pages_total);
-                            }
-                        }
-                        Msg::Done(index, result) => {
-                            segmented[index] = Some(result?);
-                            done += 1;
-                        }
-                    }
+                    let (index, result) =
+                        msg.ok_or_else(|| {
+                            PipelineError::Failed(String::from("Parse channel closed unexpectedly"))
+                        })?;
+                    segmented[index] = Some(result?);
+                    done += 1;
                 }
             }
         }
-        if super::is_cancel_requested(&cancel) {
-            return Err(String::from(super::CANCELLED_MESSAGE));
-        }
+        stop.check()?;
         start = end;
     }
 
-    // Flatten drafts in document order, then persist in one transaction.
     let flat: Vec<&SegmentDraft> = segmented.iter().flatten().flatten().collect();
     if flat.is_empty() {
         return Ok(Vec::new());
@@ -789,10 +635,7 @@ pub async fn process_files(
         }
     }
 
-    let mut transaction = pool
-        .begin()
-        .await
-        .map_err(|_| String::from("Failed to begin ingest transaction"))?;
+    let mut transaction = pool.begin().await?;
 
     let batch_size = 400;
     for chunk in insert_rows.chunks(batch_size) {
@@ -807,23 +650,15 @@ pub async fn process_files(
                 .push_bind(heading)
                 .push_bind(text);
         });
-        builder
-            .build()
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| String::from("Failed to batch insert segments"))?;
+        builder.build().execute(&mut *transaction).await?;
     }
 
-    transaction
-        .commit()
-        .await
-        .map_err(|_| String::from("Failed to commit ingested segments"))?;
+    transaction.commit().await?;
 
     sqlx::query("UPDATE worksheets SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(worksheet_id)
         .execute(pool)
-        .await
-        .map_err(|_| String::from("Failed to update worksheet"))?;
+        .await?;
 
     Ok(all_segments)
 }
@@ -836,18 +671,16 @@ mod tests {
 
     #[test]
     fn test_parse_unsupported_extension() {
-        assert!(parse_blocks("test.txt", "txt", None).is_err());
+        assert!(parse_blocks("test.txt", "txt").is_err());
     }
 
     #[test]
     fn test_parse_missing_file() {
         let path = format!("{}/nonexistent.pdf", FIXTURE_DIR);
-        assert!(parse_blocks(&path, "pdf", None).is_err());
+        assert!(parse_blocks(&path, "pdf").is_err());
     }
 
-    /// Hand-build a minimal one-page PDF: a large bold heading line followed by
-    /// two regular body lines. PDFium parses it and liteparse's layout
-    /// classifier should treat the big text as a heading.
+    /// Minimal one-page PDF: one large bold heading line, two body lines.
     fn make_test_pdf() -> Vec<u8> {
         fn obj(out: &mut Vec<u8>, number: u32, body: &[u8]) -> usize {
             let offset = out.len();
@@ -906,20 +739,20 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
         out
     }
 
-    // Verified: a hand-rolled PDF that PDFium accepts, with a large bold heading
-    // line that liteparse's classifier must surface as a Heading block.
     #[test]
     fn test_parse_pdf_extracts_heading_and_body() {
         let pdf = make_test_pdf();
         let path = std::env::temp_dir().join(format!("worxheet_pdf_{}.pdf", ulid::Ulid::new()));
         std::fs::write(&path, &pdf).unwrap();
-        let result = parse_blocks(&path.to_string_lossy(), "pdf", None);
+        let result = parse_blocks(&path.to_string_lossy(), "pdf");
         let _ = std::fs::remove_file(&path);
         let blocks = result.unwrap();
 
         assert!(blocks.iter().any(|b| b.text.contains("Introduction")));
         assert!(
-            blocks.iter().any(|b| matches!(b.kind, BlockKind::Heading(_))),
+            blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading(_))),
             "layout classifier should mark the intro as a heading"
         );
         let body = blocks
@@ -934,54 +767,71 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
     fn test_markdown_blocks_splits_headings() {
         let blocks = markdown_blocks("# Chapter 1\nSome body text.\n\n## 1.1 Sub\nMore text.\n");
         assert_eq!(blocks.len(), 4);
-        assert_eq!(blocks[0], Block {
-            kind: BlockKind::Heading(1),
-            text: "Chapter 1".to_string(),
-        });
-        assert_eq!(blocks[1], Block {
-            kind: BlockKind::Body,
-            text: "Some body text.\n\n".to_string(),
-        });
-        assert_eq!(blocks[2], Block {
-            kind: BlockKind::Heading(2),
-            text: "1.1 Sub".to_string(),
-        });
+        assert_eq!(
+            blocks[0],
+            Block {
+                kind: BlockKind::Heading(1),
+                text: "Chapter 1".to_string(),
+            }
+        );
+        assert_eq!(
+            blocks[1],
+            Block {
+                kind: BlockKind::Body,
+                text: "Some body text.\n\n".to_string(),
+            }
+        );
+        assert_eq!(
+            blocks[2],
+            Block {
+                kind: BlockKind::Heading(2),
+                text: "1.1 Sub".to_string(),
+            }
+        );
         assert!(blocks[3].text.contains("More text."));
     }
 
     #[test]
     fn test_layout_blocks_map_to_headings_and_body() {
         let heading = layout_block("heading");
-        assert_eq!(layout_block_to_block(&heading), Some(Block {
-            kind: BlockKind::Heading(3),
-            text: "Chapter 2".to_string(),
-        }));
+        assert_eq!(
+            layout_block_to_block(&heading),
+            Some(Block {
+                kind: BlockKind::Heading(3),
+                text: "Chapter 2".to_string(),
+            })
+        );
 
-        assert_eq!(layout_block_to_block(&LayoutBlock {
-            kind: "figure",
-            text: None,
-            level: None,
-            bold: false,
-            italic: false,
-            ordered: None,
-            marker: None,
-            lines: None,
-            lang: None,
-            header: None,
-            rows: None,
-            id: None,
-            format: None,
-            bbox: None,
-        }), None);
+        assert_eq!(
+            layout_block_to_block(&LayoutBlock {
+                kind: "figure",
+                text: None,
+                level: None,
+                bold: false,
+                italic: false,
+                ordered: None,
+                marker: None,
+                lines: None,
+                lang: None,
+                header: None,
+                rows: None,
+                id: None,
+                format: None,
+                bbox: None,
+            }),
+            None
+        );
 
         let paragraph = layout_block("paragraph");
-        assert_eq!(layout_block_to_block(&paragraph), Some(Block {
-            kind: BlockKind::Body,
-            text: "Plain body words here.".to_string(),
-        }));
+        assert_eq!(
+            layout_block_to_block(&paragraph),
+            Some(Block {
+                kind: BlockKind::Body,
+                text: "Plain body words here.".to_string(),
+            })
+        );
     }
 
-    /// A `LayoutBlock` for the given kind with representative content.
     fn layout_block(kind: &'static str) -> LayoutBlock {
         let (text, level) = match kind {
             "heading" => (Some("Chapter 2".to_string()), Some(3)),
@@ -1019,17 +869,35 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
             lines: None,
             lang: None,
             header: Some(vec![
-                LayoutCell { text: "Name".to_string(), bbox: None },
-                LayoutCell { text: "Value".to_string(), bbox: None },
+                LayoutCell {
+                    text: "Name".to_string(),
+                    bbox: None,
+                },
+                LayoutCell {
+                    text: "Value".to_string(),
+                    bbox: None,
+                },
             ]),
             rows: Some(vec![
                 vec![
-                    LayoutCell { text: "A".to_string(), bbox: None },
-                    LayoutCell { text: "1".to_string(), bbox: None },
+                    LayoutCell {
+                        text: "A".to_string(),
+                        bbox: None,
+                    },
+                    LayoutCell {
+                        text: "1".to_string(),
+                        bbox: None,
+                    },
                 ],
                 vec![
-                    LayoutCell { text: "B".to_string(), bbox: None },
-                    LayoutCell { text: "2".to_string(), bbox: None },
+                    LayoutCell {
+                        text: "B".to_string(),
+                        bbox: None,
+                    },
+                    LayoutCell {
+                        text: "2".to_string(),
+                        bbox: None,
+                    },
                 ],
             ]),
             id: None,
@@ -1042,7 +910,6 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
         assert!(text.contains("B\t2\n"));
     }
 
-    /// A complexity-stats stub carrying only the fields the OCR gate reads.
     fn complexity_stats(reasons: Vec<ComplexityReason>) -> PageComplexityStats {
         PageComplexityStats {
             page_number: 1,
@@ -1064,17 +931,13 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
 
     #[test]
     fn test_page_needs_ocr_ignores_figure_pages() {
-        // A born-digital textbook page with an inline figure is flagged
-        // `EmbeddedImages` but its text layer is complete: no OCR.
         assert!(!page_needs_ocr(&complexity_stats(vec![
             ComplexityReason::EmbeddedImages
         ])));
-        // A thin-but-readable page (`SparseText`) is likewise text-first.
         assert!(!page_needs_ocr(&complexity_stats(vec![
             ComplexityReason::EmbeddedImages,
             ComplexityReason::SparseText,
         ])));
-        // Scanned / textless / garbled pages genuinely need OCR.
         assert!(page_needs_ocr(&complexity_stats(vec![
             ComplexityReason::Scanned,
             ComplexityReason::EmbeddedImages,
@@ -1089,15 +952,11 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
 
     #[test]
     fn test_ocr_gate_enables_ocr_only_when_needed_share_is_large() {
-        // Figure-heavy born-digital book: every page only `EmbeddedImages` →
-        // well below the threshold, OCR stays off.
         let born_digital: Vec<PageComplexityStats> = (0..8)
             .map(|_| complexity_stats(vec![ComplexityReason::EmbeddedImages]))
             .collect();
         assert!(ocr_needed_page_fraction(&born_digital) < OCR_NEEDED_PAGE_FRACTION);
 
-        // A genuinely scanned stack: most pages carry a full-page raster with
-        // no text → at/over the threshold, OCR engages.
         let scans: Vec<PageComplexityStats> = (0..8)
             .map(|i| {
                 complexity_stats(if i < 5 {
@@ -1109,7 +968,6 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
             .collect();
         assert!(ocr_needed_page_fraction(&scans) >= OCR_NEEDED_PAGE_FRACTION);
 
-        // Empty/unreadable probe → `is_complex` returned nothing: no OCR.
         assert_eq!(ocr_needed_page_fraction(&[]), 0.0);
     }
 

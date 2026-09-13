@@ -1,11 +1,4 @@
-//! Best-effort file logging for pipeline observability.
-//!
-//! Every artifact is a uniquely-named file under a stage subdirectory of the
-//! log root (`logs/file_reads`, `logs/tokenization`, `logs/segmentation`,
-//! `logs/generation`). Filenames carry a UTC timestamp prefix so listing a
-//! directory is chronological, which doubles as a performance trace. Logging is
-//! best-effort: any I/O failure is swallowed — observability never breaks
-//! parsing, segmentation, or generation.
+//! Best-effort file logging: I/O failure never breaks the pipeline.
 
 use std::fs;
 use std::io;
@@ -13,7 +6,6 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-/// Root of all pipeline logs, resolved once per pipeline run.
 #[derive(Clone, Debug)]
 pub struct RunLogs {
     root: PathBuf,
@@ -21,12 +13,13 @@ pub struct RunLogs {
 
 impl RunLogs {
     /// Resolve the log root: `WORXHHEET_LOG_DIR` if set, else CWD-relative
-    /// `logs/` (project root during development).
-    pub fn new() -> Option<Self> {
-        std::env::var_os("WORXHHEET_LOG_DIR")
+    /// `logs/` (project root during development). Infallible by design:
+    /// pass `None` instead of a `RunLogs` where logging should be disabled.
+    pub fn new() -> Self {
+        let root = std::env::var_os("WORXHHEET_LOG_DIR")
             .map(PathBuf::from)
-            .or_else(|| Some(PathBuf::from("logs")))
-            .map(|root| Self { root })
+            .unwrap_or_else(|| PathBuf::from("logs"));
+        Self { root }
     }
 
     /// Stage subdirectory (e.g. `generation`), created on demand.

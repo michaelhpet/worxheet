@@ -13,7 +13,9 @@ pub async fn get_artifacts(
     artifact_type: ArtifactType,
     count: Option<i64>,
 ) -> Result<Vec<Artifact>, String> {
-    pipeline::get_artifacts(&state.database, &worksheet_id, &artifact_type, count).await
+    pipeline::get_artifacts(&state.database, &worksheet_id, &artifact_type, count)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Current pipeline status for a worksheet, merging live progress with the
@@ -34,6 +36,7 @@ pub async fn get_pipeline_status(
         &worksheet_id,
     )
     .await
+    .map_err(|e| e.to_string())
 }
 
 /// Restart a worksheet's pipeline, e.g. after the user fixes the cause of a

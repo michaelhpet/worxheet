@@ -210,8 +210,7 @@ export function SettingsDialog() {
 									</Field>
 
 									<div className="rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground">
-										The creativity, output, and seed settings above are not wired up yet — they're a preview of what's
-										coming.
+										The creativity, output, and seed settings above apply to the next pipeline run.
 									</div>
 								</div>
 							)}

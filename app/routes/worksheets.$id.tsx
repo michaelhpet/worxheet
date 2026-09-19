@@ -1,5 +1,7 @@
 import { Layout } from "@/components/layout";
+import { MindMapTabContent } from "@/components/mind-map-tab-content";
 import { QuizTabContent } from "@/components/quiz-tab-content";
+import { SummaryTabContent } from "@/components/summary-tab-content";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -180,11 +182,22 @@ function WorksheetDetail() {
 					</div>
 				)}
 				{worksheet ? (
-					QUIZ_TYPES.map((type) => {
-						const quizType = ARTIFACT_TYPE_OPTIONS.find((option) => option.value === type);
-						if (!quizType) return null;
-						return <QuizTabContent key={type} worksheet={worksheet} artifactType={quizType} />;
-					})
+					<>
+						{QUIZ_TYPES.map((type) => {
+							const quizType = ARTIFACT_TYPE_OPTIONS.find((option) => option.value === type);
+							if (!quizType) return null;
+							return <QuizTabContent key={type} worksheet={worksheet} artifactType={quizType} />;
+						})}
+						{ARTIFACT_TYPE_OPTIONS.filter(
+							(option) => option.value === ARTIFACT_TYPES.Summary || option.value === ARTIFACT_TYPES.MindMap,
+						).map((option) =>
+							option.value === ARTIFACT_TYPES.Summary ? (
+								<SummaryTabContent key={option.value} worksheet={worksheet} artifactType={option} />
+							) : (
+								<MindMapTabContent key={option.value} worksheet={worksheet} artifactType={option} />
+							),
+						)}
+					</>
 				) : (
 					<div className="grow flex flex-col items-center mt-[calc((100vh-436px)/4)]">
 						<Spinner />

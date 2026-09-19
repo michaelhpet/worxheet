@@ -1,5 +1,6 @@
-//! Cloud-hosted artifact generation: one model turn per unit, no retries;
-//! merged types assemble deterministically from per-segment sections.
+//! Cloud-hosted artifact generation: one model turn per unit, no retries.
+//! Quiz types fan out per segment; Summary and MindMap cover the whole
+//! worksheet in one request each, guided by a deterministic topic skeleton.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,19 +81,23 @@ fn spec(artifact_type: &ArtifactType) -> &'static ArtifactSpec {
         schema: completion_schema,
     };
     static SUMMARY: ArtifactSpec = ArtifactSpec {
-        task: "Summarize this slice of the material: a short title, a focused paragraph capturing \
-               its main ideas.",
+        task: "Write an article-length summary of the material below: a short title, \
+               several paragraphs covering each major topic in document order, and \
+               key points.",
         example: None,
         temperature: Some(0.3),
-        max_tokens: Some(700),
+        max_tokens: Some(2000),
         items_field: None,
         schema: summary_schema,
     };
     static MINDMAP: ArtifactSpec = ArtifactSpec {
-        task: "Extract the topic of this slice of the material and its major branches, each with short child concepts drawn from the material.",
+        task: "Extract the overarching topic of the material below and its major branches. \
+               Each branch carries a label and children which are themselves branches — \
+               nest recursively wherever the material warrants depth, down to individual \
+               concepts. Cover the whole material, sizing the map as the content warrants.",
         example: None,
         temperature: Some(0.4),
-        max_tokens: Some(900),
+        max_tokens: Some(2000),
         items_field: None,
         schema: mindmap_schema,
     };
@@ -118,8 +123,13 @@ fn max_tokens_for(artifact_type: &ArtifactType, params: &GenerationParams) -> i3
     }
 }
 
-/// Beyond this many segments per type, sample evenly instead of fanning out.
-const MAX_UNITS_PER_TYPE: usize = 48;
+/// Beyond this many segments, quiz types sample evenly instead of fanning out.
+/// Merged types (Summary/MindMap) cover the whole worksheet in one request each.
+const MAX_QUIZ_SEGMENTS: usize = 48;
+
+/// Source-material budget, in approximate tokens, for one worksheet-wide
+/// Summary or MindMap request.
+const WHOLE_MATERIAL_BUDGET_TOKENS: usize = 8_000;
 
 #[derive(Clone, Debug)]
 pub struct GenerationTick {
@@ -195,7 +205,7 @@ struct Unit {
     skip: bool,
 }
 
-fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> PipelineResult<Vec<Unit>> {
+fn usable_segments(segments: &[Segment]) -> PipelineResult<Vec<&Segment>> {
     if segments.is_empty() {
         return Err(PipelineError::NoSegments);
     }
@@ -207,34 +217,44 @@ fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> PipelineRe
     if usable.is_empty() {
         return Err(PipelineError::NoUsableSegments);
     }
+    Ok(usable)
+}
 
-    let indices = pick_indices(usable.len(), MAX_UNITS_PER_TYPE);
-    let contexts: Vec<(String, String, u64)> = indices
-        .iter()
-        .map(|&segment_index| {
-            let segment = usable[segment_index];
-            let context = match &segment.heading {
-                Some(heading) => format!("[Section: {heading}]\n{}", segment.text),
-                None => segment.text.clone(),
-            };
-            (segment.id.clone(), context, segment.position as u64 + 17)
-        })
-        .collect();
+fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> PipelineResult<Vec<Unit>> {
+    let usable = usable_segments(segments)?;
+
+    let indices = pick_indices(usable.len(), MAX_QUIZ_SEGMENTS);
 
     let mut units = Vec::new();
-    for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
-        for (segment_id, context, seed_offset) in &contexts {
+    for &segment_index in &indices {
+        let segment = usable[segment_index];
+        let context = section_context(segment);
+        for artifact_type in ArtifactType::QUIZ.iter() {
             units.push(Unit {
-                type_index,
+                type_index: type_index(artifact_type),
                 artifact_type: artifact_type.clone(),
-                segment_id: segment_id.clone(),
+                segment_id: segment.id.clone(),
                 context: context.clone(),
-                seed_offset: *seed_offset,
-                skip: existing.unit_done(artifact_type, segment_id),
+                seed_offset: segment.position as u64 + 17,
+                skip: existing.unit_done(artifact_type, &segment.id),
             });
         }
     }
     Ok(units)
+}
+
+fn section_context(segment: &Segment) -> String {
+    match &segment.heading {
+        Some(heading) => format!("[Section: {heading}]\n{}", segment.text),
+        None => segment.text.clone(),
+    }
+}
+
+fn type_index(artifact_type: &ArtifactType) -> usize {
+    ArtifactType::ALL
+        .iter()
+        .position(|ty| ty == artifact_type)
+        .expect("every artifact type is a member of ALL")
 }
 
 /// Content-based and format-agnostic: noise leaves share almost no real words.
@@ -311,6 +331,143 @@ fn pick_indices(total: usize, cap: usize) -> Vec<usize> {
     (0..cap)
         .map(|index| (index as f64 * stride).floor() as usize)
         .collect()
+}
+
+struct Topic {
+    label: String,
+    members: Vec<usize>,
+}
+
+fn word_terms(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(|word| word.to_lowercase())
+}
+
+fn term_scores(usable: &[&Segment]) -> std::collections::HashMap<String, f32> {
+    let mut frequency: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut documents: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for segment in usable {
+        let mut seen = std::collections::HashSet::new();
+        for term in word_terms(&segment.text)
+            .chain(word_terms(segment.heading.as_deref().unwrap_or_default()))
+        {
+            *frequency.entry(term.clone()).or_default() += 1;
+            if seen.insert(term.clone()) {
+                *documents.entry(term).or_default() += 1;
+            }
+        }
+    }
+    let total = usable.len() as f32;
+    frequency
+        .iter()
+        .map(|(term, count)| {
+            let inverse = (total / documents[term] as f32).ln().max(0.0);
+            (term.clone(), *count as f32 * inverse)
+        })
+        .collect()
+}
+
+fn extract_topics(
+    usable: &[&Segment],
+    scores: &std::collections::HashMap<String, f32>,
+) -> Vec<Topic> {
+    let mut topics: Vec<Topic> = Vec::new();
+    for (index, segment) in usable.iter().enumerate() {
+        match segment
+            .heading
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            Some(heading) => topics.push(Topic {
+                label: heading.to_string(),
+                members: vec![index],
+            }),
+            None => match topics.last_mut() {
+                Some(topic) => topic.members.push(index),
+                None => topics.push(Topic {
+                    label: top_term_label(scores),
+                    members: vec![index],
+                }),
+            },
+        }
+    }
+    topics
+}
+
+fn top_term_label(scores: &std::collections::HashMap<String, f32>) -> String {
+    scores
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(term, _)| term.clone())
+        .unwrap_or_else(|| String::from("General"))
+}
+
+fn select_covering_segments<'a>(
+    topics: &[Topic],
+    usable: &[&'a Segment],
+    scores: &std::collections::HashMap<String, f32>,
+    budget_tokens: usize,
+) -> Vec<&'a Segment> {
+    let member_scores: Vec<f32> = usable
+        .iter()
+        .map(|segment| {
+            word_terms(&segment.text)
+                .collect::<std::collections::HashSet<_>>()
+                .iter()
+                .map(|term| scores.get(term).copied().unwrap_or(0.0))
+                .sum()
+        })
+        .collect();
+    let mut picked: Vec<usize> = Vec::new();
+    let mut spent = 0usize;
+    let mut remaining: Vec<Vec<usize>> = topics
+        .iter()
+        .map(|topic| {
+            let mut members = topic.members.clone();
+            members.sort_by(|&a, &b| {
+                member_scores[b]
+                    .partial_cmp(&member_scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            members
+        })
+        .collect();
+    loop {
+        let mut progressed = false;
+        for members in remaining.iter_mut() {
+            while let Some(&index) = members.first() {
+                if picked.contains(&index) {
+                    members.remove(0);
+                    continue;
+                }
+                let cost = approximate_tokens(&usable[index].text) as usize;
+                if spent + cost > budget_tokens && !picked.is_empty() {
+                    break;
+                }
+                spent += cost;
+                picked.push(index);
+                members.remove(0);
+                progressed = true;
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    if picked.is_empty() {
+        if let Some(best) = (0..usable.len()).max_by(|&a, &b| {
+            member_scores[a]
+                .partial_cmp(&member_scores[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            picked.push(best);
+        }
+    }
+    picked.sort_unstable();
+    picked.iter().map(|&index| usable[index]).collect()
 }
 
 fn system_prompt() -> &'static str {
@@ -421,24 +578,35 @@ fn summary_schema() -> serde_json::Value {
 }
 
 fn mindmap_schema() -> serde_json::Value {
-    object_schema(
-        serde_json::json!({
+    // Recursive nodes via $defs: every branch carries a label and children
+    // that are themselves branches, to whatever depth the material warrants.
+    // Servers that reject `response_format` fall back to prompt-only JSON.
+    serde_json::json!({
+        "type": "object",
+        "properties": {
             "topic": str_field(),
-            "branches": serde_json::json!({
+            "branches": {
                 "type": "array",
-                "minItems": 1,
-                "maxItems": 6,
-                "items": object_schema(
-                    serde_json::json!({
-                        "label": str_field(),
-                        "children": string_array(1, 6),
-                    }),
-                    &["label", "children"],
-                ),
-            }),
-        }),
-        &["topic", "branches"],
-    )
+                "items": { "$ref": "#/$defs/node" },
+            },
+        },
+        "required": ["topic", "branches"],
+        "additionalProperties": false,
+        "$defs": {
+            "node": {
+                "type": "object",
+                "properties": {
+                    "label": str_field(),
+                    "children": {
+                        "type": "array",
+                        "items": { "$ref": "#/$defs/node" },
+                    },
+                },
+                "required": ["label", "children"],
+                "additionalProperties": false,
+            },
+        },
+    })
 }
 
 fn mcq_question_schema() -> serde_json::Value {
@@ -486,6 +654,17 @@ fn parse_json_anyhow(raw: &str) -> PipelineResult<serde_json::Value> {
             Err(PipelineError::Failed(first.to_string()))
         }
     }
+}
+
+fn mindmap_node_valid(node: &serde_json::Value) -> bool {
+    node.get("label").is_some_and(|label| {
+        label
+            .as_str()
+            .is_some_and(|label| !label.trim().is_empty())
+    }) && node
+        .get("children")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|children| children.iter().all(mindmap_node_valid))
 }
 
 struct ValidatedOutput {
@@ -551,12 +730,16 @@ fn validate_unit_output(
                             .get("key_points")
                             .is_some_and(serde_json::Value::is_array)
                 }
-                _ => {
+                ArtifactType::MindMap => {
                     value.get("topic").is_some_and(serde_json::Value::is_string)
                         && value
                             .get("branches")
-                            .is_some_and(serde_json::Value::is_array)
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|branches| {
+                                branches.iter().all(mindmap_node_valid)
+                            })
                 }
+                _ => false,
             };
             if shape_ok {
                 ValidatedOutput {
@@ -756,6 +939,219 @@ struct UnitRecord {
     items: Vec<String>,
 }
 
+struct UnitDriver {
+    backend: Arc<dyn ArtifactBackend>,
+    params: GenerationParams,
+    concurrency: usize,
+    on_persist: Option<PersistFn>,
+    on_progress: Option<ProgressFn>,
+    logs: Option<Arc<RunLogs>>,
+    stop: Stop,
+}
+
+impl UnitDriver {
+    async fn run(
+        &self,
+        units: Vec<Unit>,
+    ) -> PipelineResult<(Vec<Option<UnitRecord>>, RunTelemetry)> {
+        let active_units: Vec<Unit> = units.into_iter().filter(|unit| !unit.skip).collect();
+        let total_units = active_units.len();
+
+        let mut totals_per_type = [0usize; ArtifactType::ALL.len()];
+        for unit in &active_units {
+            totals_per_type[unit.type_index] += 1;
+        }
+        let completed_per_type: Arc<Vec<AtomicUsize>> = Arc::new(
+            (0..ArtifactType::ALL.len())
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+        );
+
+        if let Some(on_progress) = &self.on_progress {
+            on_progress(GenerationTick {
+                artifact_type: None,
+                done: 0,
+                total: total_units,
+                per_type: per_type_progress(&completed_per_type, &totals_per_type),
+                types_done: 0,
+            });
+        }
+
+        let records: Arc<Mutex<Vec<Option<UnitRecord>>>> =
+            Arc::new(Mutex::new((0..total_units).map(|_| None).collect()));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency.clamp(1, 32)));
+        let telemetry = Arc::new(Mutex::new(RunTelemetry::default()));
+        let first_backend_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let done_counter = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (unit_index, unit) in active_units.into_iter().enumerate() {
+            let semaphore_clone = semaphore.clone();
+            let stop_watch = self.stop.clone();
+            let permit = tokio::select! {
+                biased;
+                _ = stop_watch.stopped() => {
+                    tasks.abort_all();
+                    return Err(PipelineError::Cancelled);
+                }
+                permit = semaphore_clone.acquire_owned() => {
+                    permit.map_err(|e| PipelineError::Failed(e.to_string()))?
+                }
+            };
+            let backend = self.backend.clone();
+            let params = self.params.clone();
+            let records = records.clone();
+            let telemetry = telemetry.clone();
+            let first_backend_error = first_backend_error.clone();
+            let done_counter = done_counter.clone();
+            let completed_per_type = completed_per_type.clone();
+            let on_progress = self.on_progress.clone();
+            let on_persist = self.on_persist.clone();
+            let logs = self.logs.clone();
+
+            tasks.spawn(async move {
+                let outcome = run_unit(&backend, &unit, &params, logs.as_deref()).await;
+                drop(permit);
+
+                {
+                    let mut stats = telemetry.lock().unwrap();
+                    stats.requests += outcome.requests_made;
+                    stats.tokens_in += outcome.tokens_in;
+                    stats.tokens_out += outcome.tokens_out;
+                    if outcome.backend_error.is_some() {
+                        stats.backend_errors += 1;
+                        if let Some(message) = &outcome.backend_error {
+                            let mut holder = first_backend_error.lock().unwrap();
+                            if holder.is_none() {
+                                *holder = Some(message.clone());
+                            }
+                        }
+                    }
+                }
+
+                let is_item_type = items_field(&unit.artifact_type).is_some();
+                if is_item_type {
+                    let artifacts = build_item_artifacts(&unit, &outcome.items);
+                    if let Some(on_persist) = &on_persist {
+                        if !artifacts.is_empty() {
+                            on_persist(artifacts).await;
+                        }
+                    } else {
+                        records.lock().unwrap()[unit_index] = Some(UnitRecord {
+                            type_index: unit.type_index,
+                            segment_id: unit.segment_id.clone(),
+                            items: outcome.items,
+                        });
+                    }
+                } else {
+                    records.lock().unwrap()[unit_index] = Some(UnitRecord {
+                        type_index: unit.type_index,
+                        segment_id: unit.segment_id.clone(),
+                        items: outcome.items,
+                    });
+                }
+
+                let finished = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                completed_per_type[unit.type_index].fetch_add(1, Ordering::Relaxed);
+                let per_type = per_type_progress(&completed_per_type, &totals_per_type);
+                let types_done = per_type
+                    .iter()
+                    .filter(|progress| progress.total > 0 && progress.done == progress.total)
+                    .count();
+
+                if let Some(on_progress) = &on_progress {
+                    on_progress(GenerationTick {
+                        artifact_type: Some(unit.artifact_type.clone()),
+                        done: finished,
+                        total: total_units,
+                        per_type,
+                        types_done,
+                    });
+                }
+            });
+        }
+
+        // Abort in-flight requests promptly instead of waiting out the timeout.
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.stop.stopped() => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(PipelineError::Cancelled);
+                }
+                result = tasks.join_next() => {
+                    match result {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            return Err(if error.is_cancelled() {
+                                PipelineError::Cancelled
+                            } else {
+                                PipelineError::Failed(format!(
+                                    "Generation task failed: {error}"
+                                ))
+                            });
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.stop.check()?;
+
+        let telemetry = *telemetry.lock().unwrap();
+        let records: Vec<Option<UnitRecord>> = records.lock().unwrap().drain(..).collect();
+        Ok((records, telemetry))
+    }
+}
+
+fn build_merged_units(
+    segments: &[Segment],
+    existing: &ExistingArtifacts,
+) -> PipelineResult<Vec<Unit>> {
+    let usable = usable_segments(segments)?;
+    let scores = term_scores(&usable);
+    let topics = extract_topics(&usable, &scores);
+    let selected =
+        select_covering_segments(&topics, &usable, &scores, WHOLE_MATERIAL_BUDGET_TOKENS);
+    let source = selected
+        .iter()
+        .map(|segment| segment.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = selected
+        .iter()
+        .map(|segment| section_context(segment))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mindmap_body = format!(
+        "Major topics: {}\n\n{body}",
+        topics
+            .iter()
+            .map(|topic| topic.label.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+
+    let mut units = Vec::new();
+    for (artifact_type, context, seed_offset) in [
+        (ArtifactType::Summary, body.clone(), 0u64),
+        (ArtifactType::MindMap, mindmap_body, 1u64),
+    ] {
+        units.push(Unit {
+            type_index: type_index(&artifact_type),
+            artifact_type: artifact_type.clone(),
+            segment_id: source.clone(),
+            context,
+            seed_offset,
+            skip: existing.unit_done(&artifact_type, &source),
+        });
+    }
+    Ok(units)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn generate_all(
     backend: Arc<dyn ArtifactBackend>,
@@ -770,200 +1166,56 @@ pub async fn generate_all(
 ) -> PipelineResult<(Vec<PendingArtifact>, RunTelemetry)> {
     stop.check()?;
     let params = params.unwrap_or_default();
+    let driver = UnitDriver {
+        backend,
+        params,
+        concurrency,
+        on_persist,
+        on_progress,
+        logs,
+        stop: stop.clone(),
+    };
+
     let units = build_units(segments, &existing)?;
-    let active_units: Vec<Unit> = units.into_iter().filter(|unit| !unit.skip).collect();
-    let total_units = active_units.len();
+    let quiz_total = units.iter().filter(|unit| !unit.skip).count();
+    let (records, mut telemetry) = driver.run(units).await?;
 
-    let mut totals_per_type = [0usize; ArtifactType::ALL.len()];
-    for unit in &active_units {
-        totals_per_type[unit.type_index] += 1;
-    }
-    let completed_per_type: Arc<Vec<AtomicUsize>> = Arc::new(
-        (0..ArtifactType::ALL.len())
-            .map(|_| AtomicUsize::new(0))
-            .collect(),
-    );
-
-    if let Some(on_progress) = &on_progress {
-        on_progress(GenerationTick {
-            artifact_type: None,
-            done: 0,
-            total: total_units,
-            per_type: per_type_progress(&completed_per_type, &totals_per_type),
-            types_done: 0,
-        });
-    }
-
-    let records: Arc<Mutex<Vec<Option<UnitRecord>>>> =
-        Arc::new(Mutex::new((0..total_units).map(|_| None).collect()));
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 32)));
-    let telemetry = Arc::new(Mutex::new(RunTelemetry::default()));
-    let first_backend_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let done_counter = Arc::new(AtomicUsize::new(0));
-
-    let mut tasks = tokio::task::JoinSet::new();
-    for (unit_index, unit) in active_units.into_iter().enumerate() {
-        let semaphore_clone = semaphore.clone();
-        let stop_watch = stop.clone();
-        let permit = tokio::select! {
-            biased;
-            _ = stop_watch.stopped() => {
-                tasks.abort_all();
-                return Err(PipelineError::Cancelled);
-            }
-            permit = semaphore_clone.acquire_owned() => {
-                permit.map_err(|e| PipelineError::Failed(e.to_string()))?
-            }
-        };
-        let backend = backend.clone();
-        let params = params.clone();
-        let records = records.clone();
-        let telemetry = telemetry.clone();
-        let first_backend_error = first_backend_error.clone();
-        let done_counter = done_counter.clone();
-        let completed_per_type = completed_per_type.clone();
-        let on_progress = on_progress.clone();
-        let on_persist = on_persist.clone();
-        let logs = logs.clone();
-
-        tasks.spawn(async move {
-            let outcome = run_unit(&backend, &unit, &params, logs.as_deref()).await;
-
-            {
-                let mut stats = telemetry.lock().unwrap();
-                stats.requests += outcome.requests_made;
-                stats.tokens_in += outcome.tokens_in;
-                stats.tokens_out += outcome.tokens_out;
-                if outcome.backend_error.is_some() {
-                    stats.backend_errors += 1;
-                    if let Some(message) = &outcome.backend_error {
-                        let mut holder = first_backend_error.lock().unwrap();
-                        if holder.is_none() {
-                            *holder = Some(message.clone());
-                        }
-                    }
-                }
-            }
-
-            let is_item_type = items_field(&unit.artifact_type).is_some();
-            if is_item_type {
-                let artifacts = build_item_artifacts(&unit, &outcome.items);
-                if let Some(on_persist) = &on_persist {
-                    if !artifacts.is_empty() {
-                        on_persist(artifacts).await;
-                    }
-                } else {
-                    records.lock().unwrap()[unit_index] = Some(UnitRecord {
-                        type_index: unit.type_index,
-                        segment_id: unit.segment_id.clone(),
-                        items: outcome.items,
-                    });
-                }
-            } else {
-                records.lock().unwrap()[unit_index] = Some(UnitRecord {
-                    type_index: unit.type_index,
-                    segment_id: unit.segment_id.clone(),
-                    items: outcome.items,
-                });
-            }
-
-            let finished = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            completed_per_type[unit.type_index].fetch_add(1, Ordering::Relaxed);
-            let per_type = per_type_progress(&completed_per_type, &totals_per_type);
-            let types_done = per_type
-                .iter()
-                .filter(|progress| progress.total > 0 && progress.done == progress.total)
-                .count();
-
-            if let Some(on_progress) = &on_progress {
-                on_progress(GenerationTick {
-                    artifact_type: Some(unit.artifact_type.clone()),
-                    done: finished,
-                    total: total_units,
-                    per_type,
-                    types_done,
-                });
-            }
-
-            drop(permit);
-        });
-    }
-
-    // Abort in-flight requests promptly instead of waiting out the timeout.
-    loop {
-        tokio::select! {
-            biased;
-            _ = stop.stopped() => {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(PipelineError::Cancelled);
-            }
-            result = tasks.join_next() => {
-                match result {
-                    Some(Ok(())) => {}
-                    Some(Err(error)) => {
-                        tasks.abort_all();
-                        while tasks.join_next().await.is_some() {}
-                        return Err(if error.is_cancelled() {
-                            PipelineError::Cancelled
-                        } else {
-                            PipelineError::Failed(format!(
-                                "Generation task failed: {error}"
-                            ))
-                        });
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-    stop.check()?;
-
-    let telemetry = *telemetry.lock().unwrap();
-    let records: Vec<Option<UnitRecord>> = records.lock().unwrap().drain(..).collect();
+    let merged_units = build_merged_units(segments, &existing)?;
+    let merged_total = merged_units.iter().filter(|unit| !unit.skip).count();
+    let (merged_records, merged_telemetry) = driver.run(merged_units).await?;
+    telemetry.requests += merged_telemetry.requests;
+    telemetry.tokens_in += merged_telemetry.tokens_in;
+    telemetry.tokens_out += merged_telemetry.tokens_out;
+    telemetry.backend_errors += merged_telemetry.backend_errors;
 
     let mut pending = Vec::new();
-    for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
-        let sections: Vec<(String, serde_json::Value)> = records
-            .iter()
-            .flatten()
-            .filter(|record| record.type_index == type_index && !record.items.is_empty())
-            .flat_map(|record| {
-                record
-                    .items
-                    .iter()
-                    .filter_map(|item| serde_json::from_str::<serde_json::Value>(item).ok())
-                    .map(|value| (record.segment_id.clone(), value))
-            })
-            .collect();
-
-        if sections.is_empty() {
-            continue;
-        }
-
-        if items_field(artifact_type).is_some() {
-            if on_persist.is_none() {
-                for (source, value) in sections {
-                    pending.push(PendingArtifact {
-                        artifact_type: artifact_type.clone(),
-                        source,
-                        content: value.to_string(),
-                    });
+    if driver.on_persist.is_none() {
+        for (type_index, artifact_type) in ArtifactType::ALL.iter().enumerate() {
+            for record in records
+                .iter()
+                .flatten()
+                .filter(|record| record.type_index == type_index && !record.items.is_empty())
+            {
+                for item in &record.items {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(item) {
+                        pending.push(PendingArtifact {
+                            artifact_type: artifact_type.clone(),
+                            source: record.segment_id.clone(),
+                            content: value.to_string(),
+                        });
+                    }
                 }
             }
-            continue;
         }
-        if let Some(content) = merge_sections(artifact_type, &sections) {
+    }
+    for record in merged_records.iter().flatten() {
+        if let Some(content) = record.items.first() {
             let artifact = PendingArtifact {
-                artifact_type: artifact_type.clone(),
-                source: sections
-                    .iter()
-                    .map(|(source, _)| source.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                content,
+                artifact_type: ArtifactType::ALL[record.type_index].clone(),
+                source: record.segment_id.clone(),
+                content: content.clone(),
             };
-            if let Some(on_persist) = &on_persist {
+            if let Some(on_persist) = &driver.on_persist {
                 on_persist(vec![artifact]).await;
             } else {
                 pending.push(artifact);
@@ -972,6 +1224,7 @@ pub async fn generate_all(
     }
 
     // Every unit failing to reach the provider is an outage, not empty success.
+    let total_units = quiz_total + merged_total;
     if telemetry.backend_errors > 0 && telemetry.backend_errors == total_units {
         return Err(PipelineError::Failed(String::from(
             "Artifacts generation failed. Check that a provider is configured and reachable.",
@@ -991,81 +1244,6 @@ fn build_item_artifacts(unit: &Unit, items: &[String]) -> Vec<PendingArtifact> {
             content: value.to_string(),
         })
         .collect()
-}
-
-fn first_text(sections: &[(String, serde_json::Value)], field: &str, fallback: &str) -> String {
-    sections
-        .iter()
-        .find_map(|(_, value)| value.get(field).and_then(serde_json::Value::as_str))
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_string()
-}
-
-fn collect_texts(
-    sections: &[(String, serde_json::Value)],
-    field: &str,
-    cap: usize,
-    dedupe: bool,
-) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for (_, value) in sections {
-        let texts = match value.get(field) {
-            Some(serde_json::Value::String(text)) => vec![text.as_str()],
-            Some(serde_json::Value::Array(items)) => {
-                items.iter().filter_map(serde_json::Value::as_str).collect()
-            }
-            _ => Vec::new(),
-        };
-        for text in texts {
-            let trimmed = text.trim();
-            if trimmed.is_empty() || (dedupe && !seen.insert(trimmed.to_string())) {
-                continue;
-            }
-            out.push(trimmed.to_string());
-            if out.len() >= cap {
-                return out;
-            }
-        }
-    }
-    out
-}
-
-fn merge_sections(
-    artifact_type: &ArtifactType,
-    sections: &[(String, serde_json::Value)],
-) -> Option<String> {
-    match artifact_type {
-        ArtifactType::Summary => Some(
-            serde_json::json!({
-                "title": first_text(sections, "title", "Worksheet summary"),
-                "summary": collect_texts(sections, "summary", usize::MAX, false).join("\n\n"),
-                "key_points": collect_texts(sections, "key_points", 12, true),
-            })
-            .to_string(),
-        ),
-        ArtifactType::MindMap => {
-            let mut branches: Vec<serde_json::Value> = Vec::new();
-            for (_, value) in sections {
-                if let Some(section_branches) =
-                    value.get("branches").and_then(serde_json::Value::as_array)
-                {
-                    branches.extend(section_branches.iter().cloned());
-                }
-            }
-            branches.truncate(24);
-
-            Some(
-                serde_json::json!({
-                    "topic": first_text(sections, "topic", "Overview"),
-                    "branches": branches,
-                })
-                .to_string(),
-            )
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1130,10 +1308,10 @@ mod tests {
 
         let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
         let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
-        let expected = ["seg-1", "seg-3"].repeat(ArtifactType::ALL.len());
+        let expected = ["seg-1", "seg-3"].repeat(ArtifactType::QUIZ.len());
         assert_eq!(used.len(), expected.len());
 
-        for artifact_type in ArtifactType::ALL.iter() {
+        for artifact_type in ArtifactType::QUIZ.iter() {
             let contexts: Vec<&str> = units
                 .iter()
                 .filter(|unit| unit.artifact_type == *artifact_type)
@@ -1143,6 +1321,12 @@ mod tests {
             assert!(contexts[0].contains("OpenStax provides free"));
             assert!(contexts[1].contains("Mitochondria produce ATP"));
         }
+        assert!(
+            units
+                .iter()
+                .all(|unit| ArtifactType::QUIZ.contains(&unit.artifact_type)),
+            "merged types never fan out per segment"
+        );
     }
 
     #[test]
@@ -1238,7 +1422,7 @@ mod tests {
 
         let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
         let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
-        let expected = ["seg-1", "seg-3"].repeat(ArtifactType::ALL.len());
+        let expected = ["seg-1", "seg-3"].repeat(ArtifactType::QUIZ.len());
         assert_eq!(used.len(), expected.len());
         assert!(
             !used.contains(&"seg-4"),
@@ -1267,6 +1451,115 @@ mod tests {
         }
         let mcq = user_prompt(&ArtifactType::MultipleChoiceQuiz, "context");
         assert!(mcq.contains("as many as the material genuinely supports"));
+    }
+
+    #[test]
+    fn test_term_scores_rank_distinctive_terms_without_stopwords() {
+        let bodies = [
+            "Mitochondria produce ATP through respiration and the mitochondria power the cell.",
+            "Mitochondria carry their own DNA alongside the energy pathways of mitochondria.",
+            "The students read the textbook chapter and the lesson covers the material.",
+            "The class reviewed the lesson and the students discussed the chapter.",
+            "The book presents the material while the lesson introduces the topic.",
+            "The students studied the chapter before the class reviewed the lesson.",
+            "The textbook lesson connects the chapter material to the class discussion.",
+            "The class examined how the lesson frames the chapter for the students.",
+            "The students summarized the material after the lesson ended.",
+            "The chapter review helped the class prepare before the lesson.",
+        ];
+        let segments: Vec<Segment> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, text)| segment(i as i32, None, text))
+            .collect();
+        let refs: Vec<&Segment> = segments.iter().collect();
+        let scores = term_scores(&refs);
+        assert!(
+            scores["mitochondria"] > scores["the"],
+            "a repeated distinctive term must outrank ubiquitous words"
+        );
+    }
+
+    #[test]
+    fn test_extract_topics_groups_by_heading_in_order() {
+        let segments = [
+            segment(
+                0,
+                Some("Respiration"),
+                "Mitochondria produce ATP through respiration.",
+            ),
+            segment(1, None, "The citric acid cycle runs in the matrix."),
+            segment(
+                2,
+                Some("Volcanoes"),
+                "Magma pressure builds beneath the crust.",
+            ),
+        ];
+        let refs: Vec<&Segment> = segments.iter().collect();
+        let scores = term_scores(&refs);
+        let topics = extract_topics(&refs, &scores);
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics[0].label, "Respiration");
+        assert_eq!(topics[0].members, vec![0, 1]);
+        assert_eq!(topics[1].label, "Volcanoes");
+        assert_eq!(topics[1].members, vec![2]);
+    }
+
+    #[test]
+    fn test_select_covering_segments_spreads_budget_in_document_order() {
+        let filler =
+            "Mitochondria produce ATP through cellular respiration and glycolysis pathways.";
+        let segments = [
+            segment(0, Some("One"), filler),
+            segment(1, Some("Two"), filler),
+            segment(2, Some("Three"), filler),
+        ];
+        let refs: Vec<&Segment> = segments.iter().collect();
+        let scores = term_scores(&refs);
+        let topics = extract_topics(&refs, &scores);
+        let selected = select_covering_segments(&topics, &refs, &scores, 50);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].id, "seg-0");
+        assert_eq!(selected[1].id, "seg-1");
+    }
+
+    #[test]
+    fn test_build_merged_units_cover_whole_material_in_two_requests() {
+        let segments = [
+            segment(
+                0,
+                Some("Respiration"),
+                "Mitochondria produce ATP through respiration and the citric acid cycle.",
+            ),
+            segment(
+                1,
+                Some("Volcanoes"),
+                "Magma pressure builds beneath the crust before volcanic eruptions release ash and lava across the landscape.",
+            ),
+        ];
+        let units = build_merged_units(&segments, &ExistingArtifacts::default()).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].artifact_type, ArtifactType::Summary);
+        assert_eq!(units[1].artifact_type, ArtifactType::MindMap);
+        assert_eq!(units[0].segment_id, units[1].segment_id);
+        assert!(units[0].context.contains("Mitochondria"));
+        assert!(units[0].context.contains("Magma"));
+        assert!(units[1].context.contains("Respiration"));
+    }
+
+    #[test]
+    fn test_build_merged_units_skip_finished_types() {
+        let segments = vec![segment(
+            0,
+            None,
+            "Mitochondria produce ATP through respiration and the citric acid cycle.",
+        )];
+        let mut existing = ExistingArtifacts::default();
+        existing.done_merged.insert(String::from("Summary"));
+        let units = build_merged_units(&segments, &existing).unwrap();
+        let active: Vec<_> = units.iter().filter(|unit| !unit.skip).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].artifact_type, ArtifactType::MindMap);
     }
 
     #[test]

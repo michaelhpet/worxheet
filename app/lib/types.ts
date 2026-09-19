@@ -44,7 +44,12 @@ export interface SummaryContent {
 	key_points: string[];
 }
 
+export interface MindMapNode {
+	label: string;
+	children: MindMapNode[];
+}
+
 export interface MindMapContent {
 	topic: string;
-	branches: { label: string; children: string[] }[];
+	branches: MindMapNode[];
 }

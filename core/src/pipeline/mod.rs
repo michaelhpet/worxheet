@@ -404,18 +404,26 @@ mod tests {
                 })
                 .to_string()),
                 "Summary" => Ok(json!({
-                    "title": if source_has_mitochondria { "Cell Biology" } else { "Geology" },
-                    "summary": if source_has_mitochondria {
-                        "Respiration happens in mitochondria and produces ATP."
-                    } else {
-                        "Magma pressure builds until eruptions release ash and lava."
-                    },
+                    "title": "Cells and Volcanoes",
+                    "summary": "Respiration happens in mitochondria and produces ATP. Magma pressure builds until eruptions release ash and lava.",
                     "key_points": ["Grounded key point"]
                 })
                 .to_string()),
                 "MindMap" => Ok(json!({
-                    "topic": if source_has_mitochondria { "Cell respiration" } else { "Volcanoes" },
-                    "branches": [{ "label": "Stages", "children": ["One", "Two"] }]
+                    "topic": "Whole worksheet",
+                    "branches": [
+                        { "label": "One", "children": [
+                            { "label": "1a", "children": [
+                                { "label": "1a-i", "children": [] },
+                            ] },
+                        ] },
+                        { "label": "Two", "children": [] },
+                        { "label": "Three", "children": [] },
+                        { "label": "Four", "children": [] },
+                        { "label": "Five", "children": [] },
+                        { "label": "Six", "children": [] },
+                        { "label": "Seven", "children": [] },
+                    ]
                 })
                 .to_string()),
                 other => Err(ProviderError::Rejected(format!("unknown schema {other}"))),
@@ -437,7 +445,7 @@ mod tests {
         .await
         .expect("generation should succeed");
 
-        assert_eq!(telemetry.requests, 10);
+        assert_eq!(telemetry.requests, 8);
 
         for artifact in &pending {
             if matches!(artifact.artifact_type, ArtifactType::MultipleChoiceQuiz) {
@@ -476,6 +484,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("mitochondria"));
+
+        let mindmap: serde_json::Value = serde_json::from_str(
+            &pending
+                .iter()
+                .find(|a| a.artifact_type.to_db() == "MindMap")
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        assert_eq!(
+            mindmap["branches"].as_array().unwrap().len(),
+            7,
+            "worksheet-wide mindmaps are no longer capped"
+        );
+        assert_eq!(
+            mindmap["branches"][0]["children"][0]["children"][0]["label"],
+            "1a-i",
+            "mindmap branches nest recursively"
+        );
     }
 
     #[tokio::test]

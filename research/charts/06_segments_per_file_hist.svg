@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="380" font-family="sans-serif">
+<rect width="640" height="380" fill="white"/>
+<text x="320.0" y="26" text-anchor="middle" font-size="15" font-weight="bold">Segments produced per file (n=70 files, 698 segments)</text>
+<line x1="70" y1="290.0" x2="620" y2="290.0" stroke="#e0e0e0"/>
+<text x="62" y="294.0" text-anchor="end" font-size="10" fill="#555">0</text>
+<line x1="70" y1="242.0" x2="620" y2="242.0" stroke="#e0e0e0"/>
+<text x="62" y="246.0" text-anchor="end" font-size="10" fill="#555">10</text>
+<line x1="70" y1="194.0" x2="620" y2="194.0" stroke="#e0e0e0"/>
+<text x="62" y="198.0" text-anchor="end" font-size="10" fill="#555">20</text>
+<line x1="70" y1="146.0" x2="620" y2="146.0" stroke="#e0e0e0"/>
+<text x="62" y="150.0" text-anchor="end" font-size="10" fill="#555">30</text>
+<line x1="70" y1="98.0" x2="620" y2="98.0" stroke="#e0e0e0"/>
+<text x="62" y="102.0" text-anchor="end" font-size="10" fill="#555">40</text>
+<line x1="70" y1="50.0" x2="620" y2="50.0" stroke="#e0e0e0"/>
+<text x="62" y="54.0" text-anchor="end" font-size="10" fill="#555">50</text>
+<text x="14" y="170.0" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14,170.0)">files</text>
+<rect x="94.8" y="222.8" width="60.5" height="67.2" fill="#59a14f"/>
+<text x="125.0" y="216.8" text-anchor="middle" font-size="11" font-weight="bold">14</text>
+<text x="125.0" y="328.0" text-anchor="middle" font-size="10" fill="#333">1-2 segs</text>
+<rect x="204.8" y="93.2" width="60.5" height="196.8" fill="#59a14f"/>
+<text x="235.0" y="87.2" text-anchor="middle" font-size="11" font-weight="bold">41</text>
+<text x="235.0" y="328.0" text-anchor="middle" font-size="10" fill="#333">3-4 segs</text>
+<rect x="314.8" y="237.2" width="60.5" height="52.8" fill="#59a14f"/>
+<text x="345.0" y="231.2" text-anchor="middle" font-size="11" font-weight="bold">11</text>
+<text x="345.0" y="328.0" text-anchor="middle" font-size="10" fill="#333">5-8 segs</text>
+<rect x="424.8" y="290.0" width="60.5" height="0.0" fill="#59a14f"/>
+<text x="455.0" y="284.0" text-anchor="middle" font-size="11" font-weight="bold">0</text>
+<text x="455.0" y="328.0" text-anchor="middle" font-size="10" fill="#333">9-16 segs</text>
+<rect x="534.8" y="270.8" width="60.5" height="19.2" fill="#59a14f"/>
+<text x="565.0" y="264.8" text-anchor="middle" font-size="11" font-weight="bold">4</text>
+<text x="565.0" y="328.0" text-anchor="middle" font-size="10" fill="#333">114+ segs</text>
+<text x="320.0" y="372" text-anchor="middle" font-size="10" fill="#777">mean 10.0 segs/file, median 3.0 — 4 large files dominate segment count</text>
+</svg>

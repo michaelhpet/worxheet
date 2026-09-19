@@ -1,0 +1,103 @@
+{
+  "file_reads_started": 70,
+  "file_reads_completed": 70,
+  "parse_duration_ms": {
+    "n": 70,
+    "mean": 2063.7,
+    "median": 650.0,
+    "min": 201,
+    "max": 15414,
+    "p90": 6930,
+    "total": 144457
+  },
+  "distinct_files": 70,
+  "distinct_worksheets": 4,
+  "extensions": {
+    "pdf": 70
+  },
+  "blocks_body": 9128,
+  "blocks_heading": 2985,
+  "tokenization": {},
+  "tokens_total": 291352,
+  "tokenizer_calls_total": 9128,
+  "tokenizer_duration_ms": {
+    "n": 70,
+    "mean": 98.0,
+    "median": 52.0,
+    "min": 16,
+    "max": 1112,
+    "p90": 90,
+    "total": 6858
+  },
+  "segments_total": 698,
+  "segment_count_per_file": {
+    "n": 70,
+    "mean": 10.0,
+    "median": 3.0,
+    "min": 1,
+    "max": 132,
+    "p90": 7,
+    "total": 698
+  },
+  "generation_requests": 406,
+  "generation_responses": 617,
+  "generation_ok": 291,
+  "generation_error": 326,
+  "transport_success_rate": 0.4716,
+  "verdicts": {
+    "skipped": 14,
+    "rejected": 99,
+    "ok": 178
+  },
+  "acceptance_rate_of_transported": 0.6117,
+  "acceptance_rate_overall": 0.2885,
+  "elapsed_ok_ms": {
+    "n": 291,
+    "mean": 18805.9,
+    "median": 10074,
+    "min": 849,
+    "max": 156648,
+    "p90": 31642,
+    "total": 5472528
+  },
+  "elapsed_err_ms": {
+    "n": 326,
+    "mean": 7128.7,
+    "median": 1007.0,
+    "min": 297,
+    "max": 186585,
+    "p90": 3724,
+    "total": 2323967
+  },
+  "attempts": {
+    "0": 419,
+    "1": 101,
+    "2": 97
+  },
+  "error_classes": {
+    "401_missing_api_key": 224,
+    "402_model_not_in_free_tier": 79,
+    "429_rate_limited": 20,
+    "network_error": 3
+  },
+  "accepted_units": 178,
+  "total_questions_yielded": 600,
+  "questions_per_accepted_unit": {
+    "MultipleChoiceQuiz": {
+      "n": 89,
+      "mean": 3.6,
+      "total": 320
+    },
+    "EssayQuiz": {
+      "n": 89,
+      "mean": 3.15,
+      "total": 280
+    }
+  },
+  "rejection_reasons": {
+    "missing \"items\" array": 95,
+    "expected a Summary object with the documented fields": 2,
+    "output is not valid JSON: EOF while parsing an object at line 363 column 17; also failed on the extracted object: EOF wh": 1,
+    "output is not valid JSON: EOF while parsing a value at line 340 column 14; also failed on the extracted object: EOF whil": 1
+  }
+}

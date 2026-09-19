@@ -43,6 +43,15 @@ pub enum ProviderError {
     InvalidResponse(String),
 }
 
+impl ProviderError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Network(_) | Self::Server(_)
+        )
+    }
+}
+
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -5,19 +5,36 @@ import {
 	IconEdit,
 	IconFileText,
 	IconFileWord,
-	IconHtml,
 	IconListCheck,
 	IconMarkdown,
-	IconMusic,
 	IconNetwork,
 	IconPdf,
 	IconPhoto,
 	IconPresentation,
-	IconVideo,
 } from "@tabler/icons-react";
 import type { ArtifactType, ArtifactTypeOption } from "@/lib/types";
 
-export const SUPPORTED_EXTENSIONS = ["pdf", "ppt", "pptx", "doc", "docx"];
+// Must stay in sync with `SUPPORTED_EXTENSIONS` in core/src/worksheet.rs and
+// `parse_blocks` in core/src/pipeline/ingest.rs.
+export const SUPPORTED_EXTENSIONS = [
+	"pdf",
+	"png",
+	"jpg",
+	"jpeg",
+	"gif",
+	"bmp",
+	"tif",
+	"tiff",
+	"webp",
+	"svg",
+	"ppt",
+	"pptx",
+	"doc",
+	"docx",
+	"txt",
+	"md",
+	"csv",
+];
 
 export const FILE_SIZES = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
 
@@ -35,21 +52,15 @@ export const FILE_TYPES: Record<string, FileType> = {
 	pptx: { icon: IconPresentation, class: "text-red-300" },
 	doc: { icon: IconFileWord, class: "text-blue-300" },
 	docx: { icon: IconFileWord, class: "text-blue-300" },
-	odt: { icon: IconFileWord, class: "text-blue-300" },
-	html: { icon: IconHtml, class: "text-purple-300" },
 	png: { icon: IconPhoto, class: "text-yellow-200" },
 	jpg: { icon: IconPhoto, class: "text-yellow-200" },
 	jpeg: { icon: IconPhoto, class: "text-yellow-200" },
-	mov: { icon: IconVideo, class: "text-orange-500" },
-	mkv: { icon: IconVideo, class: "text-orange-500" },
-	avi: { icon: IconVideo, class: "text-orange-500" },
-	mp4: { icon: IconVideo, class: "text-orange-500" },
-	webm: { icon: IconVideo, class: "text-orange-500" },
-	mp3: { icon: IconMusic, class: "text-pink-500" },
-	wav: { icon: IconMusic, class: "text-pink-500" },
-	aac: { icon: IconMusic, class: "text-pink-500" },
-	flac: { icon: IconMusic, class: "text-pink-500" },
-	m4a: { icon: IconMusic, class: "text-pink-500" },
+	gif: { icon: IconPhoto, class: "text-yellow-200" },
+	bmp: { icon: IconPhoto, class: "text-yellow-200" },
+	tif: { icon: IconPhoto, class: "text-yellow-200" },
+	tiff: { icon: IconPhoto, class: "text-yellow-200" },
+	webp: { icon: IconPhoto, class: "text-yellow-200" },
+	svg: { icon: IconPhoto, class: "text-yellow-200" },
 };
 
 export const ARTIFACT_TYPES = {

@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "migrate", "time"] }
 ulid = "1.2.1"
 time = { version = "0.3.47", features = ["formatting", "parsing", "serde"] }
@@ -33,7 +33,6 @@ office_oxide = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
 async-trait = "0.1"
-futures-util = "0.3"
 liteparse = { version = "2", features = ["tesseract"] }
 thiserror = "1"
 

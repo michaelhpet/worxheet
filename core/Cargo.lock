@@ -8496,7 +8496,6 @@ name = "worxheet"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures-util",
  "keyring",
  "liteparse",
  "office_oxide",

@@ -165,7 +165,7 @@ pub async fn stop_job(
         jobs.jobs.lock().unwrap().remove(worksheet_id);
         // Report stopped even if the row already flipped: `run_job` lets a
         // cancelled outcome win over a racing completion.
-        transition_status(
+        if let Err(error) = transition_status(
             pool,
             worksheet_id,
             PipelineState::Cancelled,
@@ -173,7 +173,9 @@ pub async fn stop_job(
             &[PipelineState::Running, PipelineState::Idle],
         )
         .await
-        .ok();
+        {
+            eprintln!("[pipeline] failed to persist cancel status: {error}");
+        }
         emit_status(
             app,
             worksheet_id,
@@ -342,7 +344,7 @@ async fn run_job(ctx: RunCtx) {
 
     // A stop request wins over a racing completion.
     if ctx.stop.is_stopped() || matches!(&result, Err(PipelineError::Cancelled)) {
-        transition_status(
+        if let Err(error) = transition_status(
             &ctx.pool,
             &worksheet_id,
             PipelineState::Cancelled,
@@ -350,7 +352,9 @@ async fn run_job(ctx: RunCtx) {
             &[PipelineState::Running],
         )
         .await
-        .ok();
+        {
+            eprintln!("[pipeline] failed to persist cancel status: {error}");
+        }
         finish_job(
             &ctx,
             &PipelineStatus::terminal(PipelineState::Cancelled, None),
@@ -366,7 +370,11 @@ async fn run_job(ctx: RunCtx) {
         }
     };
 
-    let _ = persist_status(&ctx.pool, &worksheet_id, status, error.as_deref()).await;
+    if let Err(error) =
+        persist_status(&ctx.pool, &worksheet_id, status, error.as_deref()).await
+    {
+        eprintln!("[pipeline] failed to persist terminal status: {error}");
+    }
     finish_job(&ctx, &PipelineStatus::terminal(status, error));
 }
 
@@ -462,7 +470,8 @@ async fn run_pipeline(ctx: &RunCtx) -> PipelineResult<()> {
     let started = std::time::Instant::now();
 
     // Per-item artifacts persist as each unit completes so an interruption
-    // keeps finished parts; merged types persist once below.
+    // keeps finished parts; merged types persist once below. Persist failures
+    // fall back to the final persist instead of silently dropping data.
     let on_persist = {
         let pool = ctx.pool.clone();
         let worksheet_id = ctx.worksheet_id.clone();
@@ -470,8 +479,11 @@ async fn run_pipeline(ctx: &RunCtx) -> PipelineResult<()> {
             let pool = pool.clone();
             let worksheet_id = worksheet_id.clone();
             Box::pin(async move {
-                let _ = super::persist_artifacts(&pool, &worksheet_id, &artifacts).await;
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                super::persist_artifacts(&pool, &worksheet_id, &artifacts).await?;
+                Ok(())
+            }) as std::pin::Pin<
+                Box<dyn std::future::Future<Output = super::PipelineResult<()>> + Send>,
+            >
         }) as super::generate::PersistFn
     };
 

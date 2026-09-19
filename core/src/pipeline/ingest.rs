@@ -18,8 +18,8 @@ use super::{PipelineError, PipelineResult};
 const DOCUMENT_EXTENSIONS: &[&str] = &[
     "pdf", "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg",
 ];
-/// HEIF photos go through macOS `sips` since liteparse cannot read them.
-const HEIC_EXTENSIONS: &[&str] = &["heic", "heif"];
+/// Plain-text sources read straight off disk (no OCR, no office export).
+const TEXT_EXTENSIONS: &[&str] = &["txt", "md", "csv"];
 
 /// OCR dominates parse cost, so PDFs only enable it past this share of
 /// genuinely text-less pages.
@@ -31,9 +31,8 @@ pub fn parse_blocks(path: &str, extension: &str) -> PipelineResult<Vec<Block>> {
     if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) {
         return liteparse_blocks(path, ext == "pdf");
     }
-    if HEIC_EXTENSIONS.contains(&ext.as_str()) {
-        let jpeg = heic_to_jpeg(path)?;
-        return liteparse_blocks(&jpeg, false);
+    if TEXT_EXTENSIONS.contains(&ext.as_str()) {
+        return parse_text_blocks(path, &ext);
     }
     match ext.as_str() {
         "pptx" | "docx" | "ppt" | "doc" => parse_office_blocks(path),
@@ -41,6 +40,23 @@ pub fn parse_blocks(path: &str, extension: &str) -> PipelineResult<Vec<Block>> {
             "Unsupported file extension: {extension}"
         ))),
     }
+}
+
+/// Plain UTF-8 read for txt/md/csv. Markdown reuses heading splitting so
+/// sections survive; txt/csv become a single body block (csv kept raw).
+fn parse_text_blocks(path: &str, extension: &str) -> PipelineResult<Vec<Block>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| PipelineError::Failed(format!("Failed to read text file {path}: {e}")))?;
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if extension == "md" {
+        return Ok(markdown_blocks(&text));
+    }
+    Ok(vec![Block {
+        kind: BlockKind::Body,
+        text,
+    }])
 }
 
 /// Pages stream in bounded batches so a large document never sits fully in memory.
@@ -250,37 +266,6 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
     blocks
 }
 
-/// Convert a HEIC/HEIF photo to JPEG with macOS `sips`; the temp output lives
-/// for the duration of the parse.
-fn heic_to_jpeg(path: &str) -> PipelineResult<String> {
-    let out = std::env::temp_dir()
-        .join(format!("worxheet_{}.jpg", ulid::Ulid::new()))
-        .to_string_lossy()
-        .to_string();
-    let status = std::process::Command::new("sips")
-        .arg("-s")
-        .arg("format")
-        .arg("jpeg")
-        .arg("-s")
-        .arg("formatOptions")
-        .arg("85")
-        .arg(path)
-        .arg("--out")
-        .arg(&out)
-        .status()
-        .map_err(|e| {
-            PipelineError::Failed(format!(
-                "Failed to run sips (HEIC photos require macOS): {e}"
-            ))
-        })?;
-    if !status.success() {
-        return Err(PipelineError::Failed(format!(
-            "sips failed to convert HEIC photo: {path}"
-        )));
-    }
-    Ok(out)
-}
-
 fn parse_office_blocks(path: &str) -> PipelineResult<Vec<Block>> {
     let markdown = office_oxide::to_markdown(path)
         .map_err(|e| PipelineError::Failed(format!("Failed to export office markdown: {e}")))?;
@@ -349,17 +334,20 @@ pub async fn reuse_chunks(
         return Ok((Vec::new(), start_position));
     }
 
-    let ids_csv: String = file_ids
-        .iter()
-        .map(|id| format!("'{id}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let identity_rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT id, sha256 FROM files WHERE worksheet_id = ? AND id IN ({ids_csv})"
-    ))
-    .bind(worksheet_id)
-    .fetch_all(pool)
-    .await?;
+    let mut builder = sqlx::QueryBuilder::new(
+        "SELECT id, identity_key FROM files WHERE worksheet_id = ",
+    );
+    builder.push_bind(worksheet_id);
+    builder.push(" AND id IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for id in file_ids {
+            separated.push_bind(id);
+        }
+    }
+    builder.push(")");
+    let identity_rows: Vec<(String, Option<String>)> =
+        builder.build_query_as().fetch_all(pool).await?;
 
     let identity_map: std::collections::HashMap<String, Option<String>> =
         identity_rows.into_iter().collect();
@@ -379,7 +367,7 @@ pub async fn reuse_chunks(
             "SELECT c.file_id
              FROM chunks c
              JOIN files f ON f.id = c.file_id
-             WHERE f.sha256 = ? AND c.worksheet_id <> ? AND c.worksheet_id IS NOT NULL
+             WHERE f.identity_key = ? AND c.worksheet_id <> ? AND c.worksheet_id IS NOT NULL
              GROUP BY c.file_id
              ORDER BY MIN(c.position)
              LIMIT 1",
@@ -671,7 +659,59 @@ mod tests {
 
     #[test]
     fn test_parse_unsupported_extension() {
-        assert!(parse_blocks("test.txt", "txt").is_err());
+        assert!(parse_blocks("test.mp3", "mp3").is_err());
+        assert!(parse_blocks("test.heic", "heic").is_err());
+    }
+
+    fn write_temp_file(name: &str, contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "worxheet_{}_{}.{}",
+            name,
+            ulid::Ulid::new(),
+            name.rsplit('.').next().unwrap_or("txt")
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_parse_txt_becomes_single_body_block() {
+        let path = write_temp_file(
+            "sample.txt",
+            "First line of plain text.\nSecond line follows.\n",
+        );
+        let blocks = parse_blocks(&path, "txt").unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Body);
+        assert!(blocks[0].text.contains("First line"));
+    }
+
+    #[test]
+    fn test_parse_md_splits_headings() {
+        let path = write_temp_file("sample.md", "# Title\nBody text here.\n\n## Sub\nMore.\n");
+        let blocks = parse_blocks(&path, "md").unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b.kind, BlockKind::Heading(1)) && b.text == "Title"));
+    }
+
+    #[test]
+    fn test_parse_csv_becomes_single_body_block() {
+        let path = write_temp_file("sample.csv", "name,value\nA,1\nB,2\n");
+        let blocks = parse_blocks(&path, "csv").unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].text.contains("name,value"));
+    }
+
+    #[test]
+    fn test_parse_empty_text_yields_no_blocks() {
+        let path = write_temp_file("empty.txt", "   \n");
+        let blocks = parse_blocks(&path, "txt").unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(blocks.is_empty());
     }
 
     #[test]
@@ -985,11 +1025,11 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
     async fn seed_file(
         pool: &sqlx::SqlitePool,
         worksheet_id: &str,
-        sha256: Option<&str>,
+        identity_key: Option<&str>,
     ) -> String {
         let id = ulid::Ulid::new().to_string();
         sqlx::query(
-            "INSERT INTO files (id, worksheet_id, path, name, extension, size, sha256)
+            "INSERT INTO files (id, worksheet_id, path, name, extension, size, identity_key)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
@@ -998,7 +1038,7 @@ BT /F2 12 Tf 72 654 Td (A second body sentence keeps the section flowing onward.
         .bind("sample.pdf")
         .bind("pdf")
         .bind(10i64)
-        .bind(sha256)
+        .bind(identity_key)
         .execute(pool)
         .await
         .unwrap();

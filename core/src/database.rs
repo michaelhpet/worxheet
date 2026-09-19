@@ -10,7 +10,8 @@ async fn create_pool(url: &str) -> Result<Pool<Sqlite>, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal);
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true);
     let pool = SqlitePool::connect_with(options).await?;
     println!("Database pool created successfully");
     Ok(pool)

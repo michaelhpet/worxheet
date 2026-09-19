@@ -226,13 +226,31 @@ pub async fn get_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<Workshee
 }
 
 pub async fn delete_worksheet(pool: &sqlx::SqlitePool, id: &str) -> Result<(), String> {
-    sqlx::query("DELETE FROM worksheets WHERE id = ?")
+    let result = sqlx::query("DELETE FROM worksheets WHERE id = ?")
         .bind(id)
         .execute(pool)
         .await
         .map_err(|_| String::from("Failed to delete worksheet"))?;
+    if result.rows_affected() == 0 {
+        return Err(String::from("Worksheet not found"));
+    }
 
     Ok(())
+}
+
+/// Extensions the ingest pipeline can actually parse. Must stay in sync with
+/// `parse_blocks` in pipeline/ingest.rs and `SUPPORTED_EXTENSIONS` in app/.
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "pdf", "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "svg", "pptx",
+    "docx", "ppt", "doc", "txt", "md", "csv",
+];
+
+fn ensure_supported_extension(extension: &str, path: &str) -> Result<(), String> {
+    if SUPPORTED_EXTENSIONS.contains(&extension.to_lowercase().as_str()) {
+        Ok(())
+    } else {
+        Err(format!("Unsupported file extension '{extension}' for '{path}'"))
+    }
 }
 
 pub async fn create_worksheet(
@@ -255,12 +273,13 @@ pub async fn create_worksheet(
 
     for file_path in &files {
         let parts = file_parts(file_path)?;
+        ensure_supported_extension(&parts.extension, file_path)?;
         let identity = identity_key(file_path, &parts);
 
         let file_id = Ulid::new().to_string();
 
         sqlx::query(
-            "INSERT INTO files (id, worksheet_id, path, name, extension, size, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO files (id, worksheet_id, path, name, extension, size, identity_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&file_id)
         .bind(&worksheet.id)
@@ -366,7 +385,7 @@ mod tests {
 
     async fn seed_file(pool: &sqlx::SqlitePool, worksheet_id: &str, extension: &str) {
         sqlx::query(
-            "INSERT INTO files (id, worksheet_id, path, name, extension, size, sha256)
+            "INSERT INTO files (id, worksheet_id, path, name, extension, size, identity_key)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(ulid::Ulid::new().to_string())
@@ -474,6 +493,17 @@ mod tests {
         assert_eq!(result.name, "archive.tar.gz");
         assert_eq!(result.extension, "gz");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_supported_extensions_cover_text_and_images() {
+        for ext in ["pdf", "png", "txt", "md", "csv", "docx", "pptx"] {
+            assert!(SUPPORTED_EXTENSIONS.contains(&ext));
+        }
+        assert!(ensure_supported_extension("txt", "/tmp/a.txt").is_ok());
+        assert!(ensure_supported_extension("MD", "/tmp/a.md").is_ok());
+        assert!(ensure_supported_extension("mp3", "/tmp/a.mp3").is_err());
+        assert!(ensure_supported_extension("heic", "/tmp/a.heic").is_err());
     }
 
     fn identity_of(path: &str) -> (String, u64) {

@@ -1,6 +1,7 @@
-//! Cloud-hosted artifact generation: one model turn per unit, no retries.
-//! Quiz types fan out per segment; Summary and MindMap cover the whole
-//! worksheet in one request each, guided by a deterministic topic skeleton.
+//! Cloud-hosted artifact generation: one model turn per unit with bounded
+//! retries on transport errors. Quiz types fan out per segment; Summary and
+//! MindMap cover the whole worksheet in one request each, guided by a
+//! deterministic topic skeleton.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -143,12 +144,20 @@ pub struct GenerationTick {
 pub type ProgressFn = Arc<dyn Fn(GenerationTick) + Send + Sync>;
 
 /// When `Some`, artifacts route here as each unit completes and nothing is
-/// returned; when `None`, all artifacts return as `pending`.
+/// returned; when `None`, all artifacts return as `pending`. Persist failures
+/// are returned so the caller can log and fall back instead of dropping data.
 pub type PersistFn = Arc<
-    dyn Fn(Vec<PendingArtifact>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
+    dyn Fn(
+            Vec<PendingArtifact>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = super::PipelineResult<()>> + Send>,
+        > + Send
         + Sync,
 >;
+
+/// Transport retries per unit (initial attempt + 2 retries). Validation
+/// rejects are not retried.
+const MAX_GENERATION_ATTEMPTS: usize = 3;
 
 fn per_type_progress(
     completed_per_type: &[AtomicUsize],
@@ -849,44 +858,58 @@ async fn run_unit(
 
     log_request(logs, unit, 0, &request);
     let started = std::time::Instant::now();
-    let reply = match backend.generate_json(&request).await {
-        Ok(reply) => {
-            requests_made += 1;
-            tokens_in += approximate_tokens(&system) + approximate_tokens(&request.user);
-            tokens_out += approximate_tokens(&reply.text);
-            reply
+    let mut last_error: Option<String> = None;
+    let mut reply = None;
+    for attempt in 0..MAX_GENERATION_ATTEMPTS {
+        match backend.generate_json(&request).await {
+            Ok(ok) => {
+                reply = Some(ok);
+                last_error = None;
+                break;
+            }
+            Err(error) => {
+                last_error = Some(format!("{error}"));
+                log_response(
+                    logs,
+                    unit,
+                    attempt,
+                    seed,
+                    &serde_json::json!({
+                        "timestamp": logging::rfc3339_utc(),
+                        "unit_type": unit.artifact_type.to_db(),
+                        "segment_id": unit.segment_id,
+                        "attempt": attempt,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "status": "error",
+                        "error": format!("{error}"),
+                    }),
+                );
+                eprintln!(
+                    "[{}] [pipeline] unit failed ({schema_name}) attempt {attempt}: {error}",
+                    logging::rfc3339_utc()
+                );
+                if attempt + 1 < MAX_GENERATION_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        200 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
         }
-        Err(error) => {
-            log_response(
-                logs,
-                unit,
-                0,
-                seed,
-                &serde_json::json!({
-                    "timestamp": logging::rfc3339_utc(),
-                    "unit_type": unit.artifact_type.to_db(),
-                    "segment_id": unit.segment_id,
-                    "attempt": 0,
-                    "elapsed_ms": started.elapsed().as_millis(),
-                    "status": "error",
-                    "error": format!("{error}"),
-                }),
-            );
-            eprintln!(
-                "[{}] [pipeline] unit failed ({schema_name}): {error}",
-                logging::rfc3339_utc()
-            );
-            return UnitOutcome {
-                items: Vec::new(),
-                requests_made,
-                tokens_in,
-                tokens_out,
-                backend_error: Some(format!("{error}")),
-            };
-        }
+    }
+    let Some(reply) = reply else {
+        requests_made += 1;
+        return UnitOutcome {
+            items: Vec::new(),
+            requests_made,
+            tokens_in,
+            tokens_out,
+            backend_error: last_error,
+        };
     };
-
-    // One turn per unit, no retries; an empty reply is a clean skip, not an error.
+    requests_made += 1;
+    tokens_in += approximate_tokens(&system) + approximate_tokens(&request.user);
+    tokens_out += approximate_tokens(&reply.text);
     let validated = if reply.text.trim().is_empty() {
         ValidatedOutput {
             items: Vec::new(),
@@ -1034,7 +1057,17 @@ impl UnitDriver {
                     let artifacts = build_item_artifacts(&unit, &outcome.items);
                     if let Some(on_persist) = &on_persist {
                         if !artifacts.is_empty() {
-                            on_persist(artifacts).await;
+                            if let Err(error) = on_persist(artifacts).await {
+                                eprintln!(
+                                    "[{}] [pipeline] incremental persist failed, buffering for final persist: {error}",
+                                    logging::rfc3339_utc()
+                                );
+                                records.lock().unwrap()[unit_index] = Some(UnitRecord {
+                                    type_index: unit.type_index,
+                                    segment_id: unit.segment_id.clone(),
+                                    items: outcome.items,
+                                });
+                            }
                         }
                     } else {
                         records.lock().unwrap()[unit_index] = Some(UnitRecord {
@@ -1210,15 +1243,32 @@ pub async fn generate_all(
     }
     for record in merged_records.iter().flatten() {
         if let Some(content) = record.items.first() {
-            let artifact = PendingArtifact {
-                artifact_type: ArtifactType::ALL[record.type_index].clone(),
-                source: record.segment_id.clone(),
-                content: content.clone(),
-            };
+            let artifact_type = ArtifactType::ALL[record.type_index].clone();
+            let source = record.segment_id.clone();
+            let content = content.clone();
             if let Some(on_persist) = &driver.on_persist {
-                on_persist(vec![artifact]).await;
+                let artifact = PendingArtifact {
+                    artifact_type: artifact_type.clone(),
+                    source: source.clone(),
+                    content: content.clone(),
+                };
+                if let Err(error) = on_persist(vec![artifact]).await {
+                    eprintln!(
+                        "[{}] [pipeline] merged persist failed, buffering for final persist: {error}",
+                        logging::rfc3339_utc()
+                    );
+                    pending.push(PendingArtifact {
+                        artifact_type,
+                        source,
+                        content,
+                    });
+                }
             } else {
-                pending.push(artifact);
+                pending.push(PendingArtifact {
+                    artifact_type,
+                    source,
+                    content,
+                });
             }
         }
     }
@@ -1229,6 +1279,14 @@ pub async fn generate_all(
         return Err(PipelineError::Failed(String::from(
             "Artifacts generation failed. Check that a provider is configured and reachable.",
         )));
+    }
+    if telemetry.backend_errors > 0 {
+        eprintln!(
+            "[{}] [pipeline] partial generation: {}/{} units failed to reach the provider",
+            logging::rfc3339_utc(),
+            telemetry.backend_errors,
+            total_units
+        );
     }
 
     Ok((pending, telemetry))

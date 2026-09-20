@@ -63,6 +63,7 @@ pub fn run() {
             commands::pipeline::get_artifacts,
             commands::pipeline::get_pipeline_status,
             commands::pipeline::retry_pipeline,
+            commands::pipeline::regenerate_artifacts,
             commands::pipeline::stop_pipeline,
             commands::provider::get_provider_status,
             commands::provider::set_provider_config,

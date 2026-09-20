@@ -9,7 +9,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Badge } from "./ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "./ui/empty";
 import { Separator } from "./ui/separator";
 import { Skeleton } from "./ui/skeleton";
@@ -97,30 +96,28 @@ export function SummaryTabContent({ worksheet, artifactType }: Props) {
 						</EmptyHeader>
 					</Empty>
 				) : (
-					<Card>
-						<CardHeader>
-							<CardTitle>{summary.title}</CardTitle>
-							<CardDescription>{artifactType.description}</CardDescription>
-						</CardHeader>
-						<CardContent>
-							<div className="typeset typeset-docs">
-								<ReactMarkdown remarkPlugins={[remarkGfm]}>{summary.summary}</ReactMarkdown>
-							</div>
-							{summary.key_points.length > 0 && (
-								<>
-									<Separator />
-									<div className="flex flex-col gap-2">
-										<p className="font-medium text-sm">Key points</p>
-										<ul className="flex list-disc flex-col gap-1 pl-6 text-sm text-muted-foreground">
-											{summary.key_points.map((point) => (
-												<li key={point}>{point}</li>
-											))}
-										</ul>
-									</div>
-								</>
-							)}
-						</CardContent>
-					</Card>
+					<div className="flex flex-col gap-4">
+						<div className="flex flex-col gap-1">
+							<h1 className="font-heading text-2xl font-semibold tracking-tight">{summary.title}</h1>
+							<p className="text-sm text-muted-foreground">{artifactType.description}</p>
+						</div>
+						<div className="typeset typeset-docs">
+							<ReactMarkdown remarkPlugins={[remarkGfm]}>{summary.summary}</ReactMarkdown>
+						</div>
+						{summary.key_points.length > 0 && (
+							<>
+								<Separator />
+								<div className="flex flex-col gap-2">
+									<p className="text-sm font-medium">Key points</p>
+									<ul className="flex list-disc flex-col gap-1 pl-6 text-sm text-muted-foreground">
+										{summary.key_points.map((point) => (
+											<li key={point}>{point}</li>
+										))}
+									</ul>
+								</div>
+							</>
+						)}
+					</div>
 				)}
 			</div>
 		</TabsContent>

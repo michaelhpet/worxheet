@@ -45,6 +45,7 @@ struct RunCtx {
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
     stop: Stop,
+    only_types: Option<Vec<ArtifactType>>,
 }
 
 impl RunCtx {
@@ -110,6 +111,20 @@ pub fn start_job(
     jobs: Arc<PipelineJobs>,
     worksheet_id: String,
 ) -> bool {
+    start_job_for_types(app, pool, settings, jobs, worksheet_id, None)
+}
+
+/// Same as [`start_job`] but restricts generation to `only_types`.
+/// Ingestion still processes pending files; only the generation fan-out is
+/// filtered. Returns `false` if the worksheet already has a live job.
+pub fn start_job_for_types(
+    app: AppHandle,
+    pool: Pool<Sqlite>,
+    settings: Arc<SettingsState>,
+    jobs: Arc<PipelineJobs>,
+    worksheet_id: String,
+    only_types: Option<Vec<ArtifactType>>,
+) -> bool {
     let ctx = RunCtx {
         app,
         pool,
@@ -117,6 +132,7 @@ pub fn start_job(
         jobs,
         worksheet_id,
         stop: Stop::new(),
+        only_types,
     };
     {
         let mut running = ctx.jobs.jobs.lock().unwrap();
@@ -142,6 +158,11 @@ pub fn start_job(
         run_job(ctx).await;
     });
     true
+}
+
+/// Whether the worksheet currently has a live job.
+pub fn is_running(jobs: &Arc<PipelineJobs>, worksheet_id: &str) -> bool {
+    jobs.jobs.lock().unwrap().contains_key(worksheet_id)
 }
 
 /// Idempotent: returns `false` when nothing was running. The task exits without
@@ -370,9 +391,7 @@ async fn run_job(ctx: RunCtx) {
         }
     };
 
-    if let Err(error) =
-        persist_status(&ctx.pool, &worksheet_id, status, error.as_deref()).await
-    {
+    if let Err(error) = persist_status(&ctx.pool, &worksheet_id, status, error.as_deref()).await {
         eprintln!("[pipeline] failed to persist terminal status: {error}");
     }
     finish_job(&ctx, &PipelineStatus::terminal(status, error));
@@ -481,9 +500,10 @@ async fn run_pipeline(ctx: &RunCtx) -> PipelineResult<()> {
             Box::pin(async move {
                 super::persist_artifacts(&pool, &worksheet_id, &artifacts).await?;
                 Ok(())
-            }) as std::pin::Pin<
-                Box<dyn std::future::Future<Output = super::PipelineResult<()>> + Send>,
-            >
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = super::PipelineResult<()>> + Send>,
+                >
         }) as super::generate::PersistFn
     };
 
@@ -497,6 +517,7 @@ async fn run_pipeline(ctx: &RunCtx) -> PipelineResult<()> {
         Some(ctx.generate_sink()),
         Some(logs.clone()),
         ctx.stop.clone(),
+        ctx.only_types.as_deref(),
     )
     .await?;
     ctx.check_cancelled()?;

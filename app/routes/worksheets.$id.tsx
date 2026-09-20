@@ -8,17 +8,22 @@ import { Button } from "@/components/ui/button";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
+	DropdownMenuGroup,
 	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuSub,
+	DropdownMenuSubContent,
+	DropdownMenuSubTrigger,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { usePipelineStatus, useRetryPipeline, useStopPipeline } from "@/data/pipeline";
+import { usePipelineStatus, useRegenerateArtifacts, useRetryPipeline, useStopPipeline } from "@/data/pipeline";
 import { useWorksheet } from "@/data/worksheets";
 import { ARTIFACT_TYPE_OPTIONS, ARTIFACT_TYPES } from "@/lib/constants";
 import { toErrorMessage } from "@/lib/errors";
 import type { ArtifactType } from "@/lib/types";
-import { IconAlertTriangle, IconLoader, IconPlayerStop, IconRotateClockwise } from "@tabler/icons-react";
+import { IconAlertTriangle, IconLoader, IconPlayerStop, IconRefresh, IconRotateClockwise } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 
@@ -31,6 +36,34 @@ const QUIZ_TYPES: ArtifactType[] = [
 	ARTIFACT_TYPES.EssayQuiz,
 	ARTIFACT_TYPES.CompletionQuiz,
 ];
+
+function RegenerateSubmenu({
+	regenerate,
+	disabled,
+}: {
+	regenerate: ReturnType<typeof useRegenerateArtifacts>;
+	disabled?: boolean;
+}) {
+	const busy = disabled === true || regenerate.isPending;
+	return (
+		<DropdownMenuSub>
+			<DropdownMenuSubTrigger disabled={busy} className="whitespace-nowrap">
+				<IconRefresh />
+				Re-generate
+			</DropdownMenuSubTrigger>
+			<DropdownMenuSubContent className="whitespace-nowrap">
+				<DropdownMenuGroup>
+					{ARTIFACT_TYPE_OPTIONS.map((type) => (
+						<DropdownMenuItem key={type.value} disabled={busy} onClick={() => regenerate.mutate([type.value])}>
+							<type.icon />
+							{type.label}
+						</DropdownMenuItem>
+					))}
+				</DropdownMenuGroup>
+			</DropdownMenuSubContent>
+		</DropdownMenuSub>
+	);
+}
 
 function WorksheetStatusBadge({
 	worksheetId,
@@ -45,6 +78,7 @@ function WorksheetStatusBadge({
 }) {
 	const stopPipeline = useStopPipeline(worksheetId);
 	const retryPipeline = useRetryPipeline(worksheetId);
+	const regenerate = useRegenerateArtifacts(worksheetId);
 	const current = liveStatus ?? persistedStatus;
 
 	if (!current) {
@@ -97,10 +131,14 @@ function WorksheetStatusBadge({
 					}
 				/>
 				<DropdownMenuContent align="end">
-					<DropdownMenuItem disabled={retryPipeline.isPending} onClick={() => retryPipeline.mutate()}>
-						{retryPipeline.isPending ? <IconLoader className="animate-spin" /> : <IconRotateClockwise />}
-						Retry
-					</DropdownMenuItem>
+					<DropdownMenuGroup>
+						<DropdownMenuItem disabled={retryPipeline.isPending} onClick={() => retryPipeline.mutate()}>
+							{retryPipeline.isPending ? <IconLoader className="animate-spin" /> : <IconRotateClockwise />}
+							Retry
+						</DropdownMenuItem>
+					</DropdownMenuGroup>
+					<DropdownMenuSeparator />
+					<RegenerateSubmenu regenerate={regenerate} />
 				</DropdownMenuContent>
 			</DropdownMenu>
 		);
@@ -108,10 +146,19 @@ function WorksheetStatusBadge({
 
 	if (current === "done") {
 		return (
-			<Badge variant="outline" className="gap-1.5">
-				<span className="size-1.5 rounded-full bg-green-500" />
-				Done
-			</Badge>
+			<DropdownMenu>
+				<DropdownMenuTrigger
+					render={
+						<Badge variant="outline" className="gap-1.5 cursor-pointer">
+							<span className="size-1.5 rounded-full bg-green-500" />
+							Done
+						</Badge>
+					}
+				/>
+				<DropdownMenuContent align="end">
+					<RegenerateSubmenu regenerate={regenerate} />
+				</DropdownMenuContent>
+			</DropdownMenu>
 		);
 	}
 
@@ -141,7 +188,7 @@ function WorksheetDetail() {
 	].filter((message): message is string => Boolean(message));
 
 	return (
-		<Tabs value={artifactType} onValueChange={setArtifactType}>
+		<Tabs value={artifactType} onValueChange={setArtifactType} className="flex min-h-screen flex-col">
 			<Layout
 				onBack={exitWorksheet}
 				header={

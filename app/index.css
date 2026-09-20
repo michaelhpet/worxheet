@@ -13,6 +13,17 @@
 	--typeset-flow: 1.25em;
 }
 
+svg.markmap {
+	--markmap-text-color: var(--color-foreground);
+	--markmap-font: 400 15px / 20px var(--font-sans);
+}
+
+.dark svg.markmap {
+	--markmap-code-bg: #1a1b26;
+	--markmap-code-color: #ddd;
+	--markmap-circle-open-bg: #444;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {

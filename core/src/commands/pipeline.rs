@@ -59,6 +59,40 @@ pub async fn retry_pipeline(
     Ok(())
 }
 
+/// Delete a worksheet's artifacts of the given types and re-run the pipeline
+/// restricted to those types, e.g. after fixing the cause of a per-type
+/// failure. Ingestion still processes pending files; other artifact types are
+/// untouched. Fails when a job for the worksheet is already running so a
+/// live run is never clobbered.
+#[tauri::command]
+pub async fn regenerate_artifacts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    worksheet_id: String,
+    artifact_types: Vec<ArtifactType>,
+) -> Result<(), String> {
+    if artifact_types.is_empty() {
+        return Err(String::from("Select at least one artifact type to re-generate."));
+    }
+    if pipeline::is_running(&state.jobs, &worksheet_id) {
+        return Err(String::from(
+            "Pipeline is already running for this worksheet. Stop it first.",
+        ));
+    }
+    pipeline::delete_artifacts_of_types(&state.database, &worksheet_id, &artifact_types)
+        .await
+        .map_err(|e| e.to_string())?;
+    pipeline::start_job_for_types(
+        app,
+        state.database.clone(),
+        state.settings.clone(),
+        state.jobs.clone(),
+        worksheet_id,
+        Some(artifact_types),
+    );
+    Ok(())
+}
+
 /// Stop a worksheet's pipeline on demand. Only the named worksheet is
 /// affected; other running worksheets continue untouched. Finished artifacts
 /// stay persisted so a later `retry_pipeline` resumes the remainder.

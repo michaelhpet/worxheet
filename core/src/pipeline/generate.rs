@@ -82,13 +82,15 @@ fn spec(artifact_type: &ArtifactType) -> &'static ArtifactSpec {
         schema: completion_schema,
     };
     static SUMMARY: ArtifactSpec = ArtifactSpec {
-        task: "Write an article-length summary of the material below: a short title, \
-               several paragraphs covering each major topic in document order, and \
-               key points. Format the `summary` field as Markdown: use `##` headers \
+        task: "Write an article-length summary of the material below. Reply as exactly \
+               one JSON object with three keys: \"title\" (a short title string), \
+               \"summary\" (the article string), and \"key_points\" (an array of 3 to 5 \
+               short takeaway strings). Cover each major topic in document order. \
+               Format the `summary` field as Markdown: use `##` headers \
                per major topic, paragraphs for exposition, and ordered/unordered lists \
                or `**bold**`/`*italic*`/inline `code` where they aid readability. \
                Keep Markdown inside the JSON string value only.",
-        example: None,
+        example: Some(SUMMARY_EXAMPLE),
         temperature: Some(0.3),
         max_tokens: Some(4000),
         items_field: None,
@@ -96,12 +98,15 @@ fn spec(artifact_type: &ArtifactType) -> &'static ArtifactSpec {
     };
     static MINDMAP: ArtifactSpec = ArtifactSpec {
         task: "Extract the overarching topic of the material below and its major branches. \
-               Each branch carries a label and children which are themselves branches — \
-               nest recursively wherever the material warrants depth, down to individual \
-               concepts. Cover the whole material, sizing the map as the content warrants.",
+               Each branch carries a short label and children which are themselves branches. \
+               Keep the map tight enough to fit: at most 12 top-level branches, at most 3 \
+               levels of nesting, one short label per node. Every branch object must have \
+               both \"label\" and \"children\" keys — leaves use \"children\": []. \
+               Prefer major topics over exhaustive leaf concepts; consolidate details \
+               into their parent label.",
         example: None,
         temperature: Some(0.4),
-        max_tokens: Some(4000),
+        max_tokens: Some(8000),
         items_field: None,
         schema: mindmap_schema,
     };
@@ -232,7 +237,11 @@ fn usable_segments(segments: &[Segment]) -> PipelineResult<Vec<&Segment>> {
     Ok(usable)
 }
 
-fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> PipelineResult<Vec<Unit>> {
+fn build_units(
+    segments: &[Segment],
+    existing: &ExistingArtifacts,
+    only_types: Option<&[ArtifactType]>,
+) -> PipelineResult<Vec<Unit>> {
     let usable = usable_segments(segments)?;
 
     let indices = pick_indices(usable.len(), MAX_QUIZ_SEGMENTS);
@@ -242,6 +251,9 @@ fn build_units(segments: &[Segment], existing: &ExistingArtifacts) -> PipelineRe
         let segment = usable[segment_index];
         let context = section_context(segment);
         for artifact_type in ArtifactType::QUIZ.iter() {
+            if only_types.is_some_and(|only| !only.contains(artifact_type)) {
+                continue;
+            }
             units.push(Unit {
                 type_index: type_index(artifact_type),
                 artifact_type: artifact_type.clone(),
@@ -513,6 +525,11 @@ const MCQ_EXAMPLE: &str = r#"Example question object:
  "answer":"Mitochondrial matrix",
  "explanation":"The cycle runs in the matrix, producing NADH for oxidative phosphorylation."}"#;
 
+const SUMMARY_EXAMPLE: &str = r###"Example reply shape (all three keys required):
+{"title":"Cellular Respiration",
+ "summary":"## Overview\nRespiration releases energy from glucose in three stages…",
+ "key_points":["Glycolysis splits glucose in the cytosol","The citric acid cycle runs in the mitochondrial matrix"]}"###;
+
 fn user_prompt(artifact_type: &ArtifactType, context: &str) -> String {
     let task = spec(artifact_type);
     let mut prompt = String::from(task.task);
@@ -678,13 +695,61 @@ fn parse_json_anyhow(raw: &str) -> PipelineResult<serde_json::Value> {
     }
 }
 
-fn mindmap_node_valid(node: &serde_json::Value) -> bool {
-    node.get("label")
-        .is_some_and(|label| label.as_str().is_some_and(|label| !label.trim().is_empty()))
-        && node
-            .get("children")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|children| children.iter().all(mindmap_node_valid))
+/// Providers routinely omit `"children": []` on leaf nodes even when the
+/// schema requires it (observed: 76 labels with 32 `children` keys).
+/// Normalize absent children to `[]` so a structurally sound map is stored
+/// canonically; reject only empty/missing labels or non-array children.
+fn normalize_mindmap_node(node: &serde_json::Value) -> Option<serde_json::Value> {
+    let label = node.get("label")?.as_str()?;
+    if label.trim().is_empty() {
+        return None;
+    }
+    let children = match node.get("children") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()?
+            .iter()
+            .map(normalize_mindmap_node)
+            .collect::<Option<Vec<_>>>()?,
+    };
+    Some(serde_json::json!({ "label": label, "children": children }))
+}
+
+/// Validated merged-type output, normalized for storage. `None` means the
+/// shape is unusable.
+fn normalized_merged_output(
+    artifact_type: &ArtifactType,
+    value: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match artifact_type {
+        ArtifactType::Summary => {
+            let shape_ok = value
+                .get("summary")
+                .is_some_and(serde_json::Value::is_string)
+                && value
+                    .get("key_points")
+                    .is_some_and(serde_json::Value::is_array);
+            shape_ok.then(|| value.clone())
+        }
+        ArtifactType::MindMap => {
+            if !value
+                .get("topic")
+                .is_some_and(serde_json::Value::is_string)
+            {
+                return None;
+            }
+            let branches = value.get("branches")?.as_array()?;
+            let normalized = branches
+                .iter()
+                .map(normalize_mindmap_node)
+                .collect::<Option<Vec<_>>>()?;
+            Some(serde_json::json!({
+                "topic": value.get("topic"),
+                "branches": normalized,
+            }))
+        }
+        _ => None,
+    }
 }
 
 struct ValidatedOutput {
@@ -754,40 +819,19 @@ fn validate_unit_output(
                 rejection_reasons,
             }
         }
-        None => {
-            let shape_ok = match artifact_type {
-                ArtifactType::Summary => {
-                    value
-                        .get("summary")
-                        .is_some_and(serde_json::Value::is_string)
-                        && value
-                            .get("key_points")
-                            .is_some_and(serde_json::Value::is_array)
-                }
-                ArtifactType::MindMap => {
-                    value.get("topic").is_some_and(serde_json::Value::is_string)
-                        && value
-                            .get("branches")
-                            .and_then(serde_json::Value::as_array)
-                            .is_some_and(|branches| branches.iter().all(mindmap_node_valid))
-                }
-                _ => false,
-            };
-            if shape_ok {
-                ValidatedOutput {
-                    items: vec![value.to_string()],
-                    rejection_reasons,
-                }
-            } else {
-                rejected(
-                    &mut rejection_reasons,
-                    format!(
-                        "expected a {} object with the documented fields",
-                        artifact_type.to_db()
-                    ),
-                )
-            }
-        }
+        None => match normalized_merged_output(artifact_type, &value) {
+            Some(normalized) => ValidatedOutput {
+                items: vec![normalized.to_string()],
+                rejection_reasons,
+            },
+            None => rejected(
+                &mut rejection_reasons,
+                format!(
+                    "expected a {} object with the documented fields",
+                    artifact_type.to_db()
+                ),
+            ),
+        },
     }
 }
 
@@ -1178,6 +1222,7 @@ impl UnitDriver {
 fn build_merged_units(
     segments: &[Segment],
     existing: &ExistingArtifacts,
+    only_types: Option<&[ArtifactType]>,
 ) -> PipelineResult<Vec<Unit>> {
     let usable = usable_segments(segments)?;
     let scores = term_scores(&usable);
@@ -1208,6 +1253,9 @@ fn build_merged_units(
         (ArtifactType::Summary, body.clone(), 0u64),
         (ArtifactType::MindMap, mindmap_body, 1u64),
     ] {
+        if only_types.is_some_and(|only| !only.contains(&artifact_type)) {
+            continue;
+        }
         units.push(Unit {
             type_index: type_index(&artifact_type),
             artifact_type: artifact_type.clone(),
@@ -1231,6 +1279,7 @@ pub async fn generate_all(
     on_progress: Option<ProgressFn>,
     logs: Option<Arc<RunLogs>>,
     stop: Stop,
+    only_types: Option<&[ArtifactType]>,
 ) -> PipelineResult<(Vec<PendingArtifact>, RunTelemetry)> {
     stop.check()?;
     let params = params.unwrap_or_default();
@@ -1244,11 +1293,11 @@ pub async fn generate_all(
         stop: stop.clone(),
     };
 
-    let units = build_units(segments, &existing)?;
+    let units = build_units(segments, &existing, only_types)?;
     let quiz_total = units.iter().filter(|unit| !unit.skip).count();
     let (records, mut telemetry) = driver.run(units).await?;
 
-    let merged_units = build_merged_units(segments, &existing)?;
+    let merged_units = build_merged_units(segments, &existing, only_types)?;
     let merged_total = merged_units.iter().filter(|unit| !unit.skip).count();
     let (merged_records, merged_telemetry) = driver.run(merged_units).await?;
     telemetry.requests += merged_telemetry.requests;
@@ -1399,7 +1448,7 @@ mod tests {
             ),
         ];
 
-        let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
+        let units = build_units(&segments, &ExistingArtifacts::default(), None).unwrap();
         let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
         let expected = ["seg-1", "seg-3"].repeat(ArtifactType::QUIZ.len());
         assert_eq!(used.len(), expected.len());
@@ -1429,7 +1478,7 @@ mod tests {
             segment(1, None, "1 2 3 4"),
             segment(2, None, "  "),
         ];
-        let result = build_units(&segments, &ExistingArtifacts::default());
+        let result = build_units(&segments, &ExistingArtifacts::default(), None);
         let error = match result {
             Ok(_) => panic!("expected all-degenerate segments to error"),
             Err(error) => error,
@@ -1513,7 +1562,7 @@ mod tests {
             ),
         ];
 
-        let units = build_units(&segments, &ExistingArtifacts::default()).unwrap();
+        let units = build_units(&segments, &ExistingArtifacts::default(), None).unwrap();
         let used: Vec<&str> = units.iter().map(|unit| unit.segment_id.as_str()).collect();
         let expected = ["seg-1", "seg-3"].repeat(ArtifactType::QUIZ.len());
         assert_eq!(used.len(), expected.len());
@@ -1630,7 +1679,7 @@ mod tests {
                 "Magma pressure builds beneath the crust before volcanic eruptions release ash and lava across the landscape.",
             ),
         ];
-        let units = build_merged_units(&segments, &ExistingArtifacts::default()).unwrap();
+        let units = build_merged_units(&segments, &ExistingArtifacts::default(), None).unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].artifact_type, ArtifactType::Summary);
         assert_eq!(units[1].artifact_type, ArtifactType::MindMap);
@@ -1649,7 +1698,7 @@ mod tests {
         )];
         let mut existing = ExistingArtifacts::default();
         existing.done_merged.insert(String::from("Summary"));
-        let units = build_merged_units(&segments, &existing).unwrap();
+        let units = build_merged_units(&segments, &existing, None).unwrap();
         let active: Vec<_> = units.iter().filter(|unit| !unit.skip).collect();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].artifact_type, ArtifactType::MindMap);
@@ -1734,6 +1783,62 @@ mod tests {
     }
 
     #[test]
+    fn test_merged_prompts_state_shape_and_size_bounds() {
+        let summary = user_prompt(&ArtifactType::Summary, "context");
+        for key in ["\"title\"", "\"summary\"", "\"key_points\""] {
+            assert!(
+                summary.contains(key),
+                "summary prompt must name its JSON keys, missing {key}"
+            );
+        }
+        let mindmap = user_prompt(&ArtifactType::MindMap, "context");
+        assert!(
+            mindmap.contains("12 top-level branches") && mindmap.contains("3"),
+            "mindmap prompt must bound breadth and depth"
+        );
+    }
+
+    #[test]
+    fn test_mindmap_leaf_without_children_is_normalized() {
+        let validated = validate_unit_output(
+            &ArtifactType::MindMap,
+            r#"{"topic":"Biology","branches":[{"label":"Cells"},{"label":"Genetics","children":[{"label":"DNA"}]}]}"#,
+            "source words here",
+            "stop",
+        );
+        assert!(
+            validated.rejection_reasons.is_empty(),
+            "leaves without children must not reject: {:?}",
+            validated.rejection_reasons
+        );
+        assert_eq!(validated.items.len(), 1);
+        let stored: serde_json::Value = serde_json::from_str(&validated.items[0]).unwrap();
+        assert_eq!(stored["branches"][0]["children"], serde_json::json!([]));
+        assert_eq!(
+            stored["branches"][1]["children"][0]["children"],
+            serde_json::json!([])
+        );
+        assert_eq!(stored["topic"], serde_json::json!("Biology"));
+    }
+
+    #[test]
+    fn test_mindmap_bad_nodes_still_rejected() {
+        for raw in [
+            r#"{"topic":"T","branches":[{"label":"  "}]}"#,
+            r#"{"topic":"T","branches":[{"label":"A","children":{}}]}"#,
+            r#"{"branches":[{"label":"A","children":[]}]}"#,
+        ] {
+            let validated =
+                validate_unit_output(&ArtifactType::MindMap, raw, "source", "stop");
+            assert!(
+                !validated.rejection_reasons.is_empty(),
+                "must reject {raw}"
+            );
+            assert!(validated.items.is_empty());
+        }
+    }
+
+    #[test]
     fn test_truncated_reply_rejected_with_length_reason() {
         let validated = validate_unit_output(
             &ArtifactType::Summary,
@@ -1759,7 +1864,7 @@ mod tests {
     fn test_merged_types_allow_larger_output_budget() {
         let params = GenerationParams::default();
         assert_eq!(max_tokens_for(&ArtifactType::Summary, &params), 4000);
-        assert_eq!(max_tokens_for(&ArtifactType::MindMap, &params), 4000);
+        assert_eq!(max_tokens_for(&ArtifactType::MindMap, &params), 8000);
         assert_eq!(
             max_tokens_for(&ArtifactType::MultipleChoiceQuiz, &params),
             params.max_tokens

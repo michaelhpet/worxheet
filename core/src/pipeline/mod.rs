@@ -12,7 +12,37 @@ pub mod segment;
 pub mod validate;
 
 pub use generate::{generate_all, PendingArtifact};
-pub use jobs::{remove_job, resume_if_needed, resume_stale, start_job, stop_job, PipelineJobs};
+pub use jobs::{
+    is_running, remove_job, resume_if_needed, resume_stale, start_job, start_job_for_types,
+    stop_job, PipelineJobs,
+};
+
+/// Delete a worksheet's artifacts of the given types so they can be
+/// regenerated from scratch. Returns the number of rows removed.
+pub async fn delete_artifacts_of_types(
+    pool: &SqlitePool,
+    worksheet_id: &str,
+    artifact_types: &[ArtifactType],
+) -> PipelineResult<u64> {
+    if artifact_types.is_empty() {
+        return Ok(0);
+    }
+    let mut builder = sqlx::QueryBuilder::new("DELETE FROM artifacts WHERE worksheet_id = ");
+    builder.push_bind(worksheet_id);
+    builder.push(" AND artifact_type IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for artifact_type in artifact_types {
+            separated.push_bind(artifact_type.to_db());
+        }
+    }
+    builder.push(")");
+    Ok(builder
+        .build()
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -441,6 +471,7 @@ mod tests {
             None,
             None,
             Stop::never(),
+            None,
         )
         .await
         .expect("generation should succeed");
@@ -529,6 +560,7 @@ mod tests {
             None,
             None,
             Stop::never(),
+            None,
         )
         .await
         .unwrap();
@@ -569,6 +601,7 @@ mod tests {
             None,
             None,
             stop,
+            None,
         )
         .await;
         assert!(matches!(result, Err(PipelineError::Cancelled)));
@@ -622,5 +655,74 @@ mod tests {
         assert!(!existing.done_merged.contains("MindMap"));
         assert_eq!(existing.done_items.len(), 2);
         assert_eq!(existing.done_merged.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_generate_all_only_types_restricts_fan_out() {
+        let backend = Arc::new(MockBackend::with_responder(|request| {
+            Ok(match request.schema_name.as_str() {
+                "Summary" => json!({
+                    "title": "T",
+                    "summary": "Mitochondria produce ATP through respiration.",
+                    "key_points": ["Mitochondria produce ATP"]
+                }),
+                _ => json!({ "placeholder": true }),
+            }
+            .to_string())
+        })) as Arc<dyn ArtifactBackend>;
+        let segments = test_segments(2);
+        let only = [ArtifactType::Summary];
+        let (pending, telemetry) = generate_all(
+            backend,
+            4,
+            &segments,
+            ExistingArtifacts::default(),
+            Some(GenerationParams::default()),
+            None,
+            None,
+            None,
+            Stop::never(),
+            Some(&only),
+        )
+        .await
+        .expect("filtered generation should succeed");
+
+        assert_eq!(telemetry.requests, 1, "only the Summary unit may run");
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].artifact_type,
+            ArtifactType::Summary
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_artifacts_of_types_removes_only_selected() {
+        let pool = setup_db().await;
+        let worksheet_id = seed_worksheet(&pool).await;
+        seed_artifact(&pool, &worksheet_id, "Summary").await;
+        seed_artifact(&pool, &worksheet_id, "MindMap").await;
+
+        let removed = delete_artifacts_of_types(
+            &pool,
+            &worksheet_id,
+            &[ArtifactType::Summary],
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT artifact_type FROM artifacts WHERE worksheet_id = ?")
+                .bind(&worksheet_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec![("MindMap".to_string(),)]);
+
+        let removed_empty =
+            delete_artifacts_of_types(&pool, &worksheet_id, &[])
+                .await
+                .unwrap();
+        assert_eq!(removed_empty, 0);
     }
 }

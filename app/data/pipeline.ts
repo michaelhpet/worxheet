@@ -2,7 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect } from "react";
+import { ARTIFACTS_QUERY_KEY } from "@/data/artifacts";
 import { WORKSHEETS_QUERY_KEY } from "@/data/worksheets";
+import type { ArtifactType } from "@/lib/types";
 
 export interface TypeProgress {
 	artifact_type: string;
@@ -96,6 +98,21 @@ export function useRetryPipeline(worksheetId: string) {
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, worksheetId] });
 			queryClient.invalidateQueries({ queryKey: [WORKSHEETS_QUERY_KEY] });
+		},
+	});
+}
+
+export function useRegenerateArtifacts(worksheetId: string) {
+	const queryClient = useQueryClient();
+
+	return useMutation({
+		mutationFn: (artifactTypes: ArtifactType[]) => invoke<void>("regenerate_artifacts", { worksheetId, artifactTypes }),
+		onSuccess: (_data, artifactTypes) => {
+			queryClient.invalidateQueries({ queryKey: [PIPELINE_QUERY_KEY, worksheetId] });
+			queryClient.invalidateQueries({ queryKey: [WORKSHEETS_QUERY_KEY] });
+			for (const artifactType of artifactTypes) {
+				queryClient.invalidateQueries({ queryKey: [ARTIFACTS_QUERY_KEY, worksheetId, artifactType] });
+			}
 		},
 	});
 }

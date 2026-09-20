@@ -169,7 +169,7 @@ export function MindMapTabContent({ worksheet, artifactType }: Props) {
 						</AlertDescription>
 					</Alert>
 				) : !mindMap ? (
-					<Empty>
+					<Empty className="flex-none">
 						<EmptyHeader>
 							<EmptyMedia variant="icon">
 								<artifactType.icon />

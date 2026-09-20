@@ -13,16 +13,25 @@ pub struct ProviderStatus {
     pub config: PerPresetConfig,
     /// Whether an API key exists in the keychain (never returns the key).
     pub api_key_set: bool,
+    /// Keychain key presence per preset, so the UI can verify a preset
+    /// immediately on selection without exposing any key material.
+    pub keys_set: std::collections::HashMap<String, bool>,
 }
 
 fn provider_status(settings: &crate::settings::SettingsState) -> Result<ProviderStatus, String> {
     let provider = settings.get().provider;
     let config = provider.active_config();
     let api_key_set = config::load_api_key(&provider.active)?.is_some();
+    let mut keys_set = std::collections::HashMap::new();
+    for preset in provider.presets.keys() {
+        let has_key = config::load_api_key(preset)?.is_some();
+        keys_set.insert(preset.clone(), has_key);
+    }
     Ok(ProviderStatus {
         preset: provider.active,
         config,
         api_key_set,
+        keys_set,
     })
 }
 

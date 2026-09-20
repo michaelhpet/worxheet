@@ -18,6 +18,8 @@ export interface ProviderStatus {
 	config: PerPresetConfig;
 	/** Whether an API key is stored in the OS keychain (never the key itself). */
 	api_key_set: boolean;
+	/** Keychain key presence per preset, for immediate verify-on-select. */
+	keys_set: Record<string, boolean>;
 }
 
 export interface ProviderSettings {
@@ -51,9 +53,24 @@ export function useSetProviderConfig() {
 
 	return useMutation({
 		mutationFn: (input: SetProviderConfigInput) => invoke<ProviderStatus>("set_provider_config", { ...input }),
-		onSuccess: (status) => {
+		onSuccess: (status, input) => {
+			const prev = queryClient.getQueryData<ProviderStatus>([PROVIDER_QUERY_KEY]);
 			queryClient.setQueryData([PROVIDER_QUERY_KEY], status);
 			queryClient.invalidateQueries({ queryKey: [SETTINGS_QUERY_KEY] });
+			// Re-ping reachability only when the provider identity actually
+			// changed. The inference form auto-persists unchanged values while
+			// open; invalidating unconditionally would re-ping in a loop.
+			const keyChanged = input.apiKey !== undefined && input.apiKey.trim() !== "";
+			const identityChanged =
+				!prev ||
+				prev.preset !== status.preset ||
+				prev.config.base_url !== status.config.base_url ||
+				prev.config.model !== status.config.model ||
+				prev.api_key_set !== status.api_key_set ||
+				keyChanged;
+			if (identityChanged) {
+				queryClient.invalidateQueries({ queryKey: [PROVIDER_QUERY_KEY, "models"] });
+			}
 		},
 	});
 }

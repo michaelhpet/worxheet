@@ -1,6 +1,7 @@
 import { CreateWorksheetDialog } from "@/components/create-worksheet-dialog";
 import { Layout } from "@/components/layout";
 import { PipelineStatusBadge } from "@/components/pipeline-status-badge";
+import { ProviderStatusBadge } from "@/components/provider-status-badge";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -139,6 +140,7 @@ function Home() {
 						</Button>
 					</Field>
 				}
+				extra={<ProviderStatusBadge />}
 			>
 				<div className="w-full max-w-200 mx-auto flex flex-col gap-3 flex-1 min-h-0 pt-3">
 					<div className="border rounded-lg overflow-hidden">

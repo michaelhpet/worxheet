@@ -89,6 +89,9 @@ export function ProviderInferenceForm() {
 			setConnection({ ok: true, count: models.length });
 			if (models.length > 0 && !form.state.values.model.trim()) {
 				form.setFieldValue("model", models[0]);
+				// Persist the discovered model so the status badge flips to
+				// Ready without another manual step.
+				await persistSettings();
 			}
 		} finally {
 			setTesting(false);
@@ -122,6 +125,12 @@ export function ProviderInferenceForm() {
 									setConnection(null);
 								}
 								form.setFieldValue("model", next !== "custom" ? (target?.model ?? "") : "");
+								// A preset with a stored key is ready to verify: ping
+								// immediately so the status badge flips without a
+								// manual Test connection.
+								if (status?.keys_set?.[next]) {
+									void testConnection();
+								}
 							}}
 						>
 							<SelectTrigger>
